@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "config/config.h"
+#include "logging/log.h"
 
 #define CONFIG_FILE "/etc/nasfs/nasfs.conf"
 
@@ -31,6 +32,16 @@ main (int argc, char *argv[])
       fprintf (stderr, "Failed to load configuration\n");
       return EXIT_FAILURE;
     }
+
+  /* Initialize logging  */
+  log_init (config.log_file, config.log_level);
+  log_all (LOG_INFO, "Starting NASFS server...");
+
+  /* Cleanup  */
+  log_all (LOG_INFO, "Server shutting down...");
+
+  if (config.daemon_mode)
+    remove_pid_file (config.pid_file);
 
   /* Free allocated config memory  */
   free (config.bind_address);
