@@ -13,6 +13,8 @@
 
 #include "config/config.h"
 #include "logging/log.h"
+#include "network/connections.h"
+#include "network/server.h"
 
 #define CONFIG_FILE "/etc/nasfs/nasfs.conf"
 
@@ -36,6 +38,18 @@ main (int argc, char *argv[])
   /* Initialize logging  */
   log_init (config.log_file, config.log_level);
   log_all (LOG_INFO, "Starting NASFS server...");
+
+  /* Setup network  */
+  int server_socket = server_socket_setup (&config);
+  if (server_socket < 0)
+    {
+      log_all (LOG_ERROR, "Failed to setup server socket");
+      return EXIT_FAILURE;
+    }
+
+  /* Run server main loop  */
+  log_all (LOG_INFO, "Server ready to accept connections");
+  server_run (server_socket, &config);
 
   /* Cleanup  */
   log_all (LOG_INFO, "Server shutting down...");
