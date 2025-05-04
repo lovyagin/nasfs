@@ -13,8 +13,10 @@
 
 #include "config/config.h"
 #include "logging/log.h"
-#include "network/connections.h"
 #include "network/server.h"
+#include "utils/daemon.h"
+#include "utils/pid_file.h"
+#include "utils/signal_handler.h"
 
 #define CONFIG_FILE "/etc/nasfs/nasfs.conf"
 
@@ -38,6 +40,36 @@ main (int argc, char *argv[])
   /* Initialize logging  */
   log_init (config.log_file, config.log_level);
   log_all (LOG_INFO, "Starting NASFS server...");
+
+  /* Register signal handlers  */
+  if (signal (SIGTERM, signal_handler) == SIG_ERR
+      || signal (SIGINT, signal_handler) == SIG_ERR)
+    {
+      log_all (LOG_ERROR, "Failed to register signal handlers");
+      return EXIT_FAILURE;
+    }
+
+  if (config.daemon_mode)
+    {
+      log_all (LOG_INFO, "Starting in daemon mode");
+      if (daemonize () != 0)
+        {
+          log_all (LOG_ERROR, "Failed to daemonize");
+          return EXIT_FAILURE;
+        }
+      log_all (LOG_INFO, "Successfully daemonized, PID: %d", getpid ());
+
+      /* Create PID file  */
+      if (create_pid_file (config.pid_file) != 0)
+        {
+          log_all (LOG_ERROR, "Failed to create PID file");
+          return EXIT_FAILURE;
+        }
+
+      /* Register cleanup handler for PID file  */
+      atexit (cleanup_pid_file);
+      set_pid_file_path (config.pid_file);
+    }
 
   /* Setup network  */
   int server_socket = server_socket_setup (&config);
