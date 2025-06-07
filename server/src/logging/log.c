@@ -128,7 +128,8 @@ log_stdout (log_level_t level, const char *format, ...)
 void
 log_all (log_level_t level, const char *format, ...)
 {
-  va_list args_stdout, args_file;
+  va_list args_stdout;
+  va_list args_file;
   va_start (args_stdout, format);
   va_copy (args_file, args_stdout);
 

@@ -8,9 +8,9 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-PID_FILE="/var/run/nasfs/nasfs-server.pid"
+PID_FILE="/usr/local/var/run/nasfs/nasfs-server.pid"
 BINARY="/usr/local/bin/nasfs-server"
-CONFIG="/etc/nasfs/nasfs.conf"
+CONFIG="/usr/local/etc/nasfs/nasfs.conf"
 
 need_sudo=0
 if [[ ! -w "$(dirname "$PID_FILE")" ]] || [[ ! -w "$(dirname "$CONFIG")" ]]; then
