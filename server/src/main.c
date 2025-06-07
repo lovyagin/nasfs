@@ -18,7 +18,7 @@
 #include "utils/pid_file.h"
 #include "utils/signal_handler.h"
 
-#define CONFIG_FILE "/etc/nasfs/nasfs.conf"
+#define CONFIG_FILE "/usr/local/etc/nasfs/nasfs.conf"
 
 int
 main (int argc, char *argv[])
@@ -69,6 +69,17 @@ main (int argc, char *argv[])
       /* Register cleanup handler for PID file  */
       atexit (cleanup_pid_file);
       set_pid_file_path (config.pid_file);
+    }
+
+  /* Check current working dir */
+  char cwd[PATH_MAX];
+  if (getcwd (cwd, sizeof (cwd)) != NULL)
+    {
+      log_all (LOG_DEBUG, "Current working dir: %s\n", cwd);
+    }
+  else
+    {
+      log_all (LOG_ERROR, "getcwd() error");
     }
 
   /* Setup network  */
