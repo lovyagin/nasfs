@@ -1,6 +1,7 @@
 2025-07-12  Morozov Nikita <nikitwww@gmail.com>
 
     * Add PUT <filepath> command
+    * Migrate to the Google code style and c11 standard
 
 2025-07-06  Morozov Nikita <nikitwww@gmail.com>
 
