@@ -123,6 +123,17 @@ load_config (const char *filename, server_config_t *config)
               return -1;
             }
         }
+      else if (strcmp (key, "StorageDir") == 0)
+        {
+          free (config->storage_dir);
+          config->storage_dir = strdup (value);
+          if (!config->storage_dir)
+            {
+              fprintf (stderr, "Memory allocation failed\n");
+              fclose (file);
+              return -1;
+            }
+        }
     }
 
   fclose (file);
@@ -143,6 +154,7 @@ set_defaults (server_config_t *config)
   config->log_level = 0;   /* Info */
   config->daemon_mode = 0; /* Not in daemon mode by default */
   config->pid_file = strdup ("/var/run/nasfs-server.pid");
+  config->storage_dir = strdup (".");
 }
 
 /* Trim whitespace from a string and remove comments.
