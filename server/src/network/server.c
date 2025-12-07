@@ -153,23 +153,24 @@ server_run (int server_socket, server_config_t *config)
             }
 
           /* Create thread to handle client */
-          int *client_sock_ptr = malloc (sizeof (int));
-          if (!client_sock_ptr)
+          client_context_t *client_ctx = malloc (sizeof (client_context_t));
+          if (!client_ctx)
             {
               log_all (LOG_ERROR, "Memory allocation failed");
               close (client_socket);
               continue;
             }
-          *client_sock_ptr = client_socket;
+          client_ctx->client_socket = client_socket;
+          client_ctx->config = config;
 
           pthread_t client_thread;
           if (pthread_create (&client_thread, NULL, handle_client,
-                              client_sock_ptr)
+                              client_ctx)
               != 0)
             {
               log_all (LOG_ERROR, "Failed to create client thread: %s",
                        strerror (errno));
-              free (client_sock_ptr);
+              free (client_ctx);
               close (client_socket);
             }
         }
