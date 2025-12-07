@@ -4,17 +4,17 @@ SUBDIRS = server tests
 
 # Distribution of additional files
 EXTRA_DIST = \
-	README.md \
-	.clang-format \
-	.clang-tidy \
-	.env \
-	.gitignore \
-	docs/structure.md \
-	docs/development.md \
-	scripts/install_nasfsctl.sh \
-	scripts/generate_compile_commands.sh \
-	utils/nasfsctl \
-	scripts/setup_deps.sh
+			 README.md \
+			 .clang-format \
+			 .clang-tidy \
+			 .env \
+			 .gitignore \
+			 docs/structure.md \
+			 docs/development.md \
+			 scripts/install_nasfsctl.sh \
+			 scripts/generate_compile_commands.sh \
+			 utils/nasfsctl \
+			 scripts/setup_deps.sh
 
 # Install control script
 bin_SCRIPTS = utils/nasfsctl
@@ -26,15 +26,6 @@ install-data-local:
 	chmod 755 $(DESTDIR)$(localstatedir)/run/nasfs
 	chmod 755 $(DESTDIR)$(localstatedir)/log/nasfs
 
-# Generate compile_commands.json for clangd support
-compile_commands.json:
-	echo "Installing compiledb..."
-	pip install compiledb
-	echo "Generating compile_commands.json..."
-	compiledb make
-	mv compile_commands.json $(srcdir)
-
-.PHONY: compile_commands.json
-
-# Clean up compile_commands.json if it exists
-CLEANFILES = compile_commands.json
+# Installation check that ensures scripts are copied to build directory
+installcheck-local:
+	@echo "Running installcheck for main project..."

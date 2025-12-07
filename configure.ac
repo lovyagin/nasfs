@@ -33,6 +33,10 @@ AS_IF([test "x$enable_debug" = "xyes"], [
   AC_MSG_NOTICE([Release build enabled])
 ])
 
+# Make sure source and build directories are available in makefiles
+AC_SUBST([builddir])
+AC_SUBST([srcdir])
+
 # Checks for header files
 AC_CHECK_HEADERS([arpa/inet.h fcntl.h netinet/in.h stdlib.h string.h sys/socket.h unistd.h])
 

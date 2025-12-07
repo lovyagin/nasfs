@@ -1,13 +1,18 @@
+2025-07-12  Morozov Nikita <nikitwww@gmail.com>
+
+    * Add PUT <filepath> command
+
+2025-07-06  Morozov Nikita <nikitwww@gmail.com>
+
+    * Add GET <filepath> command
+
 2025-10-05  Morozov Nikita <nikitwww@gmail.com>
 
-    * docs: add project documentation
+    * Add project documentation
     * Improve README
     * Add development guidelines
     * Add ChangeLog
-
-2025-05-05  Morozov Nikita <nikitwww@gmail.com>
-
-    * build: configure GNU Autotools build system
+    * configure GNU Autotools build system
     * Add configure.ac with project configuration
     * Add Makefile.am files for build rules
     * Create autogen.sh and autoclean.sh helper scripts
@@ -15,39 +20,36 @@
 
 2025-05-05  Morozov Nikita <nikitwww@gmail.com>
 
-    * feat(utils): add nasfsctl control script
+    * Add nasfsctl control script
     * Create Bash script for server management
     * Implement start/stop/restart/status commands
     * Add privilege escalation handling
 
 2025-05-04  Morozov Nikita <nikitwww@gmail.com>
 
-    * feat(server): add daemon mode pid file sig handler
+    * Add daemon mode pid file sig handler
     * Implement daemonization functionality
     * Add signal handling for graceful shutdown
     * Create PID file management
 
 2025-05-03  Morozov Nikita <nikitwww@gmail.com>
 
-    * feat(server): implement basic echo server
+    * Implement basic echo server
     * Implement network socket handling
     * Create client connection handling
 
 2025-04-27  Morozov Nikita <nikitwww@gmail.com>
 
-    * feat(server): add logging system
+    * Add logging system
     * Implement multi-level logging (debug, info, warning, error)
     * Add file and console logging capabilities
-
-2025-04-27  Morozov Nikita <nikitwww@gmail.com>
-
-    * feat(server): add coniguration system
+    * Add coniguration system
     * Add example config server/config/nasfs.conf
     * Implement reading config from file
 
 2025-04-23  Morozov Nikita <nikitwww@gmail.com>
 
-    * feat: initialize NASFS project structure
+    * Initialize NASFS project structure
     * Initial directory layout for Network Attached Storage File System project:
     * Add docs/structure.md
     * Add clang-tidy and clang-format utils
