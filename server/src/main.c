@@ -4,6 +4,7 @@
    This file is part of NASFS server.
    Entry point for the NASFS server application.  */
 
+#include <getopt.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,21 +21,63 @@
 
 #define CONFIG_FILE "/usr/local/etc/nasfs/nasfs.conf"
 
+void
+print_usage (const char *program_name)
+{
+  printf ("Usage: %s [OPTIONS]\n\n", program_name);
+  printf ("Options:\n");
+  printf ("  -c, --config FILE    Specify configuration file (default: %s)\n",
+          CONFIG_FILE);
+  printf ("  -n, --no-daemon      Run in foreground, do not daemonize\n");
+  printf ("  -h, --help           Display this help and exit\n");
+}
+
 int
 main (int argc, char *argv[])
 {
-  /* Parse command line arguments (if any)  */
+  /* Parse command line arguments */
   const char *config_file = CONFIG_FILE;
-  /* if (argc > 1)
-     {
-       config_file = argv[1];
-     }  */
+  int no_daemon = 0;
+
+  struct option long_options[] = { { "config", required_argument, 0, 'c' },
+                                   { "no-daemon", no_argument, 0, 'n' },
+                                   { "help", no_argument, 0, 'h' },
+                                   { 0, 0, 0, 0 } };
+
+  int opt;
+  int option_index = 0;
+
+  while ((opt = getopt_long (argc, argv, "c:nh", long_options, &option_index))
+         != -1)
+    {
+      switch (opt)
+        {
+        case 'c':
+          config_file = optarg;
+          break;
+        case 'n':
+          no_daemon = 1;
+          break;
+        case 'h':
+          print_usage (argv[0]);
+          return EXIT_SUCCESS;
+        default:
+          print_usage (argv[0]);
+          return EXIT_FAILURE;
+        }
+    }
 
   server_config_t config;
   if (load_config (config_file, &config) != 0)
     {
       fprintf (stderr, "Failed to load configuration\n");
       return EXIT_FAILURE;
+    }
+
+  /* Override daemon mode if --no-daemon option was specified */
+  if (no_daemon)
+    {
+      config.daemon_mode = 0;
     }
 
   /* Initialize logging  */
@@ -104,6 +147,7 @@ main (int argc, char *argv[])
   free (config.bind_address);
   free (config.log_file);
   free (config.pid_file);
+  free (config.file_dir);
 
   return EXIT_SUCCESS;
 }
