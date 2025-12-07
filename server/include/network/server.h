@@ -13,11 +13,11 @@
    Creates, binds, and starts listening on a socket according to CONFIG.
 
    Returns the socket file descriptor on success, or -1 on failure.  */
-int server_socket_setup (server_config_t *config);
+int server_socket_setup(server_config_t *config);
 
 /* Run the server main loop.
    Accepts connections on SERVER_SOCKET and handles them according to CONFIG.
    Continues running until a termination signal is received.  */
-void server_run (int server_socket, server_config_t *config);
+void server_run(int server_socket, server_config_t *config);
 
 #endif /* SERVER_H */

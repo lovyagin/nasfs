@@ -13,6 +13,6 @@
    it in the background.
 
    Returns 0 on success, or exits with failure on error.  */
-int daemonize (void);
+int daemonize(void);
 
 #endif /* DAEMON_H */

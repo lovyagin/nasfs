@@ -11,8 +11,7 @@
 
 /* Client connection context structure
    Contains all the data needed for the connection handler thread */
-typedef struct client_context
-{
+typedef struct client_context {
   int client_socket;
   server_config_t *config;
 } client_context_t;
@@ -25,6 +24,6 @@ typedef struct client_context
    in its own thread for each client connection.
 
    Returns NULL when the client disconnects or on error.  */
-void *handle_client (void *client_ctx_ptr);
+void *handle_client(void *client_ctx_ptr);
 
 #endif /* CONNECTIONS_H */

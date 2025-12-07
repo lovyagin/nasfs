@@ -16,6 +16,6 @@ extern volatile sig_atomic_t server_running;
 /* Signal handler for SIGTERM and SIGINT.
    Logs the signal and sets server_running to 0 for clean shutdown.
    SIGNO is the signal number that was received.  */
-void signal_handler (int signo);
+void signal_handler(int signo);
 
 #endif /* SIGNAL_HANDLER_H */
