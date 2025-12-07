@@ -19,6 +19,7 @@ typedef struct
   int log_level;        /* Minimum log level to record */
   int daemon_mode;      /* Whether to run as a daemon (1) or not (0) */
   char *pid_file;       /* Path to the PID file for daemon mode */
+  char *storage_dir       /* Directory for serving files future can become a mount point */
 } server_config_t;
 
 /* Load configuration from a file.
