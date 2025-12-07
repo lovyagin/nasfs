@@ -14,14 +14,14 @@
 
 /* Use appropriate header for PATH_MAX based on platform */
 #if defined(__linux__)
-  #include <linux/limits.h>
+#include <linux/limits.h>
 #elif defined(__APPLE__) || defined(__FreeBSD__)
-  #include <sys/syslimits.h>
+#include <sys/syslimits.h>
 #else
-  #include <limits.h>
-  #ifndef PATH_MAX
-    #define PATH_MAX 4096  /* Fallback value if not defined */
-  #endif
+#include <limits.h>
+#ifndef PATH_MAX
+#define PATH_MAX 4096 /* Fallback value if not defined */
+#endif
 #endif
 
 #include "config/config.h"
@@ -159,7 +159,7 @@ main (int argc, char *argv[])
   free (config.bind_address);
   free (config.log_file);
   free (config.pid_file);
-  free (config.file_dir);
+  free (config.storage_dir);
 
   return EXIT_SUCCESS;
 }

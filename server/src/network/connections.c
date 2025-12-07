@@ -14,7 +14,7 @@
 #endif
 
 #include <ctype.h>
-   
+
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -85,27 +85,27 @@ handle_client (void *client_ctx_ptr)
 
       buffer[bytes_received] = '\0';
       log_all (LOG_DEBUG, "Received from client: '%s'", buffer);
-      
+
       /* Debug: Print each byte received to identify invisible characters */
       log_all (LOG_DEBUG, "Received bytes in hex:");
       for (int i = 0; i < bytes_received; i++) {
-        log_all (LOG_DEBUG, "[%d]: %02X (%c)", i, buffer[i], 
+        log_all (LOG_DEBUG, "[%d]: %02X (%c)", i, buffer[i],
                isprint(buffer[i]) ? buffer[i] : '.');
       }
 
       /* Trim any leading whitespace manually */
       int start_idx = 0;
-      while (start_idx < bytes_received && 
-            (buffer[start_idx] == ' ' || buffer[start_idx] == '\t' || 
+      while (start_idx < bytes_received &&
+            (buffer[start_idx] == ' ' || buffer[start_idx] == '\t' ||
              buffer[start_idx] == '\r' || buffer[start_idx] == '\n')) {
         start_idx++;
       }
-      
+
       char *command = strtok (buffer + start_idx, " \t\n\r");
       if (command)
         {
           log_all (LOG_DEBUG, "Parsed command: '%s'", command);
-          
+
           if (strcmp (command, "GET") == 0)
             {
               char *filepath = strtok (NULL, " \t\n\r");
@@ -114,12 +114,12 @@ handle_client (void *client_ctx_ptr)
                 {
                   log_all (LOG_INFO, "Client requested file: %s", filepath);
 
-                  /* Build full path using config->file_dir */
+                  /* Build full path using config->storage_dir */
                   char full_path[PATH_MAX];
-                  if (config->file_dir)
+                  if (config->storage_dir)
                     {
                       snprintf (full_path, sizeof (full_path), "%s/%s",
-                                config->file_dir, filepath);
+                                config->storage_dir, filepath);
                       log_all (LOG_DEBUG, "Full path: %s", full_path);
                     }
                   else
@@ -137,7 +137,7 @@ handle_client (void *client_ctx_ptr)
                     {
                       log_all (LOG_INFO, "Sending file: %s (from %s)",
                                filepath,
-                               config->file_dir ? config->file_dir
+                               config->storage_dir ? config->storage_dir
                                                 : "current directory");
 
                       /* Get file size for logging */
@@ -167,20 +167,20 @@ handle_client (void *client_ctx_ptr)
                               break;
                           }
                           total_sent += bytes_sent;
-                          
+
                           /* Log progress for large files */
                           if (file_size > 1048576 && (total_sent - last_progress) > 1048576) {
                               log_all (LOG_DEBUG, "Sent %zu of %zu bytes (%.1f%%)",
-                                     total_sent, file_size, 
+                                     total_sent, file_size,
                                      (double)total_sent / file_size * 100);
                               last_progress = total_sent;
                           }
                         }
-                      
+
                       /* Make sure all data is sent before closing */
                       fsync(fileno(file));
                       fclose (file);
-                      
+
                       /* Signal end of transfer with a properly closed connection */
                       shutdown(client_sock, SHUT_WR);
                       log_all (LOG_INFO, "Finished sending file: %s (%zu of %zu bytes)",
@@ -213,22 +213,22 @@ handle_client (void *client_ctx_ptr)
               if (strcmp (command, "PUT") != 0) {
                 log_all (LOG_WARNING, "Detected malformed PUT command, trying to correct");
               }
-              
+
               char *filepath = strtok (NULL, " \t\n\r");
               char *filesizeStr = strtok (NULL, " \t\n\r");
-              
+
               if (filepath && filesizeStr)
             {
               long filesize = atol(filesizeStr);
-              log_all (LOG_INFO, "Client wants to upload file: %s (%ld bytes)", 
+              log_all (LOG_INFO, "Client wants to upload file: %s (%ld bytes)",
                        filepath, filesize);
 
-              /* Build full path using config->file_dir */
+              /* Build full path using config->storage_dir */
               char full_path[PATH_MAX];
-              if (config->file_dir)
+              if (config->storage_dir)
                 {
                   snprintf (full_path, sizeof (full_path), "%s/%s",
-                            config->file_dir, filepath);
+                            config->storage_dir, filepath);
                   log_all (LOG_DEBUG, "Full path: %s", full_path);
                 }
               else
@@ -239,18 +239,18 @@ handle_client (void *client_ctx_ptr)
                            "FileDir not set, using relative path: %s",
                            full_path);
                 }
-                  
+
               /* Log directory information */
               char dir_path[PATH_MAX];
               strncpy(dir_path, full_path, sizeof(dir_path) - 1);
               dir_path[sizeof(dir_path) - 1] = '\0';
-                  
+
               char *dir_slash = strrchr(dir_path, '/');
-              if (dir_slash) 
+              if (dir_slash)
                 {
                   *dir_slash = '\0';
                   log_all (LOG_DEBUG, "Directory path: %s", dir_path);
-                      
+
                   /* Check if directory exists */
                   struct stat st;
                   if (stat(dir_path, &st) == 0 && S_ISDIR(st.st_mode))
@@ -265,7 +265,7 @@ handle_client (void *client_ctx_ptr)
 
                   /* Create directories if they don't exist */
                   char *last_slash = strrchr(full_path, '/');
-                  if (last_slash) 
+                  if (last_slash)
                     {
                       *last_slash = '\0';
                       /* Create directories recursively with mode 0755 */
@@ -274,36 +274,36 @@ handle_client (void *client_ctx_ptr)
                         {
                           *p = '\0';
                           int mkdir_result = mkdir(full_path, 0755);
-                          log_all (LOG_DEBUG, "Creating directory: %s (result: %d, errno: %s)", 
+                          log_all (LOG_DEBUG, "Creating directory: %s (result: %d, errno: %s)",
                                   full_path, mkdir_result, mkdir_result < 0 ? strerror(errno) : "success");
                           *p = '/';
                         }
                       int mkdir_result = mkdir(full_path, 0755);
-                      log_all (LOG_DEBUG, "Creating final directory: %s (result: %d, errno: %s)", 
+                      log_all (LOG_DEBUG, "Creating final directory: %s (result: %d, errno: %s)",
                               full_path, mkdir_result, mkdir_result < 0 ? strerror(errno) : "success");
                       *last_slash = '/';
                     }
 
                   log_all (LOG_DEBUG, "Attempting to create file: %s", full_path);
                   FILE *file = fopen (full_path, "wb");
-                  
+
                   if (file == NULL) {
-                      log_all (LOG_ERROR, "Failed to create file: %s - Error: %s", 
+                      log_all (LOG_ERROR, "Failed to create file: %s - Error: %s",
                                full_path, strerror(errno));
-                               
+
                       /* Check file path permissions */
                       char parent_dir[PATH_MAX];
                       char *last_dir_slash = strrchr(full_path, '/');
                       if (last_dir_slash) {
                           strncpy(parent_dir, full_path, last_dir_slash - full_path);
                           parent_dir[last_dir_slash - full_path] = '\0';
-                          
+
                           struct stat st;
                           if (stat(parent_dir, &st) == 0) {
-                              log_all (LOG_DEBUG, "Parent directory %s exists with permissions: %o", 
+                              log_all (LOG_DEBUG, "Parent directory %s exists with permissions: %o",
                                       parent_dir, st.st_mode & 0777);
                           } else {
-                              log_all (LOG_ERROR, "Parent directory %s does not exist or not accessible: %s", 
+                              log_all (LOG_ERROR, "Parent directory %s does not exist or not accessible: %s",
                                       parent_dir, strerror(errno));
                           }
                       }
@@ -320,56 +320,56 @@ handle_client (void *client_ctx_ptr)
                       size_t total_received = 0;
                       ssize_t bytes_read;
                       size_t last_progress = 0;
-                          
+
                       while (total_received < filesize)
                         {
                           size_t to_read = BUFFER_SIZE;
                           if (filesize - total_received < BUFFER_SIZE)
                             to_read = filesize - total_received;
-                                
+
                           bytes_read = recv(client_sock, file_buffer, to_read, 0);
-                              
+
                           if (bytes_read <= 0)
                             {
                               if (bytes_read == 0) {
                                 log_all (LOG_WARNING, "Client closed connection before finishing upload");
                               } else {
-                                log_all (LOG_ERROR, "Error receiving file data: %s", 
+                                log_all (LOG_ERROR, "Error receiving file data: %s",
                                          strerror(errno));
                               }
                               break;
                             }
-                                
+
                           size_t bytes_written = fwrite(file_buffer, 1, bytes_read, file);
                           if (bytes_written != bytes_read) {
-                              log_all (LOG_ERROR, "Error writing to file: %s", 
+                              log_all (LOG_ERROR, "Error writing to file: %s",
                                        strerror(errno));
                               break;
                           }
-                              
+
                           total_received += bytes_read;
-                              
+
                           /* Log progress for large files */
                           if (filesize > 1048576 && (total_received - last_progress) > 1048576) {
-                              log_all (LOG_DEBUG, "Received %zu/%ld bytes (%.1f%%)", 
+                              log_all (LOG_DEBUG, "Received %zu/%ld bytes (%.1f%%)",
                                        total_received, filesize,
                                        (double)total_received / filesize * 100);
                               last_progress = total_received;
                           }
                         }
-                        
+
                       fclose (file);
-                      
+
                       if (total_received == filesize)
                         {
-                          log_all (LOG_INFO, "Successfully received file: %s (%zu bytes)", 
+                          log_all (LOG_INFO, "Successfully received file: %s (%zu bytes)",
                                    filepath, total_received);
                           const char *ok_response = "OK\n";
                           send (client_sock, ok_response, strlen(ok_response), 0);
                         }
                       else
                         {
-                          log_all (LOG_ERROR, "Incomplete file transfer: %zu/%ld bytes", 
+                          log_all (LOG_ERROR, "Incomplete file transfer: %zu/%ld bytes",
                                    total_received, filesize);
                           const char *error_response = "ERROR: Incomplete transfer\n";
                           send (client_sock, error_response, strlen(error_response), 0);
@@ -378,7 +378,7 @@ handle_client (void *client_ctx_ptr)
                     }
                   else
                     {
-                      log_all (LOG_ERROR, "Failed to create file: %s (full path: %s): %s", 
+                      log_all (LOG_ERROR, "Failed to create file: %s (full path: %s): %s",
                                filepath, full_path, strerror(errno));
                       const char *error_response = "ERROR: Failed to create file\n";
                       send (client_sock, error_response, strlen(error_response), 0);
@@ -394,27 +394,27 @@ handle_client (void *client_ctx_ptr)
           else
             {
               /* Check if command starts with P, U, T and might be intended as PUT */
-              if ((command[0] == 'P' || command[0] == 'p') && 
+              if ((command[0] == 'P' || command[0] == 'p') &&
                   (strlen(command) > 1 && (command[1] == 'U' || command[1] == 'u')) &&
-                  (strlen(command) > 2 && (command[2] == 'T' || command[2] == 't'))) 
+                  (strlen(command) > 2 && (command[2] == 'T' || command[2] == 't')))
               {
                 log_all (LOG_WARNING, "Received possible PUT variant, trying to process as PUT");
-                
+
                 /* Try to process as PUT command */
                 char *filepath = strtok (NULL, " \t\n\r");
                 char *filesizeStr = strtok (NULL, " \t\n\r");
-                
+
                 if (filepath && filesizeStr)
                 {
                   /* Redirect to PUT command handling by re-running with corrected command */
                   log_all (LOG_INFO, "Treating '%s' as PUT command", command);
-                  
-                  /* Build full path using config->file_dir */
+
+                  /* Build full path using config->storage_dir */
                   char full_path[PATH_MAX];
-                  if (config->file_dir)
+                  if (config->storage_dir)
                     {
                       snprintf (full_path, sizeof (full_path), "%s/%s",
-                                config->file_dir, filepath);
+                                config->storage_dir, filepath);
                       log_all (LOG_DEBUG, "Full path: %s", full_path);
                     }
                   else
@@ -425,12 +425,12 @@ handle_client (void *client_ctx_ptr)
                                "FileDir not set, using relative path: %s",
                                full_path);
                     }
-                  
+
                   /* Continue with PUT command handling */
                   long filesize = atol(filesizeStr);
-                  log_all (LOG_INFO, "Client wants to upload file: %s (%ld bytes)", 
+                  log_all (LOG_INFO, "Client wants to upload file: %s (%ld bytes)",
                           filepath, filesize);
-                          
+
                   /* The rest of PUT handling... */
                   FILE *file = fopen (full_path, "wb");
                   if (file)
@@ -438,62 +438,62 @@ handle_client (void *client_ctx_ptr)
                     /* Send READY to client */
                     const char *ready_response = "READY\n";
                     send (client_sock, ready_response, strlen(ready_response), 0);
-                    
+
                     /* Continue with existing PUT implementation... */
                     char file_buffer[BUFFER_SIZE];
                     size_t total_received = 0;
                     ssize_t bytes_read;
                     size_t last_progress = 0;
-                        
+
                     while (total_received < filesize)
                     {
                       size_t to_read = BUFFER_SIZE;
                       if (filesize - total_received < BUFFER_SIZE)
                         to_read = filesize - total_received;
-                            
+
                       bytes_read = recv(client_sock, file_buffer, to_read, 0);
-                          
+
                       if (bytes_read <= 0)
                       {
                         if (bytes_read == 0) {
                           log_all (LOG_WARNING, "Client closed connection before finishing upload");
                         } else {
-                          log_all (LOG_ERROR, "Error receiving file data: %s", 
+                          log_all (LOG_ERROR, "Error receiving file data: %s",
                                   strerror(errno));
                         }
                         break;
                       }
-                            
+
                       size_t bytes_written = fwrite(file_buffer, 1, bytes_read, file);
                       if (bytes_written != bytes_read) {
-                          log_all (LOG_ERROR, "Error writing to file: %s", 
+                          log_all (LOG_ERROR, "Error writing to file: %s",
                                   strerror(errno));
                           break;
                       }
-                          
+
                       total_received += bytes_read;
-                          
+
                       /* Log progress for large files */
                       if (filesize > 1048576 && (total_received - last_progress) > 1048576) {
-                          log_all (LOG_DEBUG, "Received %zu/%ld bytes (%.1f%%)", 
+                          log_all (LOG_DEBUG, "Received %zu/%ld bytes (%.1f%%)",
                                   total_received, filesize,
                                   (double)total_received / filesize * 100);
                           last_progress = total_received;
                       }
                     }
-                    
+
                     fclose (file);
-                    
+
                     if (total_received == filesize)
                     {
-                      log_all (LOG_INFO, "Successfully received file: %s (%zu bytes)", 
+                      log_all (LOG_INFO, "Successfully received file: %s (%zu bytes)",
                               filepath, total_received);
                       const char *ok_response = "OK\n";
                       send (client_sock, ok_response, strlen(ok_response), 0);
                     }
                     else
                     {
-                      log_all (LOG_ERROR, "Incomplete file transfer: %zu/%ld bytes", 
+                      log_all (LOG_ERROR, "Incomplete file transfer: %zu/%ld bytes",
                               total_received, filesize);
                       const char *error_response = "ERROR: Incomplete transfer\n";
                       send (client_sock, error_response, strlen(error_response), 0);
@@ -502,7 +502,7 @@ handle_client (void *client_ctx_ptr)
                   }
                   else
                   {
-                    log_all (LOG_ERROR, "Failed to create file: %s (full path: %s): %s", 
+                    log_all (LOG_ERROR, "Failed to create file: %s (full path: %s): %s",
                             filepath, full_path, strerror(errno));
                     const char *error_response = "ERROR: Failed to create file\n";
                     send (client_sock, error_response, strlen(error_response), 0);
@@ -510,16 +510,16 @@ handle_client (void *client_ctx_ptr)
                   continue; // Skip the error message below
                 }
               }
-              
+
               log_all (LOG_WARNING, "Unknown command received: '%s'", command);
               log_all (LOG_DEBUG, "Command length: %zu bytes", strlen(command));
               log_all (LOG_DEBUG, "Command in hex:");
               for (size_t i = 0; i < strlen(command); i++) {
-                log_all (LOG_DEBUG, "[%zu]: %02X (%c)", i, command[i], 
+                log_all (LOG_DEBUG, "[%zu]: %02X (%c)", i, command[i],
                        isprint(command[i]) ? command[i] : '.');
               }
               log_all (LOG_DEBUG, "Expected 'PUT' in hex: %02X %02X %02X", 'P', 'U', 'T');
-              
+
               const char *response_error = "ERROR: Unknown command\n";
               send (client_sock, response_error, strlen (response_error), 0);
             }
