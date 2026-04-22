@@ -3,7 +3,7 @@
  * @brief Main entry point for the NASFS client application.
  *
  * Initializes a libuv event loop, connects to the NASFS server, and
- * implements a simple echo mechanism for testing the basic protocol.
+ * implements protocol framing to test the server's session dispatcher.
  */
 
 #include <stdio.h>
@@ -12,19 +12,9 @@
 #include <uv.h>
 #include "protocol.h"
 
-/**
- * @brief Default server port to connect to.
- */
 #define SERVER_PORT 8080
-
-/**
- * @brief Default server IP address to connect to.
- */
 #define SERVER_IP "127.0.0.1"
 
-/**
- * @brief Global libuv event loop for the client.
- */
 uv_loop_t *loop;
 
 /**
@@ -59,10 +49,10 @@ void on_close(uv_handle_t *handle) {
  */
 void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
     if (nread > 0) {
-        printf("Received from server (%zd bytes): %.*s\n", nread, (int)nread, buf->base);
+        printf("Received from server (%zd bytes)\n", nread);
     } else if (nread < 0) {
         if (nread != UV_EOF) {
-            fprintf(stderr, "Read error: %s\n", uv_err_name(nread));
+            fprintf(stderr, "Read error: %s\n", uv_err_name((int)nread));
         }
         uv_close((uv_handle_t *)stream, on_close);
     }
@@ -82,9 +72,47 @@ void on_write(uv_write_t *req, int status) {
     if (status) {
         fprintf(stderr, "Write error: %s\n", uv_strerror(status));
     } else {
-        printf("Message sent to server.\n");
+        printf("Frame sent successfully.\n");
+    }
+    
+    uv_buf_t *buf = (uv_buf_t *)req->data;
+    if (buf) {
+        if (buf->base) {
+            free(buf->base);
+        }
+        free(buf);
     }
     free(req);
+}
+
+/**
+ * @brief Packs and sends a protocol command to the server.
+ *
+ * @param stream The libuv stream to write to.
+ * @param cmd The NASFS command type.
+ * @param payload_str The payload data as a null-terminated string.
+ */
+void send_command(uv_stream_t *stream, nasfs_cmd_type_t cmd, const char *payload_str) {
+    size_t frame_size = 0;
+    uint8_t *frame_data = protocol_pack_frame(
+        cmd, 
+        (const uint8_t *)payload_str, 
+        payload_str ? strlen(payload_str) : 0, 
+        &frame_size
+    );
+
+    if (!frame_data) {
+        fprintf(stderr, "Failed to pack protocol frame\n");
+        return;
+    }
+
+    uv_write_t *write_req = malloc(sizeof(uv_write_t));
+    uv_buf_t *buf = malloc(sizeof(uv_buf_t));
+    
+    *buf = uv_buf_init((char *)frame_data, frame_size);
+    write_req->data = buf;
+
+    uv_write(write_req, stream, buf, 1, on_write);
 }
 
 /**
@@ -104,13 +132,13 @@ void on_connect(uv_connect_t *req, int status) {
     printf("Connected to server.\n");
 
     uv_stream_t *stream = req->handle;
-
     uv_read_start(stream, alloc_buffer, on_read);
 
-    uv_write_t *write_req = malloc(sizeof(uv_write_t));
-    char *message = "Hello, NASFS Server!";
-    uv_buf_t buf = uv_buf_init(message, strlen(message));
-    uv_write(write_req, stream, &buf, 1, on_write);
+    printf("Sending AUTH command...\n");
+    send_command(stream, NASFS_CMD_AUTH, "dummy_token_123");
+
+    printf("Sending PUT_REQ command...\n");
+    send_command(stream, NASFS_CMD_PUT_REQ, "test_file.txt");
 
     free(req);
 }
