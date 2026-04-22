@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+server_config_t global_config;
+
 /* Load configuration from a file.
    Reads configuration settings from FILENAME and stores them in CONFIG.
    Default values are set first, then overridden by values in the file.

@@ -41,6 +41,8 @@ typedef struct {
     size_t recv_length;            /**< Current number of bytes in the receive buffer. */
     size_t recv_capacity;          /**< Total allocated capacity of the receive buffer. */
     uv_file active_fd;             /**< File descriptor for active transfers (PUT/GET). */
+    uv_fs_t fs_req;                /**< Filesystem request handle for async operations. */
+    uint64_t file_offset;          /**< Current offset in the active file. */
 } client_session_t;
 
 /**

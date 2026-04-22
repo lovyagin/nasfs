@@ -44,28 +44,27 @@ void on_signal(uv_signal_t *watcher, int signum) {
  * @return Exit status code.
  */
 int main(int argc, char **argv) {
-    server_config_t config;
     const char *config_file = (argc > 1) ? argv[1] : "config/nasfs.conf";
 
-    set_defaults(&config);
-    if (load_config(config_file, &config) != 0) {
+    set_defaults(&global_config);
+    if (load_config(config_file, &global_config) != 0) {
         fprintf(stderr, "Warning: Failed to load config file '%s'. Using defaults.\n", config_file);
     }
 
-    log_init(config.log_file, config.log_level);
+    log_init(global_config.log_file, global_config.log_level);
     log_all(LOG_INFO, "Starting NASFS server...");
 
-    if (config.daemon_mode) {
+    if (global_config.daemon_mode) {
         log_all(LOG_INFO, "Daemonizing process...");
         daemonize();
     }
 
-    if (config.pid_file && strlen(config.pid_file) > 0) {
-        if (create_pid_file(config.pid_file) == 0) {
-            set_pid_file_path(config.pid_file);
+    if (global_config.pid_file && strlen(global_config.pid_file) > 0) {
+        if (create_pid_file(global_config.pid_file) == 0) {
+            set_pid_file_path(global_config.pid_file);
             atexit(cleanup_pid_file);
         } else {
-            log_all(LOG_ERROR, "Failed to create PID file: %s", config.pid_file);
+            log_all(LOG_ERROR, "Failed to create PID file: %s", global_config.pid_file);
             return 1;
         }
     }
@@ -81,14 +80,14 @@ int main(int argc, char **argv) {
     uv_tcp_init(loop, &server);
 
     struct sockaddr_in addr;
-    const char *bind_addr = config.bind_address ? config.bind_address : "0.0.0.0";
-    int port = config.port > 0 ? config.port : 8080;
+    const char *bind_addr = global_config.bind_address ? global_config.bind_address : "0.0.0.0";
+    int port = global_config.port > 0 ? global_config.port : 8080;
     
     uv_ip4_addr(bind_addr, port, &addr);
 
     uv_tcp_bind(&server, (const struct sockaddr *)&addr, 0);
     
-    int max_conn = config.max_connections > 0 ? config.max_connections : 128;
+    int max_conn = global_config.max_connections > 0 ? global_config.max_connections : 128;
     int r = uv_listen((uv_stream_t *)&server, max_conn, session_on_new_connection);
     
     if (r) {

@@ -29,6 +29,11 @@ typedef struct {
 } server_config_t;
 
 /**
+ * @brief Global server configuration instance.
+ */
+extern server_config_t global_config;
+
+/**
  * @brief Load configuration from a file.
  *
  * Reads settings from the specified filename into the configuration structure.
