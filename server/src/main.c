@@ -1,148 +1,206 @@
-/* server/src/main.c -- Main server application file
-   Copyright (C) 2025 Nikita Morozov (@NikitosKey)
+/**
+ * @file main.c
+ * @brief Main entry point for the NASFS server daemon.
+ *
+ * Initializes the configuration, logging, daemonizes if requested, and starts
+ * the libuv event loop for handling incoming TCP connections.
+ */
 
-   This file is part of NASFS server.
-   Entry point for the NASFS server application.  */
-
-#include <getopt.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/resource.h>
-#include <unistd.h>
+#include <uv.h>
+#include <signal.h>
 
-/* Use appropriate header for PATH_MAX based on platform */
-#if defined(__linux__)
-#include <linux/limits.h>
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-#include <sys/syslimits.h>
-#else
-#include <limits.h>
-#ifndef PATH_MAX
-#define PATH_MAX 4096 /* Fallback value if not defined */
-#endif
-#endif
-
+#include "protocol.h"
 #include "config/config.h"
 #include "logging/log.h"
-#include "network/server.h"
 #include "utils/daemon.h"
 #include "utils/pid_file.h"
 #include "utils/signal_handler.h"
 
-#define CONFIG_FILE "/usr/local/etc/nasfs/nasfs.conf"
+uv_loop_t *loop;
+uv_tcp_t server;
+uv_signal_t sigint_watcher;
+uv_signal_t sigterm_watcher;
 
-void print_usage(const char *program_name) {
-  printf("Usage: %s [OPTIONS]\n\n", program_name);
-  printf("Options:\n");
-  printf("  -c, --config FILE    Specify configuration file (default: %s)\n",
-         CONFIG_FILE);
-  printf("  -n, --no-daemon      Run in foreground, do not daemonize\n");
-  printf("  -h, --help           Display this help and exit\n");
+/**
+ * @struct client_t
+ * @brief Represents an active client connection.
+ */
+typedef struct {
+    uv_tcp_t handle;
+} client_t;
+
+/**
+ * @brief Allocates a buffer for reading data from a libuv stream.
+ *
+ * @param handle The libuv handle requesting the buffer.
+ * @param suggested_size The size suggested by libuv.
+ * @param buf Pointer to the uv_buf_t structure to populate.
+ */
+void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
+    (void)handle;
+    buf->base = malloc(suggested_size);
+    buf->len = suggested_size;
 }
 
-int main(int argc, char *argv[]) {
-  /* Parse command line arguments */
-  const char *config_file = CONFIG_FILE;
-  int no_daemon = 0;
+/**
+ * @brief Callback invoked when a client connection is fully closed.
+ *
+ * @param handle The libuv handle representing the client connection.
+ */
+void on_close(uv_handle_t *handle) {
+    client_t *client = (client_t *)handle;
+    free(client);
+    log_all(LOG_INFO, "Client disconnected.");
+}
 
-  struct option long_options[] = {{"config", required_argument, 0, 'c'},
-                                  {"no-daemon", no_argument, 0, 'n'},
-                                  {"help", no_argument, 0, 'h'},
-                                  {0, 0, 0, 0}};
-
-  int opt;
-  int option_index = 0;
-
-  while ((opt = getopt_long(argc, argv, "c:nh", long_options, &option_index)) !=
-         -1) {
-    switch (opt) {
-      case 'c':
-        config_file = optarg;
-        break;
-      case 'n':
-        no_daemon = 1;
-        break;
-      case 'h':
-        print_usage(argv[0]);
-        return EXIT_SUCCESS;
-      default:
-        print_usage(argv[0]);
-        return EXIT_FAILURE;
+/**
+ * @brief Callback invoked when an async write operation completes.
+ *
+ * @param req The write request.
+ * @param status The status of the write operation (0 for success).
+ */
+void echo_write(uv_write_t *req, int status) {
+    if (status) {
+        log_all(LOG_ERROR, "Write error: %s", uv_strerror(status));
     }
-  }
+    free(req);
+}
 
-  server_config_t config;
-  if (load_config(config_file, &config) != 0) {
-    fprintf(stderr, "Failed to load configuration\n");
-    return EXIT_FAILURE;
-  }
+/**
+ * @brief Callback invoked when data is read from a client stream.
+ *
+ * @param client_stream The client connection stream.
+ * @param nread Number of bytes read, or negative on error/EOF.
+ * @param buf The buffer containing the read data.
+ */
+void on_read(uv_stream_t *client_stream, ssize_t nread, const uv_buf_t *buf) {
+    if (nread > 0) {
+        log_all(LOG_DEBUG, "Received %zd bytes.", nread);
 
-  /* Override daemon mode if --no-daemon option was specified */
-  if (no_daemon) {
-    config.daemon_mode = 0;
-  }
-
-  /* Initialize logging  */
-  log_init(config.log_file, config.log_level);
-  log_all(LOG_INFO, "Starting NASFS server...");
-
-  /* Register signal handlers  */
-  if (signal(SIGTERM, signal_handler) == SIG_ERR ||
-      signal(SIGINT, signal_handler) == SIG_ERR) {
-    log_all(LOG_ERROR, "Failed to register signal handlers");
-    return EXIT_FAILURE;
-  }
-
-  if (config.daemon_mode) {
-    log_all(LOG_INFO, "Starting in daemon mode");
-    if (daemonize() != 0) {
-      log_all(LOG_ERROR, "Failed to daemonize");
-      return EXIT_FAILURE;
-    }
-    log_all(LOG_INFO, "Successfully daemonized, PID: %d", getpid());
-
-    /* Create PID file  */
-    if (create_pid_file(config.pid_file) != 0) {
-      log_all(LOG_ERROR, "Failed to create PID file");
-      return EXIT_FAILURE;
+        uv_write_t *req = (uv_write_t *)malloc(sizeof(uv_write_t));
+        uv_buf_t wrbuf = uv_buf_init(buf->base, nread);
+        uv_write(req, client_stream, &wrbuf, 1, echo_write);
+    } else if (nread < 0) {
+        if (nread != UV_EOF) {
+            log_all(LOG_ERROR, "Read error: %s", uv_err_name(nread));
+        }
+        uv_close((uv_handle_t *)client_stream, on_close);
     }
 
-    /* Register cleanup handler for PID file  */
-    atexit(cleanup_pid_file);
-    set_pid_file_path(config.pid_file);
-  }
+    if (buf->base) {
+        free(buf->base);
+    }
+}
 
-  /* Check current working dir */
-  char cwd[PATH_MAX];
-  if (getcwd(cwd, sizeof(cwd)) != NULL) {
-    log_all(LOG_DEBUG, "Current working dir: %s\n", cwd);
-  } else {
-    log_all(LOG_ERROR, "getcwd() error");
-  }
+/**
+ * @brief Callback invoked when a new incoming connection is received.
+ *
+ * @param server_stream The server stream that received the connection.
+ * @param status The status of the connection attempt.
+ */
+void on_new_connection(uv_stream_t *server_stream, int status) {
+    if (status < 0) {
+        log_all(LOG_ERROR, "New connection error: %s", uv_strerror(status));
+        return;
+    }
 
-  /* Setup network  */
-  int server_socket = server_socket_setup(&config);
-  if (server_socket < 0) {
-    log_all(LOG_ERROR, "Failed to setup server socket");
-    return EXIT_FAILURE;
-  }
+    client_t *client = malloc(sizeof(client_t));
+    uv_tcp_init(loop, &client->handle);
 
-  /* Run server main loop  */
-  log_all(LOG_INFO, "Server ready to accept connections");
-  server_run(server_socket, &config);
+    if (uv_accept(server_stream, (uv_stream_t *)&client->handle) == 0) {
+        log_all(LOG_INFO, "New client connected.");
+        uv_read_start((uv_stream_t *)&client->handle, alloc_buffer, on_read);
+    } else {
+        uv_close((uv_handle_t *)&client->handle, on_close);
+    }
+}
 
-  /* Cleanup  */
-  log_all(LOG_INFO, "Server shutting down...");
+/**
+ * @brief Callback invoked when a system signal is received.
+ *
+ * @param watcher The signal watcher handle.
+ * @param signum The signal number received.
+ */
+void on_signal(uv_signal_t *watcher, int signum) {
+    signal_handler(signum);
+    uv_stop(watcher->loop);
+}
 
-  if (config.daemon_mode) remove_pid_file(config.pid_file);
+/**
+ * @brief The main execution loop of the NASFS server.
+ *
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ * @return Exit status code.
+ */
+int main(int argc, char **argv) {
+    server_config_t config;
+    const char *config_file = (argc > 1) ? argv[1] : "config/nasfs.conf";
 
-  /* Free allocated config memory  */
-  free(config.bind_address);
-  free(config.log_file);
-  free(config.pid_file);
-  free(config.storage_dir);
+    set_defaults(&config);
+    if (load_config(config_file, &config) != 0) {
+        fprintf(stderr, "Warning: Failed to load config file '%s'. Using defaults.\n", config_file);
+    }
 
-  return EXIT_SUCCESS;
+    log_init(config.log_file, config.log_level);
+    log_all(LOG_INFO, "Starting NASFS server...");
+
+    if (config.daemon_mode) {
+        log_all(LOG_INFO, "Daemonizing process...");
+        daemonize();
+    }
+
+    if (config.pid_file && strlen(config.pid_file) > 0) {
+        if (create_pid_file(config.pid_file) == 0) {
+            set_pid_file_path(config.pid_file);
+            atexit(cleanup_pid_file);
+        } else {
+            log_all(LOG_ERROR, "Failed to create PID file: %s", config.pid_file);
+            return 1;
+        }
+    }
+
+    loop = uv_default_loop();
+
+    uv_signal_init(loop, &sigint_watcher);
+    uv_signal_start(&sigint_watcher, on_signal, SIGINT);
+
+    uv_signal_init(loop, &sigterm_watcher);
+    uv_signal_start(&sigterm_watcher, on_signal, SIGTERM);
+
+    uv_tcp_init(loop, &server);
+
+    struct sockaddr_in addr;
+    const char *bind_addr = config.bind_address ? config.bind_address : "0.0.0.0";
+    int port = config.port > 0 ? config.port : 8080;
+    
+    uv_ip4_addr(bind_addr, port, &addr);
+
+    uv_tcp_bind(&server, (const struct sockaddr *)&addr, 0);
+    
+    int max_conn = config.max_connections > 0 ? config.max_connections : 128;
+    int r = uv_listen((uv_stream_t *)&server, max_conn, on_new_connection);
+    
+    if (r) {
+        log_all(LOG_ERROR, "Listen error: %s", uv_strerror(r));
+        return 1;
+    }
+
+    log_all(LOG_INFO, "nasfs_server listening on %s:%d...", bind_addr, port);
+    
+    uv_run(loop, UV_RUN_DEFAULT);
+
+    log_all(LOG_INFO, "NASFS server shutting down cleanly...");
+
+    uv_close((uv_handle_t *)&sigint_watcher, NULL);
+    uv_close((uv_handle_t *)&sigterm_watcher, NULL);
+    uv_close((uv_handle_t *)&server, NULL);
+    
+    uv_run(loop, UV_RUN_NOWAIT);
+    uv_loop_close(loop);
+
+    return 0;
 }
