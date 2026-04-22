@@ -27,10 +27,15 @@
  */
 typedef enum {
     NASFS_CMD_AUTH       = 0x01, /**< Sent by client after connection to authenticate. */
-    NASFS_CMD_PUT_REQ    = 0x02, /**< Client requests to upload a file. */
-    NASFS_CMD_PUT_DATA   = 0x03, /**< Data chunk for file upload. */
-    NASFS_CMD_GET_REQ    = 0x04, /**< Client requests to download a file. */
-    NASFS_CMD_GET_DATA   = 0x05, /**< Data chunk for file download. */
+    NASFS_CMD_AUTH_ACK   = 0x02, /**< Server response to authentication. */
+    NASFS_CMD_PUT_REQ    = 0x03, /**< Client requests to upload a file. */
+    NASFS_CMD_PUT_ACK    = 0x04, /**< Server confirms file is open and ready for PUT. */
+    NASFS_CMD_PUT_DATA   = 0x05, /**< Data chunk for file upload. */
+    NASFS_CMD_PUT_DONE   = 0x06, /**< Client indicates end of file upload. */
+    NASFS_CMD_GET_REQ    = 0x07, /**< Client requests to download a file. */
+    NASFS_CMD_GET_ACK    = 0x08, /**< Server acknowledges GET request. */
+    NASFS_CMD_GET_DATA   = 0x09, /**< Data chunk for file download. */
+    NASFS_CMD_GET_DONE   = 0x0A, /**< Server indicates end of file download. */
     NASFS_CMD_ERROR      = 0xFF  /**< Error response from the server. */
 } nasfs_cmd_type_t;
 
