@@ -40,4 +40,38 @@ typedef enum {
  */
 #define NASFS_PROTO_HEADER_SIZE 5
 
+/**
+ * @struct nasfs_frame_t
+ * @brief Represents a parsed protocol frame.
+ */
+typedef struct {
+    uint32_t length;         /**< Total length excluding the 4-byte length field itself. */
+    nasfs_cmd_type_t type;   /**< Protocol command type. */
+    uint8_t *payload;        /**< Pointer to payload data (if any). */
+    size_t payload_len;      /**< Length of the payload data. */
+} nasfs_frame_t;
+
+/**
+ * @brief Parses a protocol frame from a byte buffer.
+ *
+ * @param buffer Pointer to the start of the buffer.
+ * @param size Available bytes in the buffer.
+ * @param frame Pointer to the frame structure to populate.
+ * @return The number of bytes consumed if a complete frame was parsed,
+ *         0 if more data is needed, or a negative value on framing error.
+ */
+int protocol_parse_frame(const uint8_t *buffer, size_t size, nasfs_frame_t *frame);
+
+/**
+ * @brief Packs a protocol frame into a dynamically allocated buffer.
+ *
+ * @param type The command type to send.
+ * @param payload Pointer to payload data, or NULL.
+ * @param payload_len Length of the payload.
+ * @param out_size Pointer to store the total size of the allocated buffer.
+ * @return A dynamically allocated buffer containing the packed frame, or NULL on error.
+ *         The caller is responsible for freeing the returned buffer.
+ */
+uint8_t *protocol_pack_frame(nasfs_cmd_type_t type, const uint8_t *payload, size_t payload_len, size_t *out_size);
+
 #endif /* NASFS_PROTOCOL_H */

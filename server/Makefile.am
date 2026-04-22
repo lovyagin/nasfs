@@ -4,6 +4,7 @@ nasfs_server_SOURCES = \
     src/main.c \
     src/config/config.c \
     src/logging/log.c \
+    src/network/session.c \
     src/utils/daemon.c \
     src/utils/pid_file.c \
     src/utils/signal_handler.c
