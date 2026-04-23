@@ -20,6 +20,14 @@ STORAGE_DIR="${NASFS_STORAGE_DIR:-$ROOT_DIR/storage}"
 TEST_DIR="$TEST_ROOT"
 LOG_DIR="$TEST_DIR/logs"
 
+hash_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
 # Ensure directories exist
 mkdir -p "$STORAGE_DIR"
 mkdir -p "$LOG_DIR"
@@ -60,7 +68,7 @@ TEST_INPUT="$TEST_DIR/test_file_input.bin"
 TEST_OUTPUT="$TEST_DIR/test_file_output.bin"
 # Create a 2MB file
 dd if=/dev/urandom of="$TEST_INPUT" bs=1M count=2 2>/dev/null
-INPUT_HASH=$(shasum -a 256 "$TEST_INPUT" | awk '{print $1}')
+INPUT_HASH=$(hash_file "$TEST_INPUT")
 printf "      Created 2MB random file. Hash: %s...\n" "${INPUT_HASH:0:16}"
 
 # 3. Start Server
@@ -110,7 +118,7 @@ if [ ! -f "$STORAGE_DIR/$REMOTE_NAME" ]; then
     exit 1
 fi
 
-UPLOAD_HASH=$(shasum -a 256 "$STORAGE_DIR/$REMOTE_NAME" | awk '{print $1}')
+UPLOAD_HASH=$(hash_file "$STORAGE_DIR/$REMOTE_NAME")
 if [ "$INPUT_HASH" != "$UPLOAD_HASH" ]; then
     printf "${RED}%s${NC}\n" "FAIL: Uploaded file hash mismatch!"
     exit 1
@@ -132,7 +140,7 @@ if [ ! -f "$TEST_OUTPUT" ]; then
     exit 1
 fi
 
-DOWNLOAD_HASH=$(shasum -a 256 "$TEST_OUTPUT" | awk '{print $1}')
+DOWNLOAD_HASH=$(hash_file "$TEST_OUTPUT")
 if [ "$INPUT_HASH" != "$DOWNLOAD_HASH" ]; then
     printf "${RED}%s${NC}\n" "FAIL: Downloaded file hash mismatch!"
     exit 1
