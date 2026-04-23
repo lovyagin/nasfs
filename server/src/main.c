@@ -47,17 +47,19 @@ void on_signal(uv_signal_t* watcher, int signum) {
  */
 int main(int argc, char** argv) {
   const char* config_file = (argc > 1) ? argv[1] : "config/nasfs.conf";
+  int exit_code = 0;
 
   if (sodium_init() < 0) {
     fprintf(stderr, "Failed to initialize libsodium\n");
     return 1;
   }
 
-  set_defaults(&global_config);
+  memset(&global_config, 0, sizeof(global_config));
   if (load_config(config_file, &global_config) != 0) {
     fprintf(stderr,
             "Warning: Failed to load config file '%s'. Using defaults.\n",
             config_file);
+    set_defaults(&global_config);
   }
 
   log_init(global_config.log_file, global_config.log_level);
@@ -75,7 +77,8 @@ int main(int argc, char** argv) {
     } else {
       log_all(LOG_ERROR, "Failed to create PID file: %s",
               global_config.pid_file);
-      return 1;
+      exit_code = 1;
+      goto cleanup;
     }
   }
 
@@ -104,7 +107,8 @@ int main(int argc, char** argv) {
 
   if (r) {
     log_all(LOG_ERROR, "Listen error: %s", uv_strerror(r));
-    return 1;
+    exit_code = 1;
+    goto cleanup;
   }
 
   log_all(LOG_INFO, "nasfs_server listening on %s:%d...", bind_addr, port);
@@ -120,5 +124,7 @@ int main(int argc, char** argv) {
   uv_run(loop, UV_RUN_NOWAIT);
   uv_loop_close(loop);
 
-  return 0;
+cleanup:
+  free_config(&global_config);
+  return exit_code;
 }

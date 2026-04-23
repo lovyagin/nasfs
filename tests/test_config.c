@@ -37,7 +37,7 @@ static int write_test_config(char* path, size_t path_len) {
 }
 
 int main(void) {
-  server_config_t config;
+  server_config_t config = {0};
   char path[] = "/tmp/nasfs-config-test-XXXXXX";
 
   if (write_test_config(path, sizeof(path)) != 0) {
@@ -56,10 +56,12 @@ int main(void) {
       strcmp(config.kex_algorithms, "Kyber512,ML-KEM-512") != 0 ||
       strcmp(config.cipher_algorithms, "xchacha20poly1305") != 0) {
     fprintf(stderr, "parsed values do not match expected configuration\n");
+    free_config(&config);
     unlink(path);
     return 1;
   }
 
+  free_config(&config);
   unlink(path);
   return 0;
 }

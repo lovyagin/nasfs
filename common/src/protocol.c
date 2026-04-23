@@ -13,11 +13,11 @@
 #include "config.h"
 #endif
 
-#include "protocol.h"
-
 #include <arpa/inet.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "protocol.h"
 
 int protocol_parse_frame(const uint8_t* buffer, size_t size,
                          nasfs_frame_t* frame) {

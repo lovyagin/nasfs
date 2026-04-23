@@ -137,6 +137,24 @@ void set_defaults(server_config_t* config) {
   config->cipher_algorithms = strdup("xchacha20poly1305");
 }
 
+/* Release configuration resources.
+   Frees dynamically allocated strings stored in CONFIG and resets all fields
+   to zero so the structure can be reused safely.  */
+void free_config(server_config_t* config) {
+  if (!config) {
+    return;
+  }
+
+  free(config->bind_address);
+  free(config->log_file);
+  free(config->pid_file);
+  free(config->storage_dir);
+  free(config->kex_algorithms);
+  free(config->cipher_algorithms);
+
+  memset(config, 0, sizeof(*config));
+}
+
 /* Trim whitespace from a string and remove comments.
    Modifies STR in place to remove leading and trailing whitespace,
    and cuts off any part of the string that follows a '#' character.  */

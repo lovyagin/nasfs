@@ -59,6 +59,16 @@ int load_config(const char* filename, server_config_t* config);
 void set_defaults(server_config_t* config);
 
 /**
+ * @brief Release memory owned by a configuration structure.
+ *
+ * Frees all dynamically allocated string fields and resets the structure
+ * to zeroed state.
+ *
+ * @param config Pointer to the configuration structure to release.
+ */
+void free_config(server_config_t* config);
+
+/**
  * @brief Trim whitespace from a string.
  *
  * Modifies the string in place to remove leading and trailing whitespace,
