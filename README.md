@@ -1,152 +1,262 @@
 # NASFS
 
-## Network Attached Storage File System
+NASFS is a network file storage prototype with a post-quantum, SSH-like
+control-channel negotiation layer. The data plane for file transfer remains
+unencrypted by design; only the control channel is protected.
 
-NASFS is a fast, lightweight and secure file system designed for networked storage devices and is intended to shift the load to some powerful server, allowing for example weak routers with OpenWRT firmware to be connected as storage devices.
+Current protocol characteristics:
+- TCP server/client built on `libuv`
+- configurable KEX and control-channel cipher selection
+- SSH-like client preference lists with server-side allowlists
+- post-quantum KEX via `liboqs`
+- encrypted control channel via `libsodium`
+- bulk `PUT/GET` file data transferred in clear text
 
-## Prerequisites
+## Dependencies
 
-- GCC or compatible C compiler
-- GNU Autotools (autoconf, automake, libtool)
-- POSIX-compatible operating system
-- Pthreads library
+Build dependencies:
+- C11 compiler
+- `cmake` or GNU autotools
+- `pkg-config`
+- `libuv`
+- `liboqs`
+- `libsodium`
+- OpenSSL `libcrypto`
 
-## Building and Installation
+CI and linting also use:
+- `clang-format`
+- `clang-tidy`
+- `shellcheck`
 
-### Using Autotools
+## Build
 
-1. Generate the configure script:
-   ```
-   ./autogen.sh
-   ```
+### Autotools
 
-2. Make build directory and enter it:
-   ```
-   mkdir build
-   cd build
-   ```
+Generate build files:
 
-3. Configure the build:
-   ```
-   ../configure
-   ```
+```sh
+./autogen.sh
+```
 
-   Useful install options:
-   ```
-   ../configure --disable-systemd
-   ../configure --with-systemdsystemunitdir=/lib/systemd/system
-   ```
+Configure and build:
 
-4. Build the project:
-   ```
-   make
-   ```
+```sh
+./configure
+make -j"$(nproc)"
+```
 
-5. Run the full test suite:
-   ```
-   make check
-   ```
+Useful options:
 
-5. Install (requires root privileges):
-   ```
-   sudo make install
-   ```
+```sh
+./configure --enable-debug
+./configure --disable-systemd
+./configure --with-systemdsystemunitdir=/lib/systemd/system
+```
 
-### Configuration
+Run tests:
 
-Configuration files are installed to `/etc/nasfs/` by default. The main server configuration file is `/etc/nasfs/nasfs.conf`.
+```sh
+make check
+```
 
-The default PID file path used by the installed layouts is:
-`/usr/local/var/run/nasfs/nasfs-server.pid`
+Install:
 
-The installation also provides:
+```sh
+sudo make install
+```
+
+### CMake
+
+Configure and build:
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+Useful options:
+
+```sh
+-DNASFS_INSTALL_SYSTEMD=OFF
+-DNASFS_SYSTEMD_UNIT_DIR=/lib/systemd/system
+-DNASFS_ENABLE_SANITIZERS=ON
+```
+
+Run tests:
+
+```sh
+ctest --test-dir build --output-on-failure
+```
+
+Install:
+
+```sh
+sudo cmake --install build
+```
+
+For staged install verification:
+
+```sh
+cmake --install build --prefix "$PWD/install-root"
+```
+
+## Installed layout
+
+Default install targets:
+- binaries: `/usr/local/bin`
+- config: `/usr/local/etc/nasfs/nasfs.conf`
+- runtime directories:
+  - `/usr/local/var/run/nasfs`
+  - `/usr/local/var/log/nasfs`
+- systemd unit: `/usr/local/lib/systemd/system/nasfs.service`
+
+Installed commands:
 - `nasfs_server`
 - `nasfs_client`
 - `nasfsctl`
-- `nasfs.service` for `systemd`-based systems when `systemd` install support is enabled
 
-### Using CMake
+Default PID file:
 
-The CMake build supports the same main features as the autotools build:
-- server and client binaries
-- `nasfsctl`
-- optional `systemd` unit installation
-- unit tests
-- end-to-end integration test
-
-Example:
-
-```
-cmake -S . -B build-cmake
-cmake --build build-cmake
-ctest --test-dir build-cmake --output-on-failure
-cmake --install build-cmake
+```text
+/usr/local/var/run/nasfs/nasfs-server.pid
 ```
 
-Relevant CMake options:
+## Configuration
 
-```
--DNASFS_INSTALL_SYSTEMD=OFF
--DNASFS_SYSTEMD_UNIT_DIR=/lib/systemd/system
-```
+The default server config is installed as:
 
-## Usage
-
-### Starting the Server
-
-After installation, you can control the server using the portable `nasfsctl` command:
-
-```
-nasfsctl start    # Start the server
-nasfsctl stop     # Stop the server
-nasfsctl restart  # Restart the server
-nasfsctl status   # Check server status
+```text
+/usr/local/etc/nasfs/nasfs.conf
 ```
 
-On systems with `systemd`, you can also use:
+Important options:
+- `ListenAddr`
+- `Port`
+- `MaxConn`
+- `ClientTimeout`
+- `LogFile`
+- `LogLevel`
+- `DaemonMode`
+- `PidFile`
+- `StorageDir`
+- `KexAlgorithms`
+- `CipherAlgorithms`
 
+Example defaults:
+
+```text
+ListenAddr 0.0.0.0
+Port 5252
+LogFile /usr/local/var/log/nasfs/nasfs-server.log
+PidFile /usr/local/var/run/nasfs/nasfs-server.pid
+KexAlgorithms ML-KEM-512,Kyber512,ML-KEM-768,Kyber768
+CipherAlgorithms xchacha20poly1305
 ```
+
+## Negotiation model
+
+The secure control channel works in an SSH-like way:
+- client sends ordered KEX and cipher preference lists
+- server intersects them with `KexAlgorithms` and `CipherAlgorithms`
+- server selects the first mutually supported suite by client preference order
+- server returns the negotiated suite and completes the secure channel setup
+
+At the moment:
+- KEX is negotiable
+- control-channel cipher is negotiable
+- file payload encryption is intentionally not implemented
+
+## Running
+
+### Portable control script
+
+Use `nasfsctl` for start/stop/status management:
+
+```sh
+nasfsctl start
+nasfsctl stop
+nasfsctl restart
+nasfsctl status
+```
+
+The script uses:
+- installed server binary
+- installed config file
+- PID file under `/usr/local/var/run/nasfs`
+- log file under `/usr/local/var/log/nasfs`
+
+### systemd
+
+If installed with systemd support:
+
+```sh
 sudo systemctl enable nasfs
 sudo systemctl start nasfs
 sudo systemctl status nasfs
 ```
 
-### Connecting to the Server
+## Client usage
 
-The server listens on port 8080 by default (configurable in nasfs.conf).
+Upload:
 
-The secure control channel negotiates algorithms in an SSH-like way:
-- the client sends ordered KEX and cipher preference lists
-- the server selects the first mutually supported suite allowed by `KexAlgorithms` and `CipherAlgorithms`
-- the default control cipher is `xchacha20poly1305`
-
-Client-side preferences can be overridden with:
-
+```sh
+nasfs_client put ./local.bin remote.bin
 ```
+
+Download:
+
+```sh
+nasfs_client get remote.bin ./local.bin
+```
+
+Override client-side preference lists:
+
+```sh
 NASFS_KEX_ALGORITHMS="Kyber512,ML-KEM-512" \
 NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
-./client/nasfs_client put local.bin remote.bin
+nasfs_client put ./local.bin remote.bin
 ```
 
 ## Testing
 
-`make check` runs:
-- unit tests for handshake payload helpers
-- unit tests for server config parsing
-- the end-to-end PUT/GET integration test
+Autotools:
 
-To run the tests manually:
-
-```
+```sh
 make check
 ```
 
-## Development
+CMake:
 
-For development purposes, you can configure with debugging enabled:
-
-```
-./configure --enable-debug
+```sh
+ctest --test-dir build --output-on-failure
 ```
 
-For more information on development, see the [development documentation](docs/development.md).
+Test suite contents:
+- handshake unit test
+- config parser unit test
+- end-to-end `PUT/GET` integration test
+
+The integration test validates:
+- server startup
+- secure control-channel negotiation
+- upload integrity
+- download integrity
+
+## Linting and CI
+
+GitHub Actions currently runs:
+- `clang-format`
+- `clang-tidy`
+- `shellcheck`
+- autotools build/test/install checks
+- CMake build/test/install checks
+- sanitizer build with ASan/UBSan
+
+Typical local lint commands:
+
+```sh
+git ls-files '*.c' '*.h' | xargs clang-format --dry-run --Werror
+shellcheck autogen.sh autoclean.sh tests/test_end_to_end.sh
+cmake -S . -B build-lint -G Ninja -DCMAKE_BUILD_TYPE=Release -DNASFS_INSTALL_SYSTEMD=OFF
+git ls-files '*.c' | xargs clang-tidy -p build-lint --quiet --warnings-as-errors='*'
+```
