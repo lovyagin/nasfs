@@ -26,17 +26,27 @@
  * @brief Command types used in the NASFS protocol.
  */
 typedef enum {
-    NASFS_CMD_AUTH       = 0x01, /**< Sent by client after connection to authenticate. */
-    NASFS_CMD_AUTH_ACK   = 0x02, /**< Server response to authentication. */
-    NASFS_CMD_PUT_REQ    = 0x03, /**< Client requests to upload a file. */
-    NASFS_CMD_PUT_ACK    = 0x04, /**< Server confirms file is open and ready for PUT. */
-    NASFS_CMD_PUT_DATA   = 0x05, /**< Data chunk for file upload. */
-    NASFS_CMD_PUT_DONE   = 0x06, /**< Client indicates end of file upload. */
-    NASFS_CMD_GET_REQ    = 0x07, /**< Client requests to download a file. */
-    NASFS_CMD_GET_ACK    = 0x08, /**< Server acknowledges GET request. */
-    NASFS_CMD_GET_DATA   = 0x09, /**< Data chunk for file download. */
-    NASFS_CMD_GET_DONE   = 0x0A, /**< Server indicates end of file download. */
-    NASFS_CMD_ERROR      = 0xFF  /**< Error response from the server. */
+    /* PQC Key Exchange Commands (Unencrypted) */
+    NASFS_CMD_PQC_HELLO      = 0x01, /**< C->S: Initiate a PQC handshake. Payload contains KEM name. */
+    NASFS_CMD_PQC_PUBLIC_KEY = 0x02, /**< S->C: Server responds with its public key. */
+    NASFS_CMD_PQC_CIPHERTEXT = 0x03, /**< C->S: Client sends the encapsulated shared secret. */
+
+    /* Control Commands (Payload will be encrypted) */
+    NASFS_CMD_AUTH       = 0x10, /**< C->S: Authenticate with credentials. */
+    NASFS_CMD_AUTH_ACK   = 0x11, /**< S->C: Respond to authentication attempt. */
+    NASFS_CMD_PUT_REQ    = 0x12, /**< C->S: Request to upload a file. */
+    NASFS_CMD_PUT_ACK    = 0x13, /**< S->C: Confirm file is open and ready for PUT. */
+    NASFS_CMD_PUT_DONE   = 0x14, /**< C->S: Indicate end of file upload. */
+    NASFS_CMD_GET_REQ    = 0x15, /**< C->S: Request to download a file. */
+    NASFS_CMD_GET_ACK    = 0x16, /**< S->C: Acknowledge GET request. */
+    NASFS_CMD_GET_DONE   = 0x17, /**< S->C: Indicate end of file download. */
+
+    /* Data Transfer Commands (Unencrypted Payload) */
+    NASFS_CMD_PUT_DATA   = 0x20, /**< C->S: Data chunk for file upload. */
+    NASFS_CMD_GET_DATA   = 0x21, /**< S->C: Data chunk for file download. */
+
+    /* General Commands */
+    NASFS_CMD_ERROR      = 0xFF  /**< S->C: Error response from the server. */
 } nasfs_cmd_type_t;
 
 /**

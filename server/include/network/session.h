@@ -15,6 +15,7 @@
 #include <uv.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <oqs/oqs.h>
 
 #include "protocol.h"
 
@@ -23,7 +24,8 @@
  * @brief Defines the current operational state of a client session.
  */
 typedef enum {
-    SESSION_STATE_NEW = 0,         /**< Newly connected, awaiting authentication. */
+    SESSION_STATE_NEW = 0,         /**< Newly connected, connection established. */
+    SESSION_STATE_HANDSHAKE,       /**< PQC key exchange in progress. */
     SESSION_STATE_AUTHENTICATED,   /**< Authenticated, waiting for commands. */
     SESSION_STATE_RECEIVING_FILE,  /**< Currently receiving file data (PUT). */
     SESSION_STATE_SENDING_FILE,    /**< Currently sending file data (GET). */
@@ -37,12 +39,23 @@ typedef enum {
 typedef struct {
     uv_tcp_t handle;               /**< libuv TCP handle for the connection. */
     session_state_t state;         /**< Current state of the session. */
+    
+    /* Receive Buffer */
     uint8_t *recv_buffer;          /**< Buffer for accumulating incomplete TCP frames. */
     size_t recv_length;            /**< Current number of bytes in the receive buffer. */
     size_t recv_capacity;          /**< Total allocated capacity of the receive buffer. */
+    
+    /* File Transfer State */
     uv_file active_fd;             /**< File descriptor for active transfers (PUT/GET). */
     uv_fs_t fs_req;                /**< Filesystem request handle for async operations. */
     uint64_t file_offset;          /**< Current offset in the active file. */
+
+    /* Crypto State */
+    OQS_KEM *kem;                  /**< OQS Key Encapsulation Mechanism instance. */
+    uint8_t *kem_secret_key;       /**< The server's secret key for this session. */
+    uint8_t *shared_secret;        /**< The derived shared secret for symmetric crypto. */
+    int is_secure;                 /**< Flag indicating if the channel is encrypted. */
+
 } client_session_t;
 
 /**

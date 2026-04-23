@@ -1,10 +1,10 @@
 # Tests Makefile.am for NASFS
 
-# List of scripts to run for 'make check'
-TESTS = test_end_to_end.sh
+# Nothing to build in this directory, but list scripts for distribution
+EXTRA_DIST = test_end_to_end.sh
 
-# Files to include in the distribution
-EXTRA_DIST = $(TESTS)
+# This directory has no programs to build
+check_PROGRAMS =
 
 # Clean up temporary test artifacts
 clean-local:

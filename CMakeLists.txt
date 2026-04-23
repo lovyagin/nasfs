@@ -18,6 +18,10 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic")
 # Dependencies
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(UV REQUIRED libuv)
+pkg_check_modules(OQS REQUIRED liboqs)
+pkg_check_modules(SODIUM REQUIRED libsodium)
+pkg_check_modules(OQS REQUIRED liboqs)
+pkg_check_modules(SODIUM REQUIRED libsodium)
 
 # --- Common Library ---
 add_library(nasfs_common STATIC
@@ -26,9 +30,13 @@ add_library(nasfs_common STATIC
 target_include_directories(nasfs_common PUBLIC
     common/include
     ${UV_INCLUDE_DIRS}
+    ${OQS_INCLUDE_DIRS}
+    ${SODIUM_INCLUDE_DIRS}
+    ${OQS_INCLUDE_DIRS}
+    ${SODIUM_INCLUDE_DIRS}
 )
-target_link_directories(nasfs_common PUBLIC ${UV_LIBRARY_DIRS})
-target_link_libraries(nasfs_common PUBLIC ${UV_LIBRARIES})
+target_link_libraries(nasfs_common PUBLIC ${UV_LIBRARIES} ${OQS_LIBRARIES} ${SODIUM_LIBRARIES})
+target_link_libraries(nasfs_common PUBLIC ${UV_LIBRARIES} ${OQS_LIBRARIES} ${SODIUM_LIBRARIES})
 
 # --- Server Executable ---
 add_executable(nasfs_server
