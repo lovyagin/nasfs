@@ -17,17 +17,19 @@
  * Contains all configurable parameters for the server.
  */
 typedef struct {
-  char *bind_address;  /**< IP address to bind the server to */
+  char* bind_address;  /**< IP address to bind the server to */
   int port;            /**< Port number to listen on */
   int max_connections; /**< Maximum number of simultaneous connections */
   int client_timeout;  /**< Client connection timeout in seconds */
-  char *log_file;      /**< Path to the log file */
+  char* log_file;      /**< Path to the log file */
   int log_level;       /**< Minimum log level to record */
   int daemon_mode;     /**< Whether to run as a daemon (1) or not (0) */
-  char *pid_file;      /**< Path to the PID file for daemon mode */
-  char *storage_dir;   /**< Directory for serving files; future can become a mount point */
-  char *kex_algorithms;    /**< Allowed PQC KEX algorithms in preference order */
-  char *cipher_algorithms; /**< Allowed control-channel ciphers in preference order */
+  char* pid_file;      /**< Path to the PID file for daemon mode */
+  char* storage_dir; /**< Directory for serving files; future can become a mount
+                        point */
+  char* kex_algorithms; /**< Allowed PQC KEX algorithms in preference order */
+  char* cipher_algorithms; /**< Allowed control-channel ciphers in preference
+                              order */
 } server_config_t;
 
 /**
@@ -44,7 +46,7 @@ extern server_config_t global_config;
  * @param config Pointer to the configuration structure to populate.
  * @return 0 on success, or -1 on failure.
  */
-int load_config(const char *filename, server_config_t *config);
+int load_config(const char* filename, server_config_t* config);
 
 /**
  * @brief Set default configuration values.
@@ -54,7 +56,17 @@ int load_config(const char *filename, server_config_t *config);
  *
  * @param config Pointer to the configuration structure to initialize.
  */
-void set_defaults(server_config_t *config);
+void set_defaults(server_config_t* config);
+
+/**
+ * @brief Release memory owned by a configuration structure.
+ *
+ * Frees all dynamically allocated string fields and resets the structure
+ * to zeroed state.
+ *
+ * @param config Pointer to the configuration structure to release.
+ */
+void free_config(server_config_t* config);
 
 /**
  * @brief Trim whitespace from a string.
@@ -64,6 +76,6 @@ void set_defaults(server_config_t *config);
  *
  * @param str The string to trim.
  */
-void trim_string(char *str);
+void trim_string(char* str);
 
 #endif /* CONFIG_H */

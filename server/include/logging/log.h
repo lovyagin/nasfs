@@ -30,7 +30,7 @@ typedef enum log_level {
  * @param log_path The file path where logs should be written.
  * @param min_level The minimum severity level to record.
  */
-void log_init(const char *log_path, log_level_t min_level);
+void log_init(const char* log_path, log_level_t min_level);
 
 /**
  * @brief Writes a formatted log message to a specific stream.
@@ -40,7 +40,7 @@ void log_init(const char *log_path, log_level_t min_level);
  * @param format The printf-style format string.
  * @param ... Variable arguments for the format string.
  */
-void log_stream(void *stream, log_level_t level, const char *format, ...);
+void log_stream(void* stream, log_level_t level, const char* format, ...);
 
 /**
  * @brief Writes a log message to a stream using a va_list.
@@ -50,7 +50,7 @@ void log_stream(void *stream, log_level_t level, const char *format, ...);
  * @param format The printf-style format string.
  * @param args The variable arguments list.
  */
-void log_stream_v(void *stream, log_level_t level, const char *format,
+void log_stream_v(void* stream, log_level_t level, const char* format,
                   va_list args);
 
 /**
@@ -60,7 +60,7 @@ void log_stream_v(void *stream, log_level_t level, const char *format,
  * @param format The printf-style format string.
  * @param ... Variable arguments for the format string.
  */
-void log_file(log_level_t level, const char *format, ...);
+void log_file(log_level_t level, const char* format, ...);
 
 /**
  * @brief Writes a formatted log message to standard output.
@@ -69,15 +69,16 @@ void log_file(log_level_t level, const char *format, ...);
  * @param format The printf-style format string.
  * @param ... Variable arguments for the format string.
  */
-void log_stdout(log_level_t level, const char *format, ...);
+void log_stdout(log_level_t level, const char* format, ...);
 
 /**
- * @brief Writes a formatted log message to both standard output and the log file.
+ * @brief Writes a formatted log message to both standard output and the log
+ * file.
  *
  * @param level The severity level of the message.
  * @param format The printf-style format string.
  * @param ... Variable arguments for the format string.
  */
-void log_all(log_level_t level, const char *format, ...);
+void log_all(log_level_t level, const char* format, ...);
 
 #endif /* LOG_H */

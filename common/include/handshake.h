@@ -30,9 +30,9 @@
  * @param out_size Output total size of the encoded payload.
  * @return Newly allocated payload buffer, or NULL on failure.
  */
-uint8_t *nasfs_handshake_pack_client_hello(const char *kex_list,
-                                           const char *cipher_list,
-                                           size_t *out_size);
+uint8_t* nasfs_handshake_pack_client_hello(const char* kex_list,
+                                           const char* cipher_list,
+                                           size_t* out_size);
 
 /**
  * @brief Unpacks client preference lists from a hello payload.
@@ -43,16 +43,16 @@ uint8_t *nasfs_handshake_pack_client_hello(const char *kex_list,
  * @param cipher_list_out Output duplicated cipher CSV string.
  * @return 0 on success, -1 on parse or allocation failure.
  */
-int nasfs_handshake_unpack_client_hello(const uint8_t *payload,
-                                        size_t payload_len,
-                                        char **kex_list_out,
-                                        char **cipher_list_out);
+int nasfs_handshake_unpack_client_hello(const uint8_t* payload,
+                                        size_t payload_len, char** kex_list_out,
+                                        char** cipher_list_out);
 
 /**
  * @brief Packs the server's chosen suite together with the KEM public key.
  *
  * The encoded payload layout is:
- * `uint16_t kex_len || uint16_t cipher_len || kex_name || cipher_name || public_key`.
+ * `uint16_t kex_len || uint16_t cipher_len || kex_name || cipher_name ||
+ * public_key`.
  *
  * @param kex_name Negotiated KEX identifier.
  * @param cipher_name Negotiated control-cipher identifier.
@@ -61,11 +61,11 @@ int nasfs_handshake_unpack_client_hello(const uint8_t *payload,
  * @param out_size Output total size of the encoded payload.
  * @return Newly allocated payload buffer, or NULL on failure.
  */
-uint8_t *nasfs_handshake_pack_server_selection(const char *kex_name,
-                                               const char *cipher_name,
-                                               const uint8_t *public_key,
+uint8_t* nasfs_handshake_pack_server_selection(const char* kex_name,
+                                               const char* cipher_name,
+                                               const uint8_t* public_key,
                                                size_t public_key_len,
-                                               size_t *out_size);
+                                               size_t* out_size);
 
 /**
  * @brief Unpacks the server's negotiated suite and public key payload.
@@ -78,11 +78,11 @@ uint8_t *nasfs_handshake_pack_server_selection(const char *kex_name,
  * @param public_key_len_out Output length of @p public_key_out.
  * @return 0 on success, -1 on parse or allocation failure.
  */
-int nasfs_handshake_unpack_server_selection(const uint8_t *payload,
+int nasfs_handshake_unpack_server_selection(const uint8_t* payload,
                                             size_t payload_len,
-                                            char **kex_name_out,
-                                            char **cipher_name_out,
-                                            uint8_t **public_key_out,
-                                            size_t *public_key_len_out);
+                                            char** kex_name_out,
+                                            char** cipher_name_out,
+                                            uint8_t** public_key_out,
+                                            size_t* public_key_len_out);
 
 #endif /* NASFS_HANDSHAKE_H */
