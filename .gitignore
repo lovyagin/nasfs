@@ -1,20 +1,24 @@
-# build files
-**build**
+# Build and binary files
+build*/
+out/
+bin/
+*.o
+*.lo
+*.la
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
 
-# cache files
-.cache/*
+# Executables
+nasfs_server
+nasfs_client
 
-# compilation database
-**compile_commands.json
-
-# IDE and code editor files
-.idea/
-.vscode/
-*.code-workspace
-.zed
-
-# environment variables
-**.env
+# NASFS specific
+storage/
+nasfs.log
+nasfs.pid
 
 # Autotools generated files
 Makefile
@@ -29,37 +33,58 @@ Makefile.in
 /configure
 /m4/
 /stamp-h1
+/ar-lib
+/compile
+/config.guess
+/config.sub
+/depcomp
+/install-sh
+/ltmain.sh
+/missing
+/test-driver
 .deps/
 .libs/
-*.o
-*.lo
-*.la
-*.a
-*.so
 *.dirstamp
-libtool
-ar-lib
-compile
-config.guess
-config.sub
-depcomp
-install-sh
-ltmain.sh
-missing
-test-driver
 
-# Distribution files
-*.tar.gz
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_CPack_Packages/
+CPackConfig.cmake
+CPackSourceConfig.cmake
+
+# Test artifacts
+tests/workspace/
+tests/test-suite.log
+tests/*.log
+tests/*.trs
+
+# Cache and temporary files
+.cache/
+*.tmp
+*.bak
+*.swp
+*~
+
+# Compilation database
+compile_commands.json
+
+# IDE and editor files
+.idea/
+.vscode/
+*.code-workspace
+.zed
+.clangd
+
+# environment variables
+.env
 
 # MacOS files
 .DS_Store
-*.DS_Store
 
-# Clangd configuration
-.clangd
-
-# local storage folder
-storage/
-
-# Report files
+# Report
 *report*
