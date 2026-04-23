@@ -32,7 +32,7 @@ jobs:
 
       - name: Run clang-tidy
         run: |
-          git ls-files '*.c' | xargs clang-tidy -p build-lint --quiet --warnings-as-errors='*'
+          git -c safe.directory='*' ls-files '*.c' | xargs clang-tidy -p build-lint --quiet --warnings-as-errors='*'
 
       - name: Shellcheck scripts
         run: |
