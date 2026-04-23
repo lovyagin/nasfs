@@ -8,14 +8,11 @@ permissions:
   contents: read
   packages: read
 
-env:
-  NASFS_CI_IMAGE: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
-
 jobs:
   lint:
     runs-on: ubuntu-24.04
     container:
-      image: ${{ ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest }}
+      image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -46,7 +43,7 @@ jobs:
   autotools:
     runs-on: ubuntu-24.04
     container:
-      image: ${{ env.NASFS_CI_IMAGE }}
+      image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -75,7 +72,7 @@ jobs:
   cmake:
     runs-on: ubuntu-24.04
     container:
-      image: ${{ env.NASFS_CI_IMAGE }}
+      image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -107,7 +104,7 @@ jobs:
   sanitizers:
     runs-on: ubuntu-24.04
     container:
-      image: ${{ env.NASFS_CI_IMAGE }}
+      image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
