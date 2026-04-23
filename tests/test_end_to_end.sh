@@ -101,7 +101,7 @@ printf "${GREEN}%s${NC}\n" "      Server is running."
 # 4. Test PUT
 printf "${YELLOW}%s${NC}\n" "[3/4] Testing PUT (Upload)..."
 REMOTE_NAME="e2e_test_upload.bin"
-if ! env NASFS_KEX_ALGORITHMS="Kyber512,ML-KEM-512" \
+if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512,Kyber512" \
          NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
          "$CLIENT_BIN" put "$TEST_INPUT" "$REMOTE_NAME" > "$LOG_DIR/client_put.log" 2>&1; then
     printf "${RED}%s${NC}\n" "FAIL: Client PUT command failed."
@@ -127,7 +127,7 @@ printf "${GREEN}%s${NC}\n" "      PUT successful. Integrity verified."
 
 # 5. Test GET
 printf "${YELLOW}%s${NC}\n" "[4/4] Testing GET (Download)..."
-if ! env NASFS_KEX_ALGORITHMS="Kyber512,ML-KEM-512" \
+if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512,Kyber512" \
          NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
          "$CLIENT_BIN" get "$REMOTE_NAME" "$TEST_OUTPUT" > "$LOG_DIR/client_get.log" 2>&1; then
     printf "${RED}%s${NC}\n" "FAIL: Client GET command failed."
@@ -147,7 +147,7 @@ if [ "$INPUT_HASH" != "$DOWNLOAD_HASH" ]; then
 fi
 printf "${GREEN}%s${NC}\n" "      GET successful. Integrity verified."
 
-if ! grep -q "Negotiated KEX: Kyber512; control cipher: xchacha20poly1305" "$LOG_DIR/server.log"; then
+if ! grep -Eq "Negotiated KEX: (ML-KEM-512|Kyber512); control cipher: xchacha20poly1305" "$LOG_DIR/server.log"; then
     printf "${RED}%s${NC}\n" "FAIL: Negotiated suite was not logged as expected."
     cat "$LOG_DIR/server.log"
     exit 1

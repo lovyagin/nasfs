@@ -15,7 +15,7 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     container:
-      image: ${{ env.NASFS_CI_IMAGE }}
+      image: ${{ ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
