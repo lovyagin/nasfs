@@ -9,6 +9,10 @@
  * network protocol frames used by both the client and server.
  */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include "protocol.h"
 
 #include <arpa/inet.h>
