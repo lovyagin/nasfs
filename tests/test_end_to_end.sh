@@ -34,6 +34,7 @@ if [ ! -f "$SERVER_BIN" ] || [ ! -f "$CLIENT_BIN" ]; then
     exit 1
 fi
 
+# shellcheck disable=SC2329
 cleanup() {
     printf "${YELLOW}%s${NC}" "Cleaning up processes and temporary files..."
     # Kill server if it's running

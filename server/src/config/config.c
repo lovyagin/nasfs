@@ -18,8 +18,8 @@ server_config_t global_config;
    Default values are set first, then overridden by values in the file.
 
    Returns 0 on success, or -1 on failure.  */
-int load_config(const char *filename, server_config_t *config) {
-  FILE *file = fopen(filename, "r");
+int load_config(const char* filename, server_config_t* config) {
+  FILE* file = fopen(filename, "r");
   if (!file) {
     fprintf(stderr, "Error opening configuration file: %s\n", filename);
     return -1;
@@ -35,10 +35,10 @@ int load_config(const char *filename, server_config_t *config) {
 
     trim_string(line);
 
-    char *key = strtok(line, " \t");
+    char* key = strtok(line, " \t");
     if (!key) continue;
 
-    char *value = strtok(NULL, " \t#");
+    char* value = strtok(NULL, " \t#");
     if (!value) continue;
 
     if (strcmp(key, "ListenAddr") == 0) {
@@ -123,7 +123,7 @@ int load_config(const char *filename, server_config_t *config) {
 /* Set default configuration values.
    Initializes CONFIG with sensible default values to be used when
    no configuration file is available or when options are not specified.  */
-void set_defaults(server_config_t *config) {
+void set_defaults(server_config_t* config) {
   config->bind_address = strdup("127.0.0.1");
   config->port = 8080;
   config->max_connections = 10;
@@ -140,16 +140,16 @@ void set_defaults(server_config_t *config) {
 /* Trim whitespace from a string and remove comments.
    Modifies STR in place to remove leading and trailing whitespace,
    and cuts off any part of the string that follows a '#' character.  */
-void trim_string(char *str) {
+void trim_string(char* str) {
   if (!str) return;
 
-  char *end = str + strlen(str) - 1;
+  char* end = str + strlen(str) - 1;
 
   while (isspace(*str)) str++;
   while (isspace(*end)) end--;
 
   *(end + 1) = '\0';
 
-  char *comment_start = strchr(str, '#');
+  char* comment_start = strchr(str, '#');
   if (comment_start) *comment_start = '\0';
 }

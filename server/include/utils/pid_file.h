@@ -21,7 +21,7 @@
  * @param pid_file_path The path where the PID file should be created.
  * @return 0 on success, or -1 on failure.
  */
-int create_pid_file(const char *pid_file_path);
+int create_pid_file(const char* pid_file_path);
 
 /**
  * @brief Remove a specific PID file.
@@ -30,7 +30,7 @@ int create_pid_file(const char *pid_file_path);
  *
  * @param pid_file_path The path to the PID file to remove.
  */
-void remove_pid_file(const char *pid_file_path);
+void remove_pid_file(const char* pid_file_path);
 
 /**
  * @brief Store the path of the PID file for later cleanup.
@@ -40,13 +40,14 @@ void remove_pid_file(const char *pid_file_path);
  *
  * @param path The path to the PID file to store.
  */
-void set_pid_file_path(const char *path);
+void set_pid_file_path(const char* path);
 
 /**
  * @brief Clean up the PID file when the program exits.
  *
- * Removes the PID file whose path was previously stored with set_pid_file_path().
- * This function is intended to be registered with atexit() for automatic cleanup.
+ * Removes the PID file whose path was previously stored with
+ * set_pid_file_path(). This function is intended to be registered with atexit()
+ * for automatic cleanup.
  */
 void cleanup_pid_file(void);
 

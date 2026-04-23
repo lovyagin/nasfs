@@ -14,14 +14,14 @@
 #include <time.h>
 #include <unistd.h>
 
-static char *log_path_saved;
+static char* log_path_saved;
 static log_level_t min_level_saved;
 
 /* Initialize the logging module.
    Opens the log file at LOG_PATH and sets the minimum log level to MIN_LEVEL.
    If the log file cannot be opened, logs a warning to stderr and stdout.  */
-void log_init(const char *log_path, log_level_t min_level) {
-  FILE *log_file = fopen(log_path, "a");
+void log_init(const char* log_path, log_level_t min_level) {
+  FILE* log_file = fopen(log_path, "a");
   if (!log_file) {
     fprintf(stderr, "Failed to open log file '%s'\n", log_path);
     fprintf(stdout,
@@ -36,7 +36,7 @@ void log_init(const char *log_path, log_level_t min_level) {
 
 /* Convert a log level to its string representation.
    Returns a string corresponding to the given log level.  */
-const char *log_level_str(log_level_t level) {
+const char* log_level_str(log_level_t level) {
   switch (level) {
     case LOG_DEBUG:
       return "DEBUG";
@@ -55,7 +55,7 @@ const char *log_level_str(log_level_t level) {
 /* Write a log message to a stream.
    Formats a log message and writes it to the given STREAM with the specified
    LEVEL and FORMAT string, using variable arguments.  */
-void log_stream(void *stream, log_level_t level, const char *format, ...) {
+void log_stream(void* stream, log_level_t level, const char* format, ...) {
   va_list args;
   va_start(args, format);
   log_stream_v(stream, level, format, args);
@@ -66,7 +66,7 @@ void log_stream(void *stream, log_level_t level, const char *format, ...) {
    Formats a log message and writes it to the given STREAM with the specified
    LEVEL, FORMAT string, and variable argument list ARGS.
    Only logs if the current log level is at least as severe as LEVEL.  */
-void log_stream_v(void *stream, log_level_t level, const char *format,
+void log_stream_v(void* stream, log_level_t level, const char* format,
                   va_list args) {
   if (level >= min_level_saved) {
     time_t now = time(NULL);
@@ -85,8 +85,8 @@ void log_stream_v(void *stream, log_level_t level, const char *format,
 /* Write a log message to the log file.
    Formats and writes a message with the specified LEVEL and FORMAT
    to the configured log file.  */
-void log_file(log_level_t level, const char *format, ...) {
-  FILE *log_file = fopen(log_path_saved, "a");
+void log_file(log_level_t level, const char* format, ...) {
+  FILE* log_file = fopen(log_path_saved, "a");
   if (log_file == NULL) return;
   va_list args;
   va_start(args, format);
@@ -98,7 +98,7 @@ void log_file(log_level_t level, const char *format, ...) {
 /* Write a log message to stdout.
    Formats and writes a message with the specified LEVEL and FORMAT
    to standard output.  */
-void log_stdout(log_level_t level, const char *format, ...) {
+void log_stdout(log_level_t level, const char* format, ...) {
   va_list args;
   va_start(args, format);
   log_stream_v(stdout, level, format, args);
@@ -109,7 +109,7 @@ void log_stdout(log_level_t level, const char *format, ...) {
 /* Write a log message to both stdout and the log file.
    Formats and writes a message with the specified LEVEL and FORMAT
    to both standard output and the configured log file.  */
-void log_all(log_level_t level, const char *format, ...) {
+void log_all(log_level_t level, const char* format, ...) {
   va_list args_stdout;
   va_list args_file;
   va_start(args_stdout, format);
@@ -117,7 +117,7 @@ void log_all(log_level_t level, const char *format, ...) {
 
   log_stream_v(stdout, level, format, args_stdout);
 
-  FILE *log_file = fopen(log_path_saved, "a");
+  FILE* log_file = fopen(log_path_saved, "a");
   if (log_file != NULL) {
     log_stream_v(log_file, level, format, args_file);
     fclose(log_file);

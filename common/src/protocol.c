@@ -15,60 +15,62 @@
 #include <stdlib.h>
 #include <string.h>
 
-int protocol_parse_frame(const uint8_t *buffer, size_t size, nasfs_frame_t *frame) {
-    if (!buffer || !frame) {
-        return -1;
-    }
+int protocol_parse_frame(const uint8_t* buffer, size_t size,
+                         nasfs_frame_t* frame) {
+  if (!buffer || !frame) {
+    return -1;
+  }
 
-    if (size < NASFS_PROTO_HEADER_SIZE) {
-        return 0;
-    }
+  if (size < NASFS_PROTO_HEADER_SIZE) {
+    return 0;
+  }
 
-    uint32_t network_len;
-    memcpy(&network_len, buffer, sizeof(uint32_t));
-    uint32_t frame_len = ntohl(network_len);
+  uint32_t network_len;
+  memcpy(&network_len, buffer, sizeof(uint32_t));
+  uint32_t frame_len = ntohl(network_len);
 
-    uint32_t total_required = sizeof(uint32_t) + frame_len;
-    if (size < total_required) {
-        return 0;
-    }
+  uint32_t total_required = sizeof(uint32_t) + frame_len;
+  if (size < total_required) {
+    return 0;
+  }
 
-    frame->length = frame_len;
-    frame->type = (nasfs_cmd_type_t)buffer[4];
+  frame->length = frame_len;
+  frame->type = (nasfs_cmd_type_t)buffer[4];
 
-    if (frame_len > 1) {
-        frame->payload_len = frame_len - 1;
-        frame->payload = (uint8_t *)(buffer + NASFS_PROTO_HEADER_SIZE);
-    } else {
-        frame->payload_len = 0;
-        frame->payload = NULL;
-    }
+  if (frame_len > 1) {
+    frame->payload_len = frame_len - 1;
+    frame->payload = (uint8_t*)(buffer + NASFS_PROTO_HEADER_SIZE);
+  } else {
+    frame->payload_len = 0;
+    frame->payload = NULL;
+  }
 
-    return (int)total_required;
+  return (int)total_required;
 }
 
-uint8_t *protocol_pack_frame(nasfs_cmd_type_t type, const uint8_t *payload, size_t payload_len, size_t *out_size) {
-    if (!out_size) {
-        return NULL;
-    }
+uint8_t* protocol_pack_frame(nasfs_cmd_type_t type, const uint8_t* payload,
+                             size_t payload_len, size_t* out_size) {
+  if (!out_size) {
+    return NULL;
+  }
 
-    uint32_t frame_len = 1 + (uint32_t)payload_len;
-    size_t total_size = sizeof(uint32_t) + frame_len;
+  uint32_t frame_len = 1 + (uint32_t)payload_len;
+  size_t total_size = sizeof(uint32_t) + frame_len;
 
-    uint8_t *buffer = (uint8_t *)malloc(total_size);
-    if (!buffer) {
-        return NULL;
-    }
+  uint8_t* buffer = (uint8_t*)malloc(total_size);
+  if (!buffer) {
+    return NULL;
+  }
 
-    uint32_t network_len = htonl(frame_len);
-    memcpy(buffer, &network_len, sizeof(uint32_t));
+  uint32_t network_len = htonl(frame_len);
+  memcpy(buffer, &network_len, sizeof(uint32_t));
 
-    buffer[4] = (uint8_t)type;
+  buffer[4] = (uint8_t)type;
 
-    if (payload && payload_len > 0) {
-        memcpy(buffer + NASFS_PROTO_HEADER_SIZE, payload, payload_len);
-    }
+  if (payload && payload_len > 0) {
+    memcpy(buffer + NASFS_PROTO_HEADER_SIZE, payload, payload_len);
+  }
 
-    *out_size = total_size;
-    return buffer;
+  *out_size = total_size;
+  return buffer;
 }

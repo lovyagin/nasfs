@@ -1,5 +1,9 @@
+#!/usr/bin/env bash
+
 # autoclean.sh -- Deep clean script for NASFS project
 # Removes all build artifacts, generated files, and temporary data.
+
+set -euo pipefail
 
 echo "Starting aggressive project cleanup..."
 
