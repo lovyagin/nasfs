@@ -26,11 +26,27 @@ AS_IF([test "x$enable_debug" = "xyes"], [
   AC_MSG_NOTICE([Release build enabled])
 ])
 
+# Add Homebrew OpenSSL paths for macOS if available
+AC_PATH_PROG([BREW_CMD], [brew])
+if test -n "$BREW_CMD"; then
+    OPENSSL_PREFIX=`"$BREW_CMD" --prefix openssl@3 2>/dev/null`
+    if test -n "$OPENSSL_PREFIX"; then
+        CPPFLAGS="$CPPFLAGS -I$OPENSSL_PREFIX/include"
+        LDFLAGS="$LDFLAGS -L$OPENSSL_PREFIX/lib"
+        AC_MSG_NOTICE([Found Homebrew OpenSSL and added its paths.])
+    fi
+fi
+
 # Checks for libraries.
 PKG_PROG_PKG_CONFIG
 PKG_CHECK_MODULES([UV], [libuv])
 PKG_CHECK_MODULES([OQS], [liboqs])
 PKG_CHECK_MODULES([SODIUM], [libsodium])
+
+# Check for OpenSSL's libcrypto
+AC_CHECK_LIB([crypto], [CRYPTO_free],
+             [LIBS="$LIBS -lcrypto"],
+             [AC_MSG_ERROR([OpenSSL (libcrypto) not found])])
 
 # Checks for header files.
 AC_CHECK_HEADERS([stdlib.h string.h unistd.h])
@@ -45,6 +61,7 @@ AC_CONFIG_FILES([
     common/Makefile
     server/Makefile
     client/Makefile
+    tests/Makefile
 ])
 
 AC_OUTPUT

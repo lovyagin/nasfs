@@ -97,6 +97,22 @@ int load_config(const char *filename, server_config_t *config) {
         fclose(file);
         return -1;
       }
+    } else if (strcmp(key, "KexAlgorithms") == 0) {
+      free(config->kex_algorithms);
+      config->kex_algorithms = strdup(value);
+      if (!config->kex_algorithms) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(file);
+        return -1;
+      }
+    } else if (strcmp(key, "CipherAlgorithms") == 0) {
+      free(config->cipher_algorithms);
+      config->cipher_algorithms = strdup(value);
+      if (!config->cipher_algorithms) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(file);
+        return -1;
+      }
     }
   }
 
@@ -117,6 +133,8 @@ void set_defaults(server_config_t *config) {
   config->daemon_mode = 0; /* Not in daemon mode by default */
   config->pid_file = strdup("/var/run/nasfs-server.pid");
   config->storage_dir = strdup(".");
+  config->kex_algorithms = strdup("ML-KEM-512,Kyber512,ML-KEM-768,Kyber768");
+  config->cipher_algorithms = strdup("xchacha20poly1305");
 }
 
 /* Trim whitespace from a string and remove comments.

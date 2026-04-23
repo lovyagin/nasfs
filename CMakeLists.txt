@@ -22,6 +22,7 @@ pkg_check_modules(OQS REQUIRED liboqs)
 pkg_check_modules(SODIUM REQUIRED libsodium)
 pkg_check_modules(OQS REQUIRED liboqs)
 pkg_check_modules(SODIUM REQUIRED libsodium)
+pkg_check_modules(OPENSSL REQUIRED openssl)
 
 # --- Common Library ---
 add_library(nasfs_common STATIC
@@ -34,8 +35,9 @@ target_include_directories(nasfs_common PUBLIC
     ${SODIUM_INCLUDE_DIRS}
     ${OQS_INCLUDE_DIRS}
     ${SODIUM_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIRS}
 )
-target_link_libraries(nasfs_common PUBLIC ${UV_LIBRARIES} ${OQS_LIBRARIES} ${SODIUM_LIBRARIES})
+target_link_libraries(nasfs_common PUBLIC ${UV_LIBRARIES} ${OQS_LIBRARIES} ${SODIUM_LIBRARIES} ${OPENSSL_LIBRARIES})
 target_link_libraries(nasfs_common PUBLIC ${UV_LIBRARIES} ${OQS_LIBRARIES} ${SODIUM_LIBRARIES})
 
 # --- Server Executable ---

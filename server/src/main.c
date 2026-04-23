@@ -11,6 +11,7 @@
 #include <string.h>
 #include <uv.h>
 #include <signal.h>
+#include <sodium.h>
 
 #include "protocol.h"
 #include "config/config.h"
@@ -45,6 +46,11 @@ void on_signal(uv_signal_t *watcher, int signum) {
  */
 int main(int argc, char **argv) {
     const char *config_file = (argc > 1) ? argv[1] : "config/nasfs.conf";
+
+    if (sodium_init() < 0) {
+        fprintf(stderr, "Failed to initialize libsodium\n");
+        return 1;
+    }
 
     set_defaults(&global_config);
     if (load_config(config_file, &global_config) != 0) {
