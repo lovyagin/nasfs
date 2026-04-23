@@ -1,1 +1,0 @@
-Hello from NASFS client! This is test file content.
