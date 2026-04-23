@@ -12,7 +12,9 @@
  * while bulk data is transferred unencrypted for performance.
  */
 
-#include "network/session.h"
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -25,6 +27,7 @@
 #include "config/config.h"
 #include "handshake.h"
 #include "logging/log.h"
+#include "network/session.h"
 
 #define INITIAL_RECV_BUFFER_SIZE 16384
 #define MAX_RECV_BUFFER_SIZE (64 * 1024 * 1024)
