@@ -9,6 +9,7 @@
 #ifndef NASFS_PROTOCOL_H
 #define NASFS_PROTOCOL_H
 
+#include <pthread.h>
 #include <stdint.h>
 #include <uv.h>
 

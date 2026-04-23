@@ -13,6 +13,7 @@
 #define NASFS_SESSION_H
 
 #include <oqs/oqs.h>
+#include <pthread.h>
 #include <sodium.h>
 #include <stddef.h>
 #include <stdint.h>

@@ -4,6 +4,7 @@ AM_INIT_AUTOMAKE([foreign -Wall -Werror subdir-objects])
 AM_MAINTAINER_MODE([disable])
 AC_CONFIG_SRCDIR([server/src/main.c])
 AC_CONFIG_HEADERS([config.h])
+AC_USE_SYSTEM_EXTENSIONS
 
 # Checks for programs.
 AC_PROG_CC

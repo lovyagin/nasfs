@@ -11,6 +11,7 @@
 
 #include <fcntl.h>
 #include <oqs/oqs.h>
+#include <pthread.h>
 #include <sodium.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -19,7 +19,12 @@ sudo apt-get install -y \
   clang \
   clang-format
 
+if sudo apt-get install -y liboqs-dev; then
+  exit 0
+fi
+
 if ! pkg-config --exists liboqs; then
+  rm -rf /tmp/liboqs
   git clone --depth 1 --branch 0.15.0 https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs
   cmake -S /tmp/liboqs -B /tmp/liboqs/build \
     -G Ninja \

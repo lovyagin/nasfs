@@ -1,9 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # NASFS End-to-End Integration Test
 # Robust script to verify PUT and GET operations
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
@@ -34,7 +34,7 @@ if [ ! -f "$SERVER_BIN" ] || [ ! -f "$CLIENT_BIN" ]; then
     exit 1
 fi
 
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     printf "${YELLOW}%s${NC}" "Cleaning up processes and temporary files..."
     # Kill server if it's running

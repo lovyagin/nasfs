@@ -6,6 +6,7 @@
  * the libuv event loop for handling incoming TCP connections.
  */
 
+#include <pthread.h>
 #include <signal.h>
 #include <sodium.h>
 #include <stdio.h>
