@@ -49,4 +49,5 @@ if ! pkg-config --exists liboqs; then
     -DCMAKE_INSTALL_PREFIX=/usr/local
   cmake --build /tmp/liboqs/build
   run_root cmake --install /tmp/liboqs/build
+  run_root ldconfig
 fi

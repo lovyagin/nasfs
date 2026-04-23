@@ -11,6 +11,8 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-24.04
+    env:
+      LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib64
     container:
       image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
       credentials:
@@ -42,6 +44,8 @@ jobs:
 
   autotools:
     runs-on: ubuntu-24.04
+    env:
+      LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib64
     container:
       image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
       credentials:
@@ -71,6 +75,8 @@ jobs:
 
   cmake:
     runs-on: ubuntu-24.04
+    env:
+      LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib64
     container:
       image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
       credentials:
@@ -103,6 +109,8 @@ jobs:
 
   sanitizers:
     runs-on: ubuntu-24.04
+    env:
+      LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib64
     container:
       image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
       credentials:
