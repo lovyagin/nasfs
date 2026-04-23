@@ -35,7 +35,9 @@ void log_init(const char* log_path, log_level_t min_level) {
   }
   min_level_saved = min_level;
   log_path_saved = strdup(log_path);
-  fclose(log_file);
+  if (log_file) {
+    fclose(log_file);
+  }
 }
 
 /* Convert a log level to its string representation.
@@ -73,6 +75,7 @@ void log_stream(void* stream, log_level_t level, const char* format, ...) {
 void log_stream_v(void* stream, log_level_t level, const char* format,
                   va_list args) {
   if (level >= min_level_saved) {
+    va_list args_copy;
     time_t now = time(NULL);
     struct tm local_time;
     localtime_r(&now, &local_time);
@@ -81,7 +84,9 @@ void log_stream_v(void* stream, log_level_t level, const char* format,
     fprintf(stream, "[PID=%u %s] %s ", getpid(), timestamp,
             log_level_str(level));
 
-    vfprintf(stream, format, args);
+    va_copy(args_copy, args);
+    vfprintf(stream, format, args_copy);
+    va_end(args_copy);
     fprintf(stream, "\n");
   }
 }

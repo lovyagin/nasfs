@@ -9,6 +9,7 @@
 #endif
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,25 @@
 #include "config/config.h"
 
 server_config_t global_config;
+
+/* Parse a positive integer option from the configuration file.
+   Returns 0 on success and stores the parsed value in OUT_VALUE.  */
+static int parse_config_int(const char* value, int* out_value) {
+  char* endptr;
+  long parsed;
+
+  if (!value || !out_value) {
+    return -1;
+  }
+
+  parsed = strtol(value, &endptr, 10);
+  if (*value == '\0' || *endptr != '\0' || parsed < 0 || parsed > INT_MAX) {
+    return -1;
+  }
+
+  *out_value = (int)parsed;
+  return 0;
+}
 
 /* Load configuration from a file.
    Reads configuration settings from FILENAME and stores them in CONFIG.
@@ -54,11 +74,23 @@ int load_config(const char* filename, server_config_t* config) {
         return -1;
       }
     } else if (strcmp(key, "Port") == 0) {
-      config->port = atoi(value);
+      if (parse_config_int(value, &config->port) != 0) {
+        fprintf(stderr, "Invalid Port value: %s\n", value);
+        fclose(file);
+        return -1;
+      }
     } else if (strcmp(key, "MaxConn") == 0) {
-      config->max_connections = atoi(value);
+      if (parse_config_int(value, &config->max_connections) != 0) {
+        fprintf(stderr, "Invalid MaxConn value: %s\n", value);
+        fclose(file);
+        return -1;
+      }
     } else if (strcmp(key, "ClientTimeout") == 0) {
-      config->client_timeout = atoi(value);
+      if (parse_config_int(value, &config->client_timeout) != 0) {
+        fprintf(stderr, "Invalid ClientTimeout value: %s\n", value);
+        fclose(file);
+        return -1;
+      }
     } else if (strcmp(key, "LogFile") == 0) {
       free(config->log_file);
       config->log_file = strdup(value);

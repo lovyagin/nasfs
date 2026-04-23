@@ -433,6 +433,9 @@ void on_connect(uv_connect_t* req, int status) {
 }
 
 int main(int argc, char** argv) {
+  const char* env_kex_algorithms;
+  const char* env_cipher_algorithms;
+
   if (argc < 3) {
     fprintf(stderr,
             "Usage:\n  %s put <local_file> [remote_file]\n  %s get "
@@ -446,13 +449,14 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (getenv("NASFS_KEX_ALGORITHMS") &&
-      getenv("NASFS_KEX_ALGORITHMS")[0] != '\0') {
-    client_kex_algorithms = getenv("NASFS_KEX_ALGORITHMS");
+  env_kex_algorithms = getenv("NASFS_KEX_ALGORITHMS");
+  env_cipher_algorithms = getenv("NASFS_CIPHER_ALGORITHMS");
+
+  if (env_kex_algorithms && env_kex_algorithms[0] != '\0') {
+    client_kex_algorithms = env_kex_algorithms;
   }
-  if (getenv("NASFS_CIPHER_ALGORITHMS") &&
-      getenv("NASFS_CIPHER_ALGORITHMS")[0] != '\0') {
-    client_cipher_algorithms = getenv("NASFS_CIPHER_ALGORITHMS");
+  if (env_cipher_algorithms && env_cipher_algorithms[0] != '\0') {
+    client_cipher_algorithms = env_cipher_algorithms;
   }
 
   if (strcmp(argv[1], "put") == 0) {
