@@ -1,0 +1,14 @@
+[Unit]
+Description=NASFS Server
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=@NASFS_LOCALSTATEDIR@/run/nasfs/nasfs-server.pid
+ExecStart=@NASFS_BINDIR@/nasfs_server @NASFS_SYSCONFDIR@/nasfs.conf
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

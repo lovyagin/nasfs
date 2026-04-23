@@ -1,11 +1,13 @@
 AC_PREREQ([2.69])
 AC_INIT([nasfs], [0.1.0], [admin@nasfs.local])
 AM_INIT_AUTOMAKE([foreign -Wall -Werror subdir-objects])
+AM_MAINTAINER_MODE([disable])
 AC_CONFIG_SRCDIR([server/src/main.c])
 AC_CONFIG_HEADERS([config.h])
 
 # Checks for programs.
 AC_PROG_CC
+AC_PROG_INSTALL
 m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
 AC_PROG_RANLIB
 
@@ -54,6 +56,49 @@ AC_CHECK_HEADERS([stdlib.h string.h unistd.h])
 # Checks for typedefs, structures, and compiler characteristics.
 AC_TYPE_SIZE_T
 AC_TYPE_SSIZE_T
+
+# Installation directories for auxiliary assets.
+pkgconfdir='${sysconfdir}/nasfs'
+AC_SUBST([pkgconfdir])
+
+AC_ARG_WITH([systemdsystemunitdir],
+    [AS_HELP_STRING([--with-systemdsystemunitdir=DIR],
+                    [Directory for installing systemd service units])],
+    [systemdsystemunitdir=$withval],
+    [systemdsystemunitdir='${prefix}/lib/systemd/system'])
+AC_SUBST([systemdsystemunitdir])
+
+AC_ARG_ENABLE([systemd],
+    [AS_HELP_STRING([--disable-systemd], [Do not install the systemd service unit])],
+    [enable_systemd=$enableval],
+    [enable_systemd=yes])
+AM_CONDITIONAL([INSTALL_SYSTEMD], [test "x$enable_systemd" = "xyes"])
+
+if test "x$prefix" = "xNONE"; then
+  nasfs_prefix="$ac_default_prefix"
+else
+  nasfs_prefix="$prefix"
+fi
+
+if test "x$exec_prefix" = "xNONE"; then
+  nasfs_exec_prefix="$nasfs_prefix"
+else
+  nasfs_exec_prefix="$exec_prefix"
+fi
+
+save_prefix="$prefix"
+save_exec_prefix="$exec_prefix"
+prefix="$nasfs_prefix"
+exec_prefix="$nasfs_exec_prefix"
+eval NASFS_BINDIR="$bindir"
+eval NASFS_SYSCONFDIR="$pkgconfdir"
+eval NASFS_LOCALSTATEDIR="$localstatedir"
+prefix="$save_prefix"
+exec_prefix="$save_exec_prefix"
+
+AC_SUBST([NASFS_BINDIR])
+AC_SUBST([NASFS_SYSCONFDIR])
+AC_SUBST([NASFS_LOCALSTATEDIR])
 
 # Output files
 AC_CONFIG_FILES([

@@ -13,10 +13,11 @@ NC='\033[0m' # No Color
 
 # Paths
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SERVER_BIN="$ROOT_DIR/server/nasfs_server"
-CLIENT_BIN="$ROOT_DIR/client/nasfs_client"
-STORAGE_DIR="$ROOT_DIR/storage"
-TEST_DIR="$ROOT_DIR/tests/workspace"
+SERVER_BIN="${NASFS_SERVER_BIN:-$ROOT_DIR/server/nasfs_server}"
+CLIENT_BIN="${NASFS_CLIENT_BIN:-$ROOT_DIR/client/nasfs_client}"
+TEST_ROOT="${NASFS_TEST_ROOT:-$ROOT_DIR/tests/workspace}"
+STORAGE_DIR="${NASFS_STORAGE_DIR:-$ROOT_DIR/storage}"
+TEST_DIR="$TEST_ROOT"
 LOG_DIR="$TEST_DIR/logs"
 
 # Ensure directories exist
