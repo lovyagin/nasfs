@@ -4,14 +4,23 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+  packages: read
+
+env:
+  NASFS_CI_IMAGE: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
+
 jobs:
   lint:
     runs-on: ubuntu-24.04
+    container:
+      image: ${{ env.NASFS_CI_IMAGE }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: .github/scripts/install-ubuntu-deps.sh
 
       - name: Check C formatting
         run: |
@@ -36,11 +45,13 @@ jobs:
 
   autotools:
     runs-on: ubuntu-24.04
+    container:
+      image: ${{ env.NASFS_CI_IMAGE }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: .github/scripts/install-ubuntu-deps.sh
 
       - name: Configure
         run: |
@@ -63,11 +74,13 @@ jobs:
 
   cmake:
     runs-on: ubuntu-24.04
+    container:
+      image: ${{ env.NASFS_CI_IMAGE }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: .github/scripts/install-ubuntu-deps.sh
 
       - name: Configure
         run: >
@@ -93,11 +106,13 @@ jobs:
 
   sanitizers:
     runs-on: ubuntu-24.04
+    container:
+      image: ${{ env.NASFS_CI_IMAGE }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: .github/scripts/install-ubuntu-deps.sh
 
       - name: Configure sanitizer build
         run: >

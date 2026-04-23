@@ -2,8 +2,22 @@
 
 set -euo pipefail
 
-sudo apt-get update
-sudo apt-get install -y \
+if command -v sudo >/dev/null 2>&1; then
+  SUDO="sudo"
+else
+  SUDO=""
+fi
+
+run_root() {
+  if [ -n "$SUDO" ]; then
+    "$SUDO" "$@"
+  else
+    "$@"
+  fi
+}
+
+run_root apt-get update
+run_root apt-get install -y \
   autoconf \
   automake \
   build-essential \
@@ -20,7 +34,7 @@ sudo apt-get install -y \
   clang-tidy \
   clang-format
 
-if sudo apt-get install -y liboqs-dev; then
+if run_root apt-get install -y liboqs-dev; then
   exit 0
 fi
 
@@ -34,5 +48,5 @@ if ! pkg-config --exists liboqs; then
     -DOQS_USE_OPENSSL=ON \
     -DCMAKE_INSTALL_PREFIX=/usr/local
   cmake --build /tmp/liboqs/build
-  sudo cmake --install /tmp/liboqs/build
+  run_root cmake --install /tmp/liboqs/build
 fi
