@@ -1,5 +1,7 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)
 project(nasfs VERSION 0.1.0 LANGUAGES C)
+
+include(GNUInstallDirs)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -7,6 +9,9 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 # Build Options
 option(ENABLE_DEBUG "Enable debug build" OFF)
+option(NASFS_INSTALL_SYSTEMD "Install the systemd unit" ON)
+set(NASFS_SYSTEMD_UNIT_DIR "${CMAKE_INSTALL_LIBDIR}/systemd/system" CACHE PATH "Directory for installing systemd service units")
+
 if(ENABLE_DEBUG)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -O0 -DDEBUG")
 else()
@@ -20,25 +25,35 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(UV REQUIRED libuv)
 pkg_check_modules(OQS REQUIRED liboqs)
 pkg_check_modules(SODIUM REQUIRED libsodium)
-pkg_check_modules(OQS REQUIRED liboqs)
-pkg_check_modules(SODIUM REQUIRED libsodium)
 pkg_check_modules(OPENSSL REQUIRED openssl)
+
+set(NASFS_BINDIR "${CMAKE_INSTALL_FULL_BINDIR}")
+set(NASFS_SYSCONFDIR "${CMAKE_INSTALL_FULL_SYSCONFDIR}/nasfs")
+set(NASFS_LOCALSTATEDIR "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}")
+
+configure_file(utils/nasfsctl.in ${CMAKE_CURRENT_BINARY_DIR}/nasfsctl @ONLY)
+configure_file(systemd/nasfs.service.in ${CMAKE_CURRENT_BINARY_DIR}/nasfs.service @ONLY)
 
 # --- Common Library ---
 add_library(nasfs_common STATIC
     common/src/protocol.c
+    common/src/handshake.c
 )
 target_include_directories(nasfs_common PUBLIC
     common/include
     ${UV_INCLUDE_DIRS}
     ${OQS_INCLUDE_DIRS}
     ${SODIUM_INCLUDE_DIRS}
-    ${OQS_INCLUDE_DIRS}
-    ${SODIUM_INCLUDE_DIRS}
     ${OPENSSL_INCLUDE_DIRS}
 )
+target_link_directories(nasfs_common PUBLIC
+    ${UV_LIBRARY_DIRS}
+    ${OQS_LIBRARY_DIRS}
+    ${SODIUM_LIBRARY_DIRS}
+    ${OPENSSL_LIBRARY_DIRS}
+)
+target_compile_options(nasfs_common PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(nasfs_common PUBLIC ${UV_LIBRARIES} ${OQS_LIBRARIES} ${SODIUM_LIBRARIES} ${OPENSSL_LIBRARIES})
-target_link_libraries(nasfs_common PUBLIC ${UV_LIBRARIES} ${OQS_LIBRARIES} ${SODIUM_LIBRARIES})
 
 # --- Server Executable ---
 add_executable(nasfs_server
@@ -50,18 +65,64 @@ add_executable(nasfs_server
     server/src/utils/pid_file.c
     server/src/utils/signal_handler.c
 )
-target_include_directories(nasfs_server PRIVATE server/include)
-target_link_directories(nasfs_server PRIVATE ${UV_LIBRARY_DIRS})
-target_link_libraries(nasfs_server PRIVATE nasfs_common)
+target_include_directories(nasfs_server PRIVATE server/include common/include)
+target_compile_options(nasfs_server PRIVATE -Wall -Wextra -Wpedantic)
+target_link_directories(nasfs_server PRIVATE ${UV_LIBRARY_DIRS} ${OQS_LIBRARY_DIRS} ${SODIUM_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
+target_link_libraries(nasfs_server PRIVATE nasfs_common ${OPENSSL_LIBRARIES})
 
 # --- Client Executable ---
 add_executable(nasfs_client
     client/src/main.c
 )
-target_include_directories(nasfs_client PRIVATE client/include)
-target_link_directories(nasfs_client PRIVATE ${UV_LIBRARY_DIRS})
-target_link_libraries(nasfs_client PRIVATE nasfs_common)
+target_include_directories(nasfs_client PRIVATE client/include common/include)
+target_compile_options(nasfs_client PRIVATE -Wall -Wextra -Wpedantic)
+target_link_directories(nasfs_client PRIVATE ${UV_LIBRARY_DIRS} ${OQS_LIBRARY_DIRS} ${SODIUM_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
+target_link_libraries(nasfs_client PRIVATE nasfs_common ${OPENSSL_LIBRARIES})
 
 # --- Testing ---
 enable_testing()
-add_test(NAME IntegrationTest COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_end_to_end.sh)
+
+add_executable(test_handshake tests/test_handshake.c)
+target_include_directories(test_handshake PRIVATE common/include)
+target_compile_options(test_handshake PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(test_handshake PRIVATE nasfs_common)
+
+add_executable(test_config tests/test_config.c server/src/config/config.c)
+target_include_directories(test_config PRIVATE server/include common/include)
+target_compile_options(test_config PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME unit_handshake COMMAND test_handshake)
+add_test(NAME unit_config COMMAND test_config)
+add_test(
+    NAME integration_e2e
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_end_to_end.sh
+)
+set_tests_properties(
+    integration_e2e
+    PROPERTIES
+    ENVIRONMENT "NASFS_SERVER_BIN=$<TARGET_FILE:nasfs_server>;NASFS_CLIENT_BIN=$<TARGET_FILE:nasfs_client>;NASFS_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/tests-workspace;NASFS_STORAGE_DIR=${CMAKE_CURRENT_BINARY_DIR}/storage"
+)
+
+# --- Installation ---
+install(TARGETS nasfs_server nasfs_client
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/nasfsctl
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(FILES server/config/nasfs.conf
+    DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/nasfs
+)
+
+if(NASFS_INSTALL_SYSTEMD)
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/nasfs.service
+        DESTINATION ${NASFS_SYSTEMD_UNIT_DIR}
+    )
+endif()
+
+install(CODE "
+    file(MAKE_DIRECTORY \"\$ENV{DESTDIR}${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/run/nasfs\")
+    file(MAKE_DIRECTORY \"\$ENV{DESTDIR}${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/log/nasfs\")
+")

@@ -31,9 +31,20 @@ NASFS is a fast, lightweight and secure file system designed for networked stora
    ../configure
    ```
 
+   Useful install options:
+   ```
+   ../configure --disable-systemd
+   ../configure --with-systemdsystemunitdir=/lib/systemd/system
+   ```
+
 4. Build the project:
    ```
    make
+   ```
+
+5. Run the full test suite:
+   ```
+   make check
    ```
 
 5. Install (requires root privileges):
@@ -45,17 +56,59 @@ NASFS is a fast, lightweight and secure file system designed for networked stora
 
 Configuration files are installed to `/etc/nasfs/` by default. The main server configuration file is `/etc/nasfs/nasfs.conf`.
 
+The default PID file path used by the installed layouts is:
+`/usr/local/var/run/nasfs/nasfs-server.pid`
+
+The installation also provides:
+- `nasfs_server`
+- `nasfs_client`
+- `nasfsctl`
+- `nasfs.service` for `systemd`-based systems when `systemd` install support is enabled
+
+### Using CMake
+
+The CMake build supports the same main features as the autotools build:
+- server and client binaries
+- `nasfsctl`
+- optional `systemd` unit installation
+- unit tests
+- end-to-end integration test
+
+Example:
+
+```
+cmake -S . -B build-cmake
+cmake --build build-cmake
+ctest --test-dir build-cmake --output-on-failure
+cmake --install build-cmake
+```
+
+Relevant CMake options:
+
+```
+-DNASFS_INSTALL_SYSTEMD=OFF
+-DNASFS_SYSTEMD_UNIT_DIR=/lib/systemd/system
+```
+
 ## Usage
 
 ### Starting the Server
 
-After installation, you can control the server using the `nasfsctl` command:
+After installation, you can control the server using the portable `nasfsctl` command:
 
 ```
 nasfsctl start    # Start the server
 nasfsctl stop     # Stop the server
 nasfsctl restart  # Restart the server
 nasfsctl status   # Check server status
+```
+
+On systems with `systemd`, you can also use:
+
+```
+sudo systemctl enable nasfs
+sudo systemctl start nasfs
+sudo systemctl status nasfs
 ```
 
 ### Connecting to the Server
@@ -77,7 +130,12 @@ NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
 
 ## Testing
 
-To run the tests:
+`make check` runs:
+- unit tests for handshake payload helpers
+- unit tests for server config parsing
+- the end-to-end PUT/GET integration test
+
+To run the tests manually:
 
 ```
 make check
