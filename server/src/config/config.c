@@ -4,22 +4,46 @@
    This file is part of NASFS server.
    Handles loading and parsing of server configuration files.  */
 
-#include "config/config.h"
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "config/config.h"
+
 server_config_t global_config;
+
+/* Parse a positive integer option from the configuration file.
+   Returns 0 on success and stores the parsed value in OUT_VALUE.  */
+static int parse_config_int(const char* value, int* out_value) {
+  char* endptr;
+  long parsed;
+
+  if (!value || !out_value) {
+    return -1;
+  }
+
+  parsed = strtol(value, &endptr, 10);
+  if (*value == '\0' || *endptr != '\0' || parsed < 0 || parsed > INT_MAX) {
+    return -1;
+  }
+
+  *out_value = (int)parsed;
+  return 0;
+}
 
 /* Load configuration from a file.
    Reads configuration settings from FILENAME and stores them in CONFIG.
    Default values are set first, then overridden by values in the file.
 
    Returns 0 on success, or -1 on failure.  */
-int load_config(const char *filename, server_config_t *config) {
-  FILE *file = fopen(filename, "r");
+int load_config(const char* filename, server_config_t* config) {
+  FILE* file = fopen(filename, "r");
   if (!file) {
     fprintf(stderr, "Error opening configuration file: %s\n", filename);
     return -1;
@@ -35,10 +59,10 @@ int load_config(const char *filename, server_config_t *config) {
 
     trim_string(line);
 
-    char *key = strtok(line, " \t");
+    char* key = strtok(line, " \t");
     if (!key) continue;
 
-    char *value = strtok(NULL, " \t#");
+    char* value = strtok(NULL, " \t#");
     if (!value) continue;
 
     if (strcmp(key, "ListenAddr") == 0) {
@@ -50,11 +74,23 @@ int load_config(const char *filename, server_config_t *config) {
         return -1;
       }
     } else if (strcmp(key, "Port") == 0) {
-      config->port = atoi(value);
+      if (parse_config_int(value, &config->port) != 0) {
+        fprintf(stderr, "Invalid Port value: %s\n", value);
+        fclose(file);
+        return -1;
+      }
     } else if (strcmp(key, "MaxConn") == 0) {
-      config->max_connections = atoi(value);
+      if (parse_config_int(value, &config->max_connections) != 0) {
+        fprintf(stderr, "Invalid MaxConn value: %s\n", value);
+        fclose(file);
+        return -1;
+      }
     } else if (strcmp(key, "ClientTimeout") == 0) {
-      config->client_timeout = atoi(value);
+      if (parse_config_int(value, &config->client_timeout) != 0) {
+        fprintf(stderr, "Invalid ClientTimeout value: %s\n", value);
+        fclose(file);
+        return -1;
+      }
     } else if (strcmp(key, "LogFile") == 0) {
       free(config->log_file);
       config->log_file = strdup(value);
@@ -123,7 +159,7 @@ int load_config(const char *filename, server_config_t *config) {
 /* Set default configuration values.
    Initializes CONFIG with sensible default values to be used when
    no configuration file is available or when options are not specified.  */
-void set_defaults(server_config_t *config) {
+void set_defaults(server_config_t* config) {
   config->bind_address = strdup("127.0.0.1");
   config->port = 8080;
   config->max_connections = 10;
@@ -137,19 +173,37 @@ void set_defaults(server_config_t *config) {
   config->cipher_algorithms = strdup("xchacha20poly1305");
 }
 
+/* Release configuration resources.
+   Frees dynamically allocated strings stored in CONFIG and resets all fields
+   to zero so the structure can be reused safely.  */
+void free_config(server_config_t* config) {
+  if (!config) {
+    return;
+  }
+
+  free(config->bind_address);
+  free(config->log_file);
+  free(config->pid_file);
+  free(config->storage_dir);
+  free(config->kex_algorithms);
+  free(config->cipher_algorithms);
+
+  memset(config, 0, sizeof(*config));
+}
+
 /* Trim whitespace from a string and remove comments.
    Modifies STR in place to remove leading and trailing whitespace,
    and cuts off any part of the string that follows a '#' character.  */
-void trim_string(char *str) {
+void trim_string(char* str) {
   if (!str) return;
 
-  char *end = str + strlen(str) - 1;
+  char* end = str + strlen(str) - 1;
 
   while (isspace(*str)) str++;
   while (isspace(*end)) end--;
 
   *(end + 1) = '\0';
 
-  char *comment_start = strchr(str, '#');
+  char* comment_start = strchr(str, '#');
   if (comment_start) *comment_start = '\0';
 }

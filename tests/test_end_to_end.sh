@@ -1,9 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # NASFS End-to-End Integration Test
 # Robust script to verify PUT and GET operations
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
@@ -12,6 +12,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Paths
+export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${LD_LIBRARY_PATH:-}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_BIN="${NASFS_SERVER_BIN:-$ROOT_DIR/server/nasfs_server}"
 CLIENT_BIN="${NASFS_CLIENT_BIN:-$ROOT_DIR/client/nasfs_client}"
@@ -19,6 +20,14 @@ TEST_ROOT="${NASFS_TEST_ROOT:-$ROOT_DIR/tests/workspace}"
 STORAGE_DIR="${NASFS_STORAGE_DIR:-$ROOT_DIR/storage}"
 TEST_DIR="$TEST_ROOT"
 LOG_DIR="$TEST_DIR/logs"
+
+hash_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
 
 # Ensure directories exist
 mkdir -p "$STORAGE_DIR"
@@ -34,6 +43,7 @@ if [ ! -f "$SERVER_BIN" ] || [ ! -f "$CLIENT_BIN" ]; then
     exit 1
 fi
 
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     printf "${YELLOW}%s${NC}" "Cleaning up processes and temporary files..."
     # Kill server if it's running
@@ -59,7 +69,7 @@ TEST_INPUT="$TEST_DIR/test_file_input.bin"
 TEST_OUTPUT="$TEST_DIR/test_file_output.bin"
 # Create a 2MB file
 dd if=/dev/urandom of="$TEST_INPUT" bs=1M count=2 2>/dev/null
-INPUT_HASH=$(shasum -a 256 "$TEST_INPUT" | awk '{print $1}')
+INPUT_HASH=$(hash_file "$TEST_INPUT")
 printf "      Created 2MB random file. Hash: %s...\n" "${INPUT_HASH:0:16}"
 
 # 3. Start Server
@@ -92,7 +102,7 @@ printf "${GREEN}%s${NC}\n" "      Server is running."
 # 4. Test PUT
 printf "${YELLOW}%s${NC}\n" "[3/4] Testing PUT (Upload)..."
 REMOTE_NAME="e2e_test_upload.bin"
-if ! env NASFS_KEX_ALGORITHMS="Kyber512,ML-KEM-512" \
+if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512,Kyber512" \
          NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
          "$CLIENT_BIN" put "$TEST_INPUT" "$REMOTE_NAME" > "$LOG_DIR/client_put.log" 2>&1; then
     printf "${RED}%s${NC}\n" "FAIL: Client PUT command failed."
@@ -109,7 +119,7 @@ if [ ! -f "$STORAGE_DIR/$REMOTE_NAME" ]; then
     exit 1
 fi
 
-UPLOAD_HASH=$(shasum -a 256 "$STORAGE_DIR/$REMOTE_NAME" | awk '{print $1}')
+UPLOAD_HASH=$(hash_file "$STORAGE_DIR/$REMOTE_NAME")
 if [ "$INPUT_HASH" != "$UPLOAD_HASH" ]; then
     printf "${RED}%s${NC}\n" "FAIL: Uploaded file hash mismatch!"
     exit 1
@@ -118,7 +128,7 @@ printf "${GREEN}%s${NC}\n" "      PUT successful. Integrity verified."
 
 # 5. Test GET
 printf "${YELLOW}%s${NC}\n" "[4/4] Testing GET (Download)..."
-if ! env NASFS_KEX_ALGORITHMS="Kyber512,ML-KEM-512" \
+if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512,Kyber512" \
          NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
          "$CLIENT_BIN" get "$REMOTE_NAME" "$TEST_OUTPUT" > "$LOG_DIR/client_get.log" 2>&1; then
     printf "${RED}%s${NC}\n" "FAIL: Client GET command failed."
@@ -131,14 +141,14 @@ if [ ! -f "$TEST_OUTPUT" ]; then
     exit 1
 fi
 
-DOWNLOAD_HASH=$(shasum -a 256 "$TEST_OUTPUT" | awk '{print $1}')
+DOWNLOAD_HASH=$(hash_file "$TEST_OUTPUT")
 if [ "$INPUT_HASH" != "$DOWNLOAD_HASH" ]; then
     printf "${RED}%s${NC}\n" "FAIL: Downloaded file hash mismatch!"
     exit 1
 fi
 printf "${GREEN}%s${NC}\n" "      GET successful. Integrity verified."
 
-if ! grep -q "Negotiated KEX: Kyber512; control cipher: xchacha20poly1305" "$LOG_DIR/server.log"; then
+if ! grep -Eq "Negotiated KEX: (ML-KEM-512|Kyber512); control cipher: xchacha20poly1305" "$LOG_DIR/server.log"; then
     printf "${RED}%s${NC}\n" "FAIL: Negotiated suite was not logged as expected."
     cat "$LOG_DIR/server.log"
     exit 1

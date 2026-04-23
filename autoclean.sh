@@ -1,5 +1,9 @@
+#!/usr/bin/env bash
+
 # autoclean.sh -- Deep clean script for NASFS project
 # Removes all build artifacts, generated files, and temporary data.
+
+set -euo pipefail
 
 echo "Starting aggressive project cleanup..."
 
@@ -8,6 +12,7 @@ echo "Cleaning Autotools..."
 rm -rf autom4te.cache/ m4/
 rm -f aclocal.m4 configure config.h.in config.h.in~ stamp-h1
 rm -f ar-lib compile config.guess config.sub depcomp install-sh ltmain.sh missing test-driver
+rm -f utils/nasfsctl
 
 # Remove generated Makefiles and dependencies recursively
 find . -name "Makefile.in" -type f -delete

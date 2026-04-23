@@ -6,22 +6,27 @@
  * the libuv event loop for handling incoming TCP connections.
  */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include <pthread.h>
+#include <signal.h>
+#include <sodium.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <uv.h>
-#include <signal.h>
-#include <sodium.h>
 
-#include "protocol.h"
 #include "config/config.h"
 #include "logging/log.h"
+#include "network/session.h"
+#include "protocol.h"
 #include "utils/daemon.h"
 #include "utils/pid_file.h"
 #include "utils/signal_handler.h"
-#include "network/session.h"
 
-uv_loop_t *loop;
+uv_loop_t* loop;
 uv_tcp_t server;
 uv_signal_t sigint_watcher;
 uv_signal_t sigterm_watcher;
@@ -32,9 +37,9 @@ uv_signal_t sigterm_watcher;
  * @param watcher The signal watcher handle.
  * @param signum The signal number received.
  */
-void on_signal(uv_signal_t *watcher, int signum) {
-    signal_handler(signum);
-    uv_stop(watcher->loop);
+void on_signal(uv_signal_t* watcher, int signum) {
+  signal_handler(signum);
+  uv_stop(watcher->loop);
 }
 
 /**
@@ -44,75 +49,86 @@ void on_signal(uv_signal_t *watcher, int signum) {
  * @param argv Argument vector.
  * @return Exit status code.
  */
-int main(int argc, char **argv) {
-    const char *config_file = (argc > 1) ? argv[1] : "config/nasfs.conf";
+int main(int argc, char** argv) {
+  const char* config_file = (argc > 1) ? argv[1] : "config/nasfs.conf";
+  int exit_code = 0;
 
-    if (sodium_init() < 0) {
-        fprintf(stderr, "Failed to initialize libsodium\n");
-        return 1;
-    }
+  if (sodium_init() < 0) {
+    fprintf(stderr, "Failed to initialize libsodium\n");
+    return 1;
+  }
 
+  memset(&global_config, 0, sizeof(global_config));
+  if (load_config(config_file, &global_config) != 0) {
+    fprintf(stderr,
+            "Warning: Failed to load config file '%s'. Using defaults.\n",
+            config_file);
     set_defaults(&global_config);
-    if (load_config(config_file, &global_config) != 0) {
-        fprintf(stderr, "Warning: Failed to load config file '%s'. Using defaults.\n", config_file);
+  }
+
+  log_init(global_config.log_file, global_config.log_level);
+  log_all(LOG_INFO, "Starting NASFS server...");
+
+  if (global_config.daemon_mode) {
+    log_all(LOG_INFO, "Daemonizing process...");
+    daemonize();
+  }
+
+  if (global_config.pid_file && strlen(global_config.pid_file) > 0) {
+    if (create_pid_file(global_config.pid_file) == 0) {
+      set_pid_file_path(global_config.pid_file);
+      atexit(cleanup_pid_file);
+    } else {
+      log_all(LOG_ERROR, "Failed to create PID file: %s",
+              global_config.pid_file);
+      exit_code = 1;
+      goto cleanup;
     }
+  }
 
-    log_init(global_config.log_file, global_config.log_level);
-    log_all(LOG_INFO, "Starting NASFS server...");
+  loop = uv_default_loop();
 
-    if (global_config.daemon_mode) {
-        log_all(LOG_INFO, "Daemonizing process...");
-        daemonize();
-    }
+  uv_signal_init(loop, &sigint_watcher);
+  uv_signal_start(&sigint_watcher, on_signal, SIGINT);
 
-    if (global_config.pid_file && strlen(global_config.pid_file) > 0) {
-        if (create_pid_file(global_config.pid_file) == 0) {
-            set_pid_file_path(global_config.pid_file);
-            atexit(cleanup_pid_file);
-        } else {
-            log_all(LOG_ERROR, "Failed to create PID file: %s", global_config.pid_file);
-            return 1;
-        }
-    }
+  uv_signal_init(loop, &sigterm_watcher);
+  uv_signal_start(&sigterm_watcher, on_signal, SIGTERM);
 
-    loop = uv_default_loop();
+  uv_tcp_init(loop, &server);
 
-    uv_signal_init(loop, &sigint_watcher);
-    uv_signal_start(&sigint_watcher, on_signal, SIGINT);
+  struct sockaddr_in addr;
+  const char* bind_addr =
+      global_config.bind_address ? global_config.bind_address : "0.0.0.0";
+  int port = global_config.port > 0 ? global_config.port : 8080;
 
-    uv_signal_init(loop, &sigterm_watcher);
-    uv_signal_start(&sigterm_watcher, on_signal, SIGTERM);
+  uv_ip4_addr(bind_addr, port, &addr);
 
-    uv_tcp_init(loop, &server);
+  uv_tcp_bind(&server, (const struct sockaddr*)&addr, 0);
 
-    struct sockaddr_in addr;
-    const char *bind_addr = global_config.bind_address ? global_config.bind_address : "0.0.0.0";
-    int port = global_config.port > 0 ? global_config.port : 8080;
-    
-    uv_ip4_addr(bind_addr, port, &addr);
+  int max_conn =
+      global_config.max_connections > 0 ? global_config.max_connections : 128;
+  int r = uv_listen((uv_stream_t*)&server, max_conn, session_on_new_connection);
 
-    uv_tcp_bind(&server, (const struct sockaddr *)&addr, 0);
-    
-    int max_conn = global_config.max_connections > 0 ? global_config.max_connections : 128;
-    int r = uv_listen((uv_stream_t *)&server, max_conn, session_on_new_connection);
-    
-    if (r) {
-        log_all(LOG_ERROR, "Listen error: %s", uv_strerror(r));
-        return 1;
-    }
+  if (r) {
+    log_all(LOG_ERROR, "Listen error: %s", uv_strerror(r));
+    exit_code = 1;
+    goto cleanup;
+  }
 
-    log_all(LOG_INFO, "nasfs_server listening on %s:%d...", bind_addr, port);
-    
-    uv_run(loop, UV_RUN_DEFAULT);
+  log_all(LOG_INFO, "nasfs_server listening on %s:%d...", bind_addr, port);
 
-    log_all(LOG_INFO, "NASFS server shutting down cleanly...");
+  uv_run(loop, UV_RUN_DEFAULT);
 
-    uv_close((uv_handle_t *)&sigint_watcher, NULL);
-    uv_close((uv_handle_t *)&sigterm_watcher, NULL);
-    uv_close((uv_handle_t *)&server, NULL);
-    
-    uv_run(loop, UV_RUN_NOWAIT);
-    uv_loop_close(loop);
+  log_all(LOG_INFO, "NASFS server shutting down cleanly...");
 
-    return 0;
+  uv_close((uv_handle_t*)&sigint_watcher, NULL);
+  uv_close((uv_handle_t*)&sigterm_watcher, NULL);
+  uv_close((uv_handle_t*)&server, NULL);
+
+  uv_run(loop, UV_RUN_NOWAIT);
+  uv_loop_close(loop);
+
+cleanup:
+  free_config(&global_config);
+  return exit_code;
 }
