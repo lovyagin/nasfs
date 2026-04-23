@@ -21,7 +21,7 @@ jobs:
 
       - name: Check C formatting
         run: |
-          git ls-files '*.c' '*.h' | xargs clang-format --dry-run --Werror
+          git -c safe.directory='*' ls-files '*.c' '*.h' | xargs clang-format --dry-run --Werror
 
       - name: Configure clang-tidy database
         run: >
