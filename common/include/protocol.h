@@ -30,6 +30,7 @@ typedef enum {
     NASFS_CMD_PQC_HELLO      = 0x01, /**< C->S: Initiate a PQC handshake. Payload contains KEM name. */
     NASFS_CMD_PQC_PUBLIC_KEY = 0x02, /**< S->C: Server responds with its public key. */
     NASFS_CMD_PQC_CIPHERTEXT = 0x03, /**< C->S: Client sends the encapsulated shared secret. */
+    NASFS_CMD_SECURE_READY   = 0x04, /**< S->C: Server confirms secure channel and sends its stream header. */
 
     /* Control Commands (Payload will be encrypted) */
     NASFS_CMD_AUTH       = 0x10, /**< C->S: Authenticate with credentials. */

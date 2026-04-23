@@ -26,6 +26,8 @@ typedef struct {
   int daemon_mode;     /**< Whether to run as a daemon (1) or not (0) */
   char *pid_file;      /**< Path to the PID file for daemon mode */
   char *storage_dir;   /**< Directory for serving files; future can become a mount point */
+  char *kex_algorithms;    /**< Allowed PQC KEX algorithms in preference order */
+  char *cipher_algorithms; /**< Allowed control-channel ciphers in preference order */
 } server_config_t;
 
 /**

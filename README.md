@@ -62,6 +62,19 @@ nasfsctl status   # Check server status
 
 The server listens on port 8080 by default (configurable in nasfs.conf).
 
+The secure control channel negotiates algorithms in an SSH-like way:
+- the client sends ordered KEX and cipher preference lists
+- the server selects the first mutually supported suite allowed by `KexAlgorithms` and `CipherAlgorithms`
+- the default control cipher is `xchacha20poly1305`
+
+Client-side preferences can be overridden with:
+
+```
+NASFS_KEX_ALGORITHMS="Kyber512,ML-KEM-512" \
+NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
+./client/nasfs_client put local.bin remote.bin
+```
+
 ## Testing
 
 To run the tests:

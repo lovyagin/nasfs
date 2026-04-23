@@ -73,6 +73,8 @@ LogLevel Debug
 DaemonMode No
 PidFile $LOG_DIR/server.pid
 StorageDir $STORAGE_DIR
+KexAlgorithms ML-KEM-512,Kyber512
+CipherAlgorithms xchacha20poly1305
 EOF
 
 "$SERVER_BIN" "$TEST_DIR/test_server.conf" > "$LOG_DIR/server_stdout.log" 2>&1 &
@@ -89,7 +91,9 @@ printf "${GREEN}%s${NC}\n" "      Server is running."
 # 4. Test PUT
 printf "${YELLOW}%s${NC}\n" "[3/4] Testing PUT (Upload)..."
 REMOTE_NAME="e2e_test_upload.bin"
-if ! "$CLIENT_BIN" put "$TEST_INPUT" "$REMOTE_NAME" > "$LOG_DIR/client_put.log" 2>&1; then
+if ! env NASFS_KEX_ALGORITHMS="Kyber512,ML-KEM-512" \
+         NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
+         "$CLIENT_BIN" put "$TEST_INPUT" "$REMOTE_NAME" > "$LOG_DIR/client_put.log" 2>&1; then
     printf "${RED}%s${NC}\n" "FAIL: Client PUT command failed."
     printf "--- Client Logs ---\n"
     cat "$LOG_DIR/client_put.log"
@@ -113,7 +117,9 @@ printf "${GREEN}%s${NC}\n" "      PUT successful. Integrity verified."
 
 # 5. Test GET
 printf "${YELLOW}%s${NC}\n" "[4/4] Testing GET (Download)..."
-if ! "$CLIENT_BIN" get "$REMOTE_NAME" "$TEST_OUTPUT" > "$LOG_DIR/client_get.log" 2>&1; then
+if ! env NASFS_KEX_ALGORITHMS="Kyber512,ML-KEM-512" \
+         NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
+         "$CLIENT_BIN" get "$REMOTE_NAME" "$TEST_OUTPUT" > "$LOG_DIR/client_get.log" 2>&1; then
     printf "${RED}%s${NC}\n" "FAIL: Client GET command failed."
     cat "$LOG_DIR/client_get.log"
     exit 1
@@ -130,6 +136,13 @@ if [ "$INPUT_HASH" != "$DOWNLOAD_HASH" ]; then
     exit 1
 fi
 printf "${GREEN}%s${NC}\n" "      GET successful. Integrity verified."
+
+if ! grep -q "Negotiated KEX: Kyber512; control cipher: xchacha20poly1305" "$LOG_DIR/server.log"; then
+    printf "${RED}%s${NC}\n" "FAIL: Negotiated suite was not logged as expected."
+    cat "$LOG_DIR/server.log"
+    exit 1
+fi
+printf "${GREEN}%s${NC}\n" "      Negotiated suite verified in server logs."
 
 printf "${YELLOW}%s${NC}\n" "=============================================="
 printf "${GREEN}%s${NC}\n" "    SUCCESS: All tests passed!               "
