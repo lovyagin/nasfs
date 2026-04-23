@@ -4,12 +4,16 @@
    This file is part of NASFS server.
    Handles loading and parsing of server configuration files.  */
 
-#include "config/config.h"
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "config/config.h"
 
 server_config_t global_config;
 

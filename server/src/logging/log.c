@@ -4,7 +4,9 @@
 
    This file is part of NASFS server.  */
 
-#include "logging/log.h"
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -13,6 +15,8 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "logging/log.h"
 
 static char* log_path_saved;
 static log_level_t min_level_saved;

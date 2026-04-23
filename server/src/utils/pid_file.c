@@ -5,7 +5,9 @@
    Handles creating, removing, and cleaning up PID files for daemon processes.
  */
 
-#include "utils/pid_file.h"
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +15,7 @@
 #include <unistd.h>
 
 #include "logging/log.h"
+#include "utils/pid_file.h"
 
 /* Path to the PID file used for cleanup at program exit.  */
 static char* pid_file_path = NULL;

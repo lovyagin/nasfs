@@ -17,6 +17,17 @@ jobs:
         run: |
           git ls-files '*.c' '*.h' | xargs clang-format --dry-run --Werror
 
+      - name: Configure clang-tidy database
+        run: >
+          cmake -S . -B build-lint
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DNASFS_INSTALL_SYSTEMD=OFF
+
+      - name: Run clang-tidy
+        run: |
+          git ls-files '*.c' | xargs clang-tidy -p build-lint --quiet --warnings-as-errors='*'
+
       - name: Shellcheck scripts
         run: |
           shellcheck autogen.sh

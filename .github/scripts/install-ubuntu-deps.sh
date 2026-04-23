@@ -17,6 +17,7 @@ sudo apt-get install -y \
   pkg-config \
   shellcheck \
   clang \
+  clang-tidy \
   clang-format
 
 if sudo apt-get install -y liboqs-dev; then
