@@ -29,6 +29,8 @@ AS_IF([test "x$enable_debug" = "xyes"], [
 # Checks for libraries.
 PKG_PROG_PKG_CONFIG
 PKG_CHECK_MODULES([UV], [libuv])
+PKG_CHECK_MODULES([OQS], [liboqs])
+PKG_CHECK_MODULES([SODIUM], [libsodium])
 
 # Checks for header files.
 AC_CHECK_HEADERS([stdlib.h string.h unistd.h])
