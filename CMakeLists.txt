@@ -6,10 +6,12 @@ include(GNUInstallDirs)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Build Options
 option(ENABLE_DEBUG "Enable debug build" OFF)
 option(NASFS_INSTALL_SYSTEMD "Install the systemd unit" ON)
+option(NASFS_ENABLE_SANITIZERS "Enable address and undefined behavior sanitizers" OFF)
 set(NASFS_SYSTEMD_UNIT_DIR "${CMAKE_INSTALL_LIBDIR}/systemd/system" CACHE PATH "Directory for installing systemd service units")
 
 if(ENABLE_DEBUG)
@@ -19,6 +21,15 @@ else()
 endif()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic")
+
+if(NASFS_ENABLE_SANITIZERS)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    else()
+        message(FATAL_ERROR "Sanitizers are only supported with Clang or GCC")
+    endif()
+endif()
 
 # Dependencies
 find_package(PkgConfig REQUIRED)

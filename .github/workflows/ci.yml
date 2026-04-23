@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: .github/scripts/install-ubuntu-deps.sh
+
+      - name: Check C formatting
+        run: |
+          git ls-files '*.c' '*.h' | xargs clang-format --dry-run --Werror
+
+      - name: Shellcheck scripts
+        run: |
+          shellcheck autogen.sh
+          shellcheck autoclean.sh
+          shellcheck tests/test_end_to_end.sh
+
+  autotools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: .github/scripts/install-ubuntu-deps.sh
+
+      - name: Configure
+        run: |
+          autoreconf -fi
+          ./configure --disable-systemd
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Test
+        run: make check
+
+      - name: Install to staging
+        run: |
+          make install DESTDIR="$PWD/install-root"
+          test -f "$PWD/install-root/usr/local/bin/nasfs_server"
+          test -f "$PWD/install-root/usr/local/bin/nasfs_client"
+          test -f "$PWD/install-root/usr/local/bin/nasfsctl"
+          test -f "$PWD/install-root/usr/local/etc/nasfs/nasfs.conf"
+
+  cmake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: .github/scripts/install-ubuntu-deps.sh
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DNASFS_INSTALL_SYSTEMD=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install to staging
+        run: |
+          cmake --install build --prefix "$PWD/install-root"
+          test -f "$PWD/install-root/bin/nasfs_server"
+          test -f "$PWD/install-root/bin/nasfs_client"
+          test -f "$PWD/install-root/bin/nasfsctl"
+          test -f "$PWD/install-root/etc/nasfs/nasfs.conf"
+          test -f "$PWD/install-root/lib/systemd/system/nasfs.service"
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: .github/scripts/install-ubuntu-deps.sh
+
+      - name: Configure sanitizer build
+        run: >
+          cmake -S . -B build-sanitize
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DNASFS_INSTALL_SYSTEMD=OFF
+          -DNASFS_ENABLE_SANITIZERS=ON
+
+      - name: Build sanitizer targets
+        run: cmake --build build-sanitize
+
+      - name: Run sanitizer tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:check_initialization_order=1:strict_init_order=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build-sanitize --output-on-failure
