@@ -35,10 +35,11 @@ static int test_password_payload_round_trip(void) {
   }
 
   rc = strcmp(output.method, NASFS_AUTH_METHOD_PASSWORD) == 0 &&
-       strcmp(output.username, "alice") == 0 &&
-       strcmp(output.password, "secret") == 0 && !output.sig_algorithm &&
-       !output.public_key && output.public_key_len == 0 && !output.signature &&
-       output.signature_len == 0
+               strcmp(output.username, "alice") == 0 &&
+               strcmp(output.password, "secret") == 0 &&
+               !output.sig_algorithm && !output.public_key &&
+               output.public_key_len == 0 && !output.signature &&
+               output.signature_len == 0
            ? 0
            : 1;
 
@@ -71,12 +72,13 @@ static int test_publickey_payload_round_trip(void) {
   }
 
   rc = strcmp(output.method, NASFS_AUTH_METHOD_PUBLICKEY) == 0 &&
-       strcmp(output.username, "bob") == 0 &&
-       strcmp(output.sig_algorithm, NASFS_AUTH_DEFAULT_SIG_ALGORITHM) == 0 &&
-       output.public_key_len == sizeof(public_key) &&
-       memcmp(output.public_key, public_key, sizeof(public_key)) == 0 &&
-       output.signature_len == sizeof(signature) &&
-       memcmp(output.signature, signature, sizeof(signature)) == 0
+               strcmp(output.username, "bob") == 0 &&
+               strcmp(output.sig_algorithm, NASFS_AUTH_DEFAULT_SIG_ALGORITHM) ==
+                   0 &&
+               output.public_key_len == sizeof(public_key) &&
+               memcmp(output.public_key, public_key, sizeof(public_key)) == 0 &&
+               output.signature_len == sizeof(signature) &&
+               memcmp(output.signature, signature, sizeof(signature)) == 0
            ? 0
            : 1;
 
@@ -96,7 +98,8 @@ static int test_hex_round_trip(void) {
   encoded = nasfs_hex_encode(input, sizeof(input));
   decoded = nasfs_hex_decode(encoded, &decoded_len);
   rc = encoded && strcmp(encoded, "0010abff") == 0 && decoded &&
-       decoded_len == sizeof(input) && memcmp(decoded, input, sizeof(input)) == 0
+               decoded_len == sizeof(input) &&
+               memcmp(decoded, input, sizeof(input)) == 0
            ? 0
            : 1;
 
@@ -111,12 +114,12 @@ static int test_auth_message_shape(void) {
   size_t message_len = 0;
   int rc;
 
-  message = nasfs_auth_build_message(NASFS_AUTH_METHOD_PASSWORD_PUBLICKEY,
-                                     "carol", secret, sizeof(secret),
-                                     &message_len);
+  message =
+      nasfs_auth_build_message(NASFS_AUTH_METHOD_PASSWORD_PUBLICKEY, "carol",
+                               secret, sizeof(secret), &message_len);
   rc = message && message_len > sizeof(secret) &&
-       memcmp(message + message_len - sizeof(secret), secret, sizeof(secret)) ==
-           0
+               memcmp(message + message_len - sizeof(secret), secret,
+                      sizeof(secret)) == 0
            ? 0
            : 1;
 
