@@ -149,6 +149,38 @@ int load_config(const char* filename, server_config_t* config) {
         fclose(file);
         return -1;
       }
+    } else if (strcmp(key, "AuthMethods") == 0) {
+      free(config->auth_methods);
+      config->auth_methods = strdup(value);
+      if (!config->auth_methods) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(file);
+        return -1;
+      }
+    } else if (strcmp(key, "AuthPassword") == 0) {
+      free(config->auth_password);
+      config->auth_password = strdup(value);
+      if (!config->auth_password) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(file);
+        return -1;
+      }
+    } else if (strcmp(key, "AuthorizedKeysFile") == 0) {
+      free(config->authorized_keys_file);
+      config->authorized_keys_file = strdup(value);
+      if (!config->authorized_keys_file) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(file);
+        return -1;
+      }
+    } else if (strcmp(key, "PubKeyAuthAlgorithms") == 0) {
+      free(config->pubkey_auth_algorithms);
+      config->pubkey_auth_algorithms = strdup(value);
+      if (!config->pubkey_auth_algorithms) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(file);
+        return -1;
+      }
     }
   }
 
@@ -171,6 +203,10 @@ void set_defaults(server_config_t* config) {
   config->storage_dir = strdup(".");
   config->kex_algorithms = strdup("ML-KEM-512,Kyber512,ML-KEM-768,Kyber768");
   config->cipher_algorithms = strdup("xchacha20poly1305");
+  config->auth_methods = strdup("password,publickey,password+publickey");
+  config->auth_password = strdup("nasfs");
+  config->authorized_keys_file = strdup("/usr/local/etc/nasfs/authorized_keys");
+  config->pubkey_auth_algorithms = strdup("ML-DSA-65,ML-DSA-44");
 }
 
 /* Release configuration resources.
@@ -187,6 +223,10 @@ void free_config(server_config_t* config) {
   free(config->storage_dir);
   free(config->kex_algorithms);
   free(config->cipher_algorithms);
+  free(config->auth_methods);
+  free(config->auth_password);
+  free(config->authorized_keys_file);
+  free(config->pubkey_auth_algorithms);
 
   memset(config, 0, sizeof(*config));
 }

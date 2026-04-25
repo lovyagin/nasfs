@@ -56,11 +56,13 @@ typedef struct {
   OQS_KEM* kem;            /**< OQS Key Encapsulation Mechanism instance. */
   uint8_t* kem_secret_key; /**< The server's secret key for this session. */
   uint8_t*
-      shared_secret;   /**< The derived shared secret for symmetric crypto. */
-  char* kex_algorithm; /**< Negotiated KEX algorithm for this session. */
-  char* cipher_algorithm; /**< Negotiated control-channel cipher for this
-                             session. */
-  int is_secure;          /**< Flag indicating if the channel is encrypted. */
+      shared_secret; /**< The derived shared secret for symmetric crypto. */
+  size_t shared_secret_len; /**< Length of @p shared_secret. */
+  char* kex_algorithm;      /**< Negotiated KEX algorithm for this session. */
+  char* cipher_algorithm;   /**< Negotiated control-channel cipher for this
+                               session. */
+  int is_secure;            /**< Flag indicating if the channel is encrypted. */
+  int is_authenticated;     /**< Flag indicating successful user auth. */
   crypto_secretstream_xchacha20poly1305_state
       send_crypto_state; /**< Server->client control channel state. */
   crypto_secretstream_xchacha20poly1305_state

@@ -30,6 +30,10 @@ typedef struct {
   char* kex_algorithms; /**< Allowed PQC KEX algorithms in preference order */
   char* cipher_algorithms; /**< Allowed control-channel ciphers in preference
                               order */
+  char* auth_methods;      /**< Allowed authentication methods */
+  char* auth_password;     /**< Shared password for password authentication */
+  char* authorized_keys_file;   /**< Path to PQ public keys allowed for login */
+  char* pubkey_auth_algorithms; /**< Allowed PQ signature algorithms */
 } server_config_t;
 
 /**
