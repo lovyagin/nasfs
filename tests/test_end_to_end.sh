@@ -20,6 +20,8 @@ TEST_ROOT="${NASFS_TEST_ROOT:-$ROOT_DIR/tests/workspace}"
 STORAGE_DIR="${NASFS_STORAGE_DIR:-$ROOT_DIR/storage}"
 TEST_DIR="$TEST_ROOT"
 LOG_DIR="$TEST_DIR/logs"
+CLIENT_KEY="$TEST_DIR/client_mldsa.key"
+AUTHORIZED_KEYS="$TEST_DIR/authorized_keys"
 
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -54,7 +56,7 @@ cleanup() {
     # Hard cleanup of any leaked instances
     pkill -f nasfs_server 2>/dev/null || true
 
-    rm -rf "$TEST_DIR/test_file_*"
+    rm -f "$TEST_DIR"/test_file_* "$CLIENT_KEY" "$AUTHORIZED_KEYS"
     printf "${GREEN}%s${NC}\n" " Done."
 }
 trap cleanup EXIT
@@ -72,6 +74,9 @@ dd if=/dev/urandom of="$TEST_INPUT" bs=1M count=2 2>/dev/null
 INPUT_HASH=$(hash_file "$TEST_INPUT")
 printf "      Created 2MB random file. Hash: %s...\n" "${INPUT_HASH:0:16}"
 
+"$CLIENT_BIN" keygen "$CLIENT_KEY" "$AUTHORIZED_KEYS" ML-DSA-65 \
+    > "$LOG_DIR/keygen.log" 2>&1
+
 # 3. Start Server
 printf "${YELLOW}%s${NC}\n" "[2/4] Starting server..."
 # Create a test config
@@ -86,6 +91,10 @@ PidFile $LOG_DIR/server.pid
 StorageDir $STORAGE_DIR
 KexAlgorithms ML-KEM-512,Kyber512
 CipherAlgorithms xchacha20poly1305
+AuthMethods password,publickey,password+publickey
+AuthPassword e2e-password
+AuthorizedKeysFile $AUTHORIZED_KEYS
+PubKeyAuthAlgorithms ML-DSA-65
 EOF
 
 "$SERVER_BIN" "$TEST_DIR/test_server.conf" > "$LOG_DIR/server_stdout.log" 2>&1 &
@@ -102,8 +111,24 @@ printf "${GREEN}%s${NC}\n" "      Server is running."
 # 4. Test PUT
 printf "${YELLOW}%s${NC}\n" "[3/4] Testing PUT (Upload)..."
 REMOTE_NAME="e2e_test_upload.bin"
+
+if env NASFS_KEX_ALGORITHMS="ML-KEM-512,Kyber512" \
+       NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
+       NASFS_AUTH_METHOD="password" \
+       NASFS_AUTH_USER="e2e" \
+       NASFS_AUTH_PASSWORD="wrong-password" \
+       "$CLIENT_BIN" put "$TEST_INPUT" "bad-auth.bin" \
+       > "$LOG_DIR/client_bad_auth.log" 2>&1; then
+    printf "${RED}%s${NC}\n" "FAIL: Client succeeded with an invalid password."
+    cat "$LOG_DIR/client_bad_auth.log"
+    exit 1
+fi
+
 if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512,Kyber512" \
          NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
+         NASFS_AUTH_METHOD="password" \
+         NASFS_AUTH_USER="e2e" \
+         NASFS_AUTH_PASSWORD="e2e-password" \
          "$CLIENT_BIN" put "$TEST_INPUT" "$REMOTE_NAME" > "$LOG_DIR/client_put.log" 2>&1; then
     printf "${RED}%s${NC}\n" "FAIL: Client PUT command failed."
     printf "--- Client Logs ---\n"
@@ -130,6 +155,10 @@ printf "${GREEN}%s${NC}\n" "      PUT successful. Integrity verified."
 printf "${YELLOW}%s${NC}\n" "[4/4] Testing GET (Download)..."
 if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512,Kyber512" \
          NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
+         NASFS_AUTH_METHOD="publickey" \
+         NASFS_AUTH_USER="e2e" \
+         NASFS_AUTH_SIG_ALGORITHM="ML-DSA-65" \
+         NASFS_IDENTITY_FILE="$CLIENT_KEY" \
          "$CLIENT_BIN" get "$REMOTE_NAME" "$TEST_OUTPUT" > "$LOG_DIR/client_get.log" 2>&1; then
     printf "${RED}%s${NC}\n" "FAIL: Client GET command failed."
     cat "$LOG_DIR/client_get.log"

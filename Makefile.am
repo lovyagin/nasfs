@@ -28,10 +28,12 @@ CLEANFILES = utils/nasfsctl systemd/nasfs.service
 BUILT_SOURCES = utils/nasfsctl systemd/nasfs.service
 
 utils/nasfsctl: utils/nasfsctl.in Makefile
+	$(MKDIR_P) $(@D)
 	$(edit_paths) $< > $@
 	chmod 755 $@
 
 systemd/nasfs.service: systemd/nasfs.service.in Makefile
+	$(MKDIR_P) $(@D)
 	$(edit_paths) $< > $@
 
 if INSTALL_SYSTEMD

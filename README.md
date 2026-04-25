@@ -7,8 +7,10 @@ unencrypted by design; only the control channel is protected.
 Current protocol characteristics:
 - TCP server/client built on `libuv`
 - configurable KEX and control-channel cipher selection
+- configurable authentication: password, PQ public key, or both
 - SSH-like client preference lists with server-side allowlists
 - post-quantum KEX via `liboqs`
+- post-quantum signatures for public-key authentication via `liboqs`
 - encrypted control channel via `libsodium`
 - bulk `PUT/GET` file data transferred in clear text
 
@@ -141,6 +143,10 @@ Important options:
 - `StorageDir`
 - `KexAlgorithms`
 - `CipherAlgorithms`
+- `AuthMethods`
+- `AuthPassword`
+- `AuthorizedKeysFile`
+- `PubKeyAuthAlgorithms`
 
 Example defaults:
 
@@ -151,6 +157,10 @@ LogFile /usr/local/var/log/nasfs/nasfs-server.log
 PidFile /usr/local/var/run/nasfs/nasfs-server.pid
 KexAlgorithms ML-KEM-512,Kyber512,ML-KEM-768,Kyber768
 CipherAlgorithms xchacha20poly1305
+AuthMethods password,publickey,password+publickey
+AuthPassword nasfs
+AuthorizedKeysFile /usr/local/etc/nasfs/authorized_keys
+PubKeyAuthAlgorithms ML-DSA-65,ML-DSA-44
 ```
 
 ## Negotiation model
@@ -164,7 +174,66 @@ The secure control channel works in an SSH-like way:
 At the moment:
 - KEX is negotiable
 - control-channel cipher is negotiable
+- user authentication method is selectable
 - file payload encryption is intentionally not implemented
+
+## Authentication
+
+NASFS does not use `libssh`. Authentication is implemented in the NASFS
+control protocol after the post-quantum KEX completes and after the control
+channel is encrypted.
+
+Supported methods:
+- `password`
+- `publickey`
+- `password+publickey`
+
+Public-key auth uses post-quantum signature algorithms from `liboqs`. The
+default is `ML-DSA-65`; `Ed25519` is not used because it is not
+post-quantum-resistant.
+
+Generate a client identity and an `authorized_keys` file:
+
+```sh
+nasfs_client keygen ~/.nasfs/id_mldsa /usr/local/etc/nasfs/authorized_keys ML-DSA-65
+```
+
+The private key file is written in a NASFS-specific text format and should stay
+client-side. The public file contains lines in this format:
+
+```text
+ML-DSA-65 <hex-encoded-public-key>
+```
+
+Password-only client auth:
+
+```sh
+NASFS_AUTH_METHOD=password \
+NASFS_AUTH_USER=alice \
+NASFS_AUTH_PASSWORD='change-me' \
+nasfs_client put ./local.bin remote.bin
+```
+
+Public-key client auth:
+
+```sh
+NASFS_AUTH_METHOD=publickey \
+NASFS_AUTH_USER=alice \
+NASFS_AUTH_SIG_ALGORITHM=ML-DSA-65 \
+NASFS_IDENTITY_FILE=~/.nasfs/id_mldsa \
+nasfs_client get remote.bin ./local.bin
+```
+
+Password plus public key:
+
+```sh
+NASFS_AUTH_METHOD=password+publickey \
+NASFS_AUTH_USER=alice \
+NASFS_AUTH_PASSWORD='change-me' \
+NASFS_AUTH_SIG_ALGORITHM=ML-DSA-65 \
+NASFS_IDENTITY_FILE=~/.nasfs/id_mldsa \
+nasfs_client put ./local.bin remote.bin
+```
 
 ## Running
 
@@ -214,6 +283,9 @@ Override client-side preference lists:
 ```sh
 NASFS_KEX_ALGORITHMS="Kyber512,ML-KEM-512" \
 NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
+NASFS_AUTH_METHOD="password" \
+NASFS_AUTH_USER="alice" \
+NASFS_AUTH_PASSWORD="change-me" \
 nasfs_client put ./local.bin remote.bin
 ```
 
@@ -234,11 +306,15 @@ ctest --test-dir build --output-on-failure
 Test suite contents:
 - handshake unit test
 - config parser unit test
+- auth payload unit test
 - end-to-end `PUT/GET` integration test
 
 The integration test validates:
 - server startup
 - secure control-channel negotiation
+- failed authentication rejection
+- password authentication
+- post-quantum public-key authentication
 - upload integrity
 - download integrity
 

@@ -51,6 +51,7 @@ configure_file(systemd/nasfs.service.in ${CMAKE_CURRENT_BINARY_DIR}/nasfs.servic
 add_library(nasfs_common STATIC
   common/src/protocol.c
   common/src/handshake.c
+  common/src/auth.c
 )
 target_include_directories(nasfs_common PUBLIC
   common/include
@@ -116,8 +117,14 @@ add_executable(test_config tests/test_config.c server/src/config/config.c)
 target_include_directories(test_config PRIVATE server/include common/include)
 target_compile_options(test_config PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(test_auth tests/test_auth.c)
+target_include_directories(test_auth PRIVATE common/include)
+target_compile_options(test_auth PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(test_auth PRIVATE nasfs_common)
+
 add_test(NAME unit_handshake COMMAND test_handshake)
 add_test(NAME unit_config COMMAND test_config)
+add_test(NAME unit_auth COMMAND test_auth)
 add_test(NAME integration_e2e COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_end_to_end.sh)
 set_tests_properties(
   integration_e2e

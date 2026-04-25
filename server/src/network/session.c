@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "auth.h"
 #include "config/config.h"
 #include "handshake.h"
 #include "logging/log.h"
@@ -57,6 +58,127 @@ static void session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
 static void do_get_next_chunk(client_session_t* session);
 static void session_dispatch_frame(client_session_t* session,
                                    nasfs_frame_t* frame);
+static int csv_list_contains(const char* csv_list, const char* candidate);
+
+static int method_requires_password(const char* method) {
+  return strcmp(method, NASFS_AUTH_METHOD_PASSWORD) == 0 ||
+         strcmp(method, NASFS_AUTH_METHOD_PASSWORD_PUBLICKEY) == 0;
+}
+
+static int method_requires_publickey(const char* method) {
+  return strcmp(method, NASFS_AUTH_METHOD_PUBLICKEY) == 0 ||
+         strcmp(method, NASFS_AUTH_METHOD_PASSWORD_PUBLICKEY) == 0;
+}
+
+static int authorized_key_matches(const char* path, const char* alg,
+                                  const uint8_t* public_key,
+                                  size_t public_key_len) {
+  FILE* file;
+  char line[8192];
+
+  if (!path || !alg || !public_key) {
+    return 0;
+  }
+
+  file = fopen(path, "r");
+  if (!file) {
+    return 0;
+  }
+
+  while (fgets(line, sizeof(line), file)) {
+    char* key_alg;
+    char* key_hex;
+    uint8_t* decoded;
+    size_t decoded_len = 0;
+    int match;
+
+    if (line[0] == '#' || line[0] == '\n') {
+      continue;
+    }
+
+    key_alg = strtok(line, " \t\r\n");
+    key_hex = strtok(NULL, " \t\r\n");
+    if (!key_alg || !key_hex || strcmp(key_alg, alg) != 0) {
+      continue;
+    }
+
+    decoded = nasfs_hex_decode(key_hex, &decoded_len);
+    if (!decoded) {
+      continue;
+    }
+
+    match = decoded_len == public_key_len &&
+            memcmp(decoded, public_key, public_key_len) == 0;
+    free(decoded);
+    if (match) {
+      fclose(file);
+      return 1;
+    }
+  }
+
+  fclose(file);
+  return 0;
+}
+
+static int verify_publickey_auth(client_session_t* session,
+                                 const nasfs_auth_payload_t* auth) {
+  OQS_SIG* sig;
+  uint8_t* message;
+  size_t message_len = 0;
+  int ok = 0;
+
+  if (!auth->sig_algorithm || !auth->public_key || !auth->signature ||
+      !csv_list_contains(global_config.pubkey_auth_algorithms,
+                         auth->sig_algorithm) ||
+      !OQS_SIG_alg_is_enabled(auth->sig_algorithm) ||
+      !authorized_key_matches(global_config.authorized_keys_file,
+                              auth->sig_algorithm, auth->public_key,
+                              auth->public_key_len)) {
+    return 0;
+  }
+
+  sig = OQS_SIG_new(auth->sig_algorithm);
+  if (!sig || auth->public_key_len != sig->length_public_key) {
+    if (sig) {
+      OQS_SIG_free(sig);
+    }
+    return 0;
+  }
+
+  message = nasfs_auth_build_message(auth->method, auth->username,
+                                     session->shared_secret,
+                                     session->shared_secret_len, &message_len);
+  if (message) {
+    ok = OQS_SIG_verify(sig, message, message_len, auth->signature,
+                        auth->signature_len, auth->public_key) == OQS_SUCCESS;
+    free(message);
+  }
+
+  OQS_SIG_free(sig);
+  return ok;
+}
+
+static int verify_auth_payload(client_session_t* session,
+                               const nasfs_auth_payload_t* auth) {
+  if (!auth || !auth->method || !auth->username ||
+      !csv_list_contains(global_config.auth_methods, auth->method)) {
+    return 0;
+  }
+
+  if (method_requires_password(auth->method) &&
+      (!auth->password || !global_config.auth_password ||
+       strcmp(auth->password, global_config.auth_password) != 0)) {
+    return 0;
+  }
+
+  if (method_requires_publickey(auth->method) &&
+      !verify_publickey_auth(session, auth)) {
+    return 0;
+  }
+
+  return method_requires_password(auth->method) ||
+         method_requires_publickey(auth->method);
+}
 
 /**
  * @brief Checks whether a comma-separated list contains a given token.
@@ -438,6 +560,7 @@ static void session_dispatch_frame(client_session_t* session,
 
         session->shared_secret =
             sodium_malloc(session->kem->length_shared_secret);
+        session->shared_secret_len = session->kem->length_shared_secret;
         if (!session->shared_secret ||
             OQS_KEM_decaps(session->kem, session->shared_secret, frame->payload,
                            session->kem_secret_key) != OQS_SUCCESS) {
@@ -503,13 +626,35 @@ static void session_dispatch_frame(client_session_t* session,
   }
 
   switch (plain_frame.type) {
-    case NASFS_CMD_AUTH:
-      log_all(LOG_INFO, "Client authenticated.");
+    case NASFS_CMD_AUTH: {
+      nasfs_auth_payload_t auth = {0};
+      if (nasfs_auth_unpack(plain_frame.payload, plain_frame.payload_len,
+                            &auth) != 0 ||
+          !verify_auth_payload(session, &auth)) {
+        log_all(LOG_WARNING, "Client authentication failed.");
+        nasfs_auth_payload_free(&auth);
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"Authentication failed", 21, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+
+      log_all(LOG_INFO, "Client '%s' authenticated with %s.", auth.username,
+              auth.method);
+      session->is_authenticated = 1;
       session->state = SESSION_STATE_AUTHENTICATED;
       session_send_frame(session, NASFS_CMD_AUTH_ACK, NULL, 0, 1);
+      nasfs_auth_payload_free(&auth);
       break;
+    }
 
     case NASFS_CMD_PUT_REQ: {
+      if (!session->is_authenticated) {
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"Authentication required", 23, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
       char raw[256] = {0};
       memcpy(raw, plain_frame.payload,
              plain_frame.payload_len < 255 ? plain_frame.payload_len : 255);
@@ -525,7 +670,8 @@ static void session_dispatch_frame(client_session_t* session,
     }
 
     case NASFS_CMD_PUT_DATA: {  // Unencrypted
-      if (session->state == SESSION_STATE_RECEIVING_FILE &&
+      if (session->is_authenticated &&
+          session->state == SESSION_STATE_RECEIVING_FILE &&
           session->active_fd != -1) {
         nasfs_fs_ctx_t* ctx = malloc(sizeof(nasfs_fs_ctx_t));
         if (ctx) {
@@ -542,7 +688,8 @@ static void session_dispatch_frame(client_session_t* session,
     }
 
     case NASFS_CMD_PUT_DONE:
-      if (session->state == SESSION_STATE_RECEIVING_FILE) {
+      if (session->is_authenticated &&
+          session->state == SESSION_STATE_RECEIVING_FILE) {
         log_all(LOG_INFO, "Upload complete.");
         if (session->active_fd != -1) {
           uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd,
@@ -554,6 +701,12 @@ static void session_dispatch_frame(client_session_t* session,
       break;
 
     case NASFS_CMD_GET_REQ: {
+      if (!session->is_authenticated) {
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"Authentication required", 23, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
       char raw[256] = {0};
       memcpy(raw, plain_frame.payload,
              plain_frame.payload_len < 255 ? plain_frame.payload_len : 255);
