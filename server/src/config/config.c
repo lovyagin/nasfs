@@ -53,9 +53,14 @@ int load_config(const char* filename, server_config_t* config) {
 
   char line[512];
   while (fgets(line, sizeof(line), file)) {
+    char* newline;
+
     if (line[0] == '#' || line[0] == '\n') continue;
 
-    line[strcspn(line, "\n")] = 0;
+    newline = memchr(line, '\n', sizeof(line));
+    if (newline) {
+      *newline = '\0';
+    }
 
     trim_string(line);
 
