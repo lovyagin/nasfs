@@ -222,8 +222,13 @@ uint8_t* nasfs_hex_decode(const char* hex, size_t* out_len) {
     return NULL;
   }
 
+  if (hex_len == 0) {
+    *out_len = 0;
+    return NULL;
+  }
+
   out = malloc(hex_len / 2);
-  if (!out && hex_len > 0) {
+  if (!out) {
     return NULL;
   }
 

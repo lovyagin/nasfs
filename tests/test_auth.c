@@ -108,6 +108,12 @@ static int test_hex_round_trip(void) {
   return rc;
 }
 
+static int test_empty_hex_decode(void) {
+  size_t decoded_len = 1;
+
+  return nasfs_hex_decode("", &decoded_len) == NULL && decoded_len == 0 ? 0 : 1;
+}
+
 static int test_auth_message_shape(void) {
   uint8_t secret[] = {0xde, 0xad, 0xbe, 0xef};
   uint8_t* message;
@@ -138,6 +144,10 @@ int main(void) {
   }
   if (test_hex_round_trip() != 0) {
     fprintf(stderr, "hex round-trip failed\n");
+    return 1;
+  }
+  if (test_empty_hex_decode() != 0) {
+    fprintf(stderr, "empty hex decode failed\n");
     return 1;
   }
   if (test_auth_message_shape() != 0) {
