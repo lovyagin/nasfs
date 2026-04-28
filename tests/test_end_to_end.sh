@@ -21,6 +21,7 @@ STORAGE_DIR="${NASFS_STORAGE_DIR:-$ROOT_DIR/storage}"
 TEST_DIR="$TEST_ROOT"
 LOG_DIR="$TEST_DIR/logs"
 CLIENT_KEY="$TEST_DIR/client_mldsa.key"
+CLIENT_KEY_44="$TEST_DIR/client_mldsa44.key"
 AUTHORIZED_KEYS="$TEST_DIR/authorized_keys"
 
 hash_file() {
@@ -29,6 +30,76 @@ hash_file() {
     else
         shasum -a 256 "$1" | awk '{print $1}'
     fi
+}
+
+run_client() {
+    local log_file=$1
+    local kex_list=$2
+    local auth_method=$3
+    local auth_password=$4
+    local identity_file=$5
+    local sig_algorithm=$6
+    shift 6
+
+    env NASFS_KEX_ALGORITHMS="$kex_list" \
+        NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
+        NASFS_AUTH_METHOD="$auth_method" \
+        NASFS_AUTH_USER="e2e" \
+        NASFS_AUTH_PASSWORD="$auth_password" \
+        NASFS_AUTH_SIG_ALGORITHM="$sig_algorithm" \
+        NASFS_IDENTITY_FILE="$identity_file" \
+        "$CLIENT_BIN" "$@" > "$log_file" 2>&1
+}
+
+expect_client_failure() {
+    local log_file=$1
+    shift
+
+    if run_client "$log_file" "$@"; then
+        printf "${RED}%s${NC}\n" "FAIL: Client command unexpectedly succeeded."
+        cat "$log_file"
+        exit 1
+    fi
+}
+
+verify_download_hash() {
+    local expected_hash=$1
+    local downloaded_file=$2
+    local actual_hash
+
+    if [ ! -f "$downloaded_file" ]; then
+        printf "${RED}%s${NC}\n" "FAIL: Downloaded file not found: $downloaded_file"
+        exit 1
+    fi
+
+    actual_hash=$(hash_file "$downloaded_file")
+    if [ "$expected_hash" != "$actual_hash" ]; then
+        printf "${RED}%s${NC}\n" "FAIL: Downloaded file hash mismatch!"
+        exit 1
+    fi
+}
+
+try_kex_download() {
+    local kex_algorithm=$1
+    local output_file="$TEST_DIR/test_file_${kex_algorithm//[^A-Za-z0-9]/_}.bin"
+    local log_file="$LOG_DIR/client_kex_${kex_algorithm//[^A-Za-z0-9]/_}.log"
+
+    if run_client "$log_file" "$kex_algorithm" "password" "e2e-password" "" \
+        "ML-DSA-65" get "$REMOTE_NAME" "$output_file"; then
+        verify_download_hash "$INPUT_HASH" "$output_file"
+        printf "${GREEN}%s${NC}\n" "      KEX $kex_algorithm verified."
+        return
+    fi
+
+    if grep -Eq "No compatible KEX/cipher suite|Connection closed|Connection error" \
+        "$log_file"; then
+        printf "${YELLOW}%s${NC}\n" "      SKIP: KEX $kex_algorithm is not enabled in this liboqs build."
+        return
+    fi
+
+    printf "${RED}%s${NC}\n" "FAIL: KEX $kex_algorithm failed unexpectedly."
+    cat "$log_file"
+    exit 1
 }
 
 # Ensure directories exist
@@ -56,7 +127,8 @@ cleanup() {
     # Hard cleanup of any leaked instances
     pkill -f nasfs_server 2>/dev/null || true
 
-    rm -f "$TEST_DIR"/test_file_* "$CLIENT_KEY" "$AUTHORIZED_KEYS"
+    rm -f "$TEST_DIR"/test_file_* "$CLIENT_KEY" "$CLIENT_KEY_44" \
+        "$AUTHORIZED_KEYS" "$TEST_DIR"/authorized_keys_*
     printf "${GREEN}%s${NC}\n" " Done."
 }
 trap cleanup EXIT
@@ -74,8 +146,18 @@ dd if=/dev/urandom of="$TEST_INPUT" bs=1M count=2 2>/dev/null
 INPUT_HASH=$(hash_file "$TEST_INPUT")
 printf "      Created 2MB random file. Hash: %s...\n" "${INPUT_HASH:0:16}"
 
-"$CLIENT_BIN" keygen "$CLIENT_KEY" "$AUTHORIZED_KEYS" ML-DSA-65 \
-    > "$LOG_DIR/keygen.log" 2>&1
+"$CLIENT_BIN" keygen "$CLIENT_KEY" "$TEST_DIR/authorized_keys_65" ML-DSA-65 \
+    > "$LOG_DIR/keygen_mldsa65.log" 2>&1
+cat "$TEST_DIR/authorized_keys_65" > "$AUTHORIZED_KEYS"
+
+if "$CLIENT_BIN" keygen "$CLIENT_KEY_44" "$TEST_DIR/authorized_keys_44" \
+    ML-DSA-44 > "$LOG_DIR/keygen_mldsa44.log" 2>&1; then
+    cat "$TEST_DIR/authorized_keys_44" >> "$AUTHORIZED_KEYS"
+    HAS_ML_DSA_44=1
+else
+    HAS_ML_DSA_44=0
+    printf "${YELLOW}%s${NC}\n" "      SKIP: ML-DSA-44 is not enabled in this liboqs build."
+fi
 
 # 3. Start Server
 printf "${YELLOW}%s${NC}\n" "[2/4] Starting server..."
@@ -89,12 +171,12 @@ LogLevel Debug
 DaemonMode No
 PidFile $LOG_DIR/server.pid
 StorageDir $STORAGE_DIR
-KexAlgorithms ML-KEM-512,Kyber512
+KexAlgorithms ML-KEM-512,Kyber512,ML-KEM-768,Kyber768
 CipherAlgorithms xchacha20poly1305
 AuthMethods password,publickey,password+publickey
 AuthPassword e2e-password
 AuthorizedKeysFile $AUTHORIZED_KEYS
-PubKeyAuthAlgorithms ML-DSA-65
+PubKeyAuthAlgorithms ML-DSA-65,ML-DSA-44
 EOF
 
 "$SERVER_BIN" "$TEST_DIR/test_server.conf" > "$LOG_DIR/server_stdout.log" 2>&1 &
@@ -112,24 +194,12 @@ printf "${GREEN}%s${NC}\n" "      Server is running."
 printf "${YELLOW}%s${NC}\n" "[3/4] Testing PUT (Upload)..."
 REMOTE_NAME="e2e_test_upload.bin"
 
-if env NASFS_KEX_ALGORITHMS="ML-KEM-512,Kyber512" \
-       NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
-       NASFS_AUTH_METHOD="password" \
-       NASFS_AUTH_USER="e2e" \
-       NASFS_AUTH_PASSWORD="wrong-password" \
-       "$CLIENT_BIN" put "$TEST_INPUT" "bad-auth.bin" \
-       > "$LOG_DIR/client_bad_auth.log" 2>&1; then
-    printf "${RED}%s${NC}\n" "FAIL: Client succeeded with an invalid password."
-    cat "$LOG_DIR/client_bad_auth.log"
-    exit 1
-fi
+expect_client_failure "$LOG_DIR/client_bad_auth.log" \
+    "ML-KEM-512" "password" "wrong-password" "" "ML-DSA-65" \
+    put "$TEST_INPUT" "bad-auth.bin"
 
-if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512,Kyber512" \
-         NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
-         NASFS_AUTH_METHOD="password" \
-         NASFS_AUTH_USER="e2e" \
-         NASFS_AUTH_PASSWORD="e2e-password" \
-         "$CLIENT_BIN" put "$TEST_INPUT" "$REMOTE_NAME" > "$LOG_DIR/client_put.log" 2>&1; then
+if ! run_client "$LOG_DIR/client_put.log" "ML-KEM-512" "password" \
+    "e2e-password" "" "ML-DSA-65" put "$TEST_INPUT" "$REMOTE_NAME"; then
     printf "${RED}%s${NC}\n" "FAIL: Client PUT command failed."
     printf "--- Client Logs ---\n"
     cat "$LOG_DIR/client_put.log"
@@ -153,31 +223,49 @@ printf "${GREEN}%s${NC}\n" "      PUT successful. Integrity verified."
 
 # 5. Test GET
 printf "${YELLOW}%s${NC}\n" "[4/4] Testing GET (Download)..."
-if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512,Kyber512" \
-         NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
-         NASFS_AUTH_METHOD="publickey" \
-         NASFS_AUTH_USER="e2e" \
-         NASFS_AUTH_SIG_ALGORITHM="ML-DSA-65" \
-         NASFS_IDENTITY_FILE="$CLIENT_KEY" \
-         "$CLIENT_BIN" get "$REMOTE_NAME" "$TEST_OUTPUT" > "$LOG_DIR/client_get.log" 2>&1; then
+if ! run_client "$LOG_DIR/client_get.log" "ML-KEM-512" "publickey" "" \
+    "$CLIENT_KEY" "ML-DSA-65" get "$REMOTE_NAME" "$TEST_OUTPUT"; then
     printf "${RED}%s${NC}\n" "FAIL: Client GET command failed."
     cat "$LOG_DIR/client_get.log"
     exit 1
 fi
 
-if [ ! -f "$TEST_OUTPUT" ]; then
-    printf "${RED}%s${NC}\n" "FAIL: Downloaded file not found."
-    exit 1
-fi
-
-DOWNLOAD_HASH=$(hash_file "$TEST_OUTPUT")
-if [ "$INPUT_HASH" != "$DOWNLOAD_HASH" ]; then
-    printf "${RED}%s${NC}\n" "FAIL: Downloaded file hash mismatch!"
-    exit 1
-fi
+verify_download_hash "$INPUT_HASH" "$TEST_OUTPUT"
 printf "${GREEN}%s${NC}\n" "      GET successful. Integrity verified."
 
-if ! grep -Eq "Negotiated KEX: (ML-KEM-512|Kyber512); control cipher: xchacha20poly1305" "$LOG_DIR/server.log"; then
+printf "${YELLOW}%s${NC}\n" "      Testing auth/KEX matrix..."
+if ! run_client "$LOG_DIR/client_both_auth.log" "ML-KEM-512" \
+    "password+publickey" "e2e-password" "$CLIENT_KEY" "ML-DSA-65" \
+    get "$REMOTE_NAME" "$TEST_DIR/test_file_both_auth.bin"; then
+    printf "${RED}%s${NC}\n" "FAIL: password+publickey authentication failed."
+    cat "$LOG_DIR/client_both_auth.log"
+    exit 1
+fi
+verify_download_hash "$INPUT_HASH" "$TEST_DIR/test_file_both_auth.bin"
+printf "${GREEN}%s${NC}\n" "      password+publickey auth verified."
+
+expect_client_failure "$LOG_DIR/client_unauthorized_key.log" \
+    "ML-KEM-512" "publickey" "" "$CLIENT_KEY" "ML-DSA-44" \
+    get "$REMOTE_NAME" "$TEST_DIR/test_file_unauthorized_key.bin"
+
+if [ "$HAS_ML_DSA_44" -eq 1 ]; then
+    if ! run_client "$LOG_DIR/client_mldsa44.log" "ML-KEM-512" "publickey" \
+        "" "$CLIENT_KEY_44" "ML-DSA-44" get "$REMOTE_NAME" \
+        "$TEST_DIR/test_file_mldsa44.bin"; then
+        printf "${RED}%s${NC}\n" "FAIL: ML-DSA-44 publickey authentication failed."
+        cat "$LOG_DIR/client_mldsa44.log"
+        exit 1
+    fi
+    verify_download_hash "$INPUT_HASH" "$TEST_DIR/test_file_mldsa44.bin"
+    printf "${GREEN}%s${NC}\n" "      ML-DSA-44 publickey auth verified."
+fi
+
+try_kex_download "ML-KEM-512"
+try_kex_download "Kyber512"
+try_kex_download "ML-KEM-768"
+try_kex_download "Kyber768"
+
+if ! grep -Eq "Negotiated KEX: (ML-KEM-512|Kyber512|ML-KEM-768|Kyber768); control cipher: xchacha20poly1305" "$LOG_DIR/server.log"; then
     printf "${RED}%s${NC}\n" "FAIL: Negotiated suite was not logged as expected."
     cat "$LOG_DIR/server.log"
     exit 1
