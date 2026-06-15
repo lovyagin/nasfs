@@ -158,6 +158,10 @@ static int verify_publickey_auth(client_session_t* session,
   return ok;
 }
 
+static uint8_t server_auth_password_hash[32];
+static int server_auth_password_hash_initialized = 0;
+static pthread_mutex_t server_auth_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int verify_auth_payload(client_session_t* session,
                                const nasfs_auth_payload_t* auth) {
   if (!auth || !auth->method || !auth->username ||
@@ -165,10 +169,50 @@ static int verify_auth_payload(client_session_t* session,
     return 0;
   }
 
-  if (method_requires_password(auth->method) &&
-      (!auth->password || !global_config.auth_password ||
-       strcmp(auth->password, global_config.auth_password) != 0)) {
-    return 0;
+  if (method_requires_password(auth->method)) {
+    if (!auth->password || !global_config.auth_password) {
+      return 0;
+    }
+    
+    pthread_mutex_lock(&server_auth_lock);
+    if (!server_auth_password_hash_initialized) {
+      uint8_t auth_salt[crypto_pwhash_SALTBYTES];
+      // Static domain salt for authentication (same as client)
+      memset(auth_salt, 0x55, sizeof(auth_salt));
+
+      if (crypto_pwhash(server_auth_password_hash, sizeof(server_auth_password_hash),
+                        global_config.auth_password, strlen(global_config.auth_password),
+                        auth_salt,
+                        crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                        crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                        crypto_pwhash_ALG_ARGON2ID13) != 0) {
+        pthread_mutex_unlock(&server_auth_lock);
+        return 0;
+      }
+      server_auth_password_hash_initialized = 1;
+    }
+    pthread_mutex_unlock(&server_auth_lock);
+
+    // Compute the session-bound fast and secure proof: BLAKE2b(shared_secret, key=server_auth_password_hash)
+    uint8_t expected_proof[32];
+    if (crypto_generichash(expected_proof, sizeof(expected_proof),
+                           (const uint8_t*)session->shared_secret, session->shared_secret_len,
+                           server_auth_password_hash, sizeof(server_auth_password_hash)) != 0) {
+      return 0;
+    }
+    char* expected_hex = nasfs_hex_encode(expected_proof, sizeof(expected_proof));
+    if (!expected_hex) {
+      return 0;
+    }
+    if (strlen(auth->password) != 64) {
+      free(expected_hex);
+      return 0;
+    }
+    int rc = sodium_memcmp(auth->password, expected_hex, 64);
+    free(expected_hex);
+    if (rc != 0) {
+      return 0;
+    }
   }
 
   if (method_requires_publickey(auth->method) &&
@@ -410,7 +454,24 @@ static void on_put_fs_open(uv_fs_t* req) {
     session->state = SESSION_STATE_AUTHENTICATED;
   } else {
     session->active_fd = (uv_file)req->result;
-    session->file_offset = 0;
+    if (session->file_encryption_enabled) {
+      uv_fs_t write_req;
+      uv_buf_t buf = uv_buf_init((char*)session->file_salt, crypto_pwhash_SALTBYTES);
+      int rc = uv_fs_write(session->handle.loop, &write_req, session->active_fd, &buf, 1, 0, NULL);
+      uv_fs_req_cleanup(&write_req);
+      if (rc < 0) {
+        log_all(LOG_ERROR, "PUT: Salt write failed: %s", uv_strerror(rc));
+        session_send_frame(session, NASFS_CMD_ERROR, (const uint8_t*)"Salt write failed", 17, 1);
+        session->state = SESSION_STATE_AUTHENTICATED;
+        uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd, NULL);
+        session->active_fd = -1;
+        uv_fs_req_cleanup(req);
+        return;
+      }
+      session->file_offset = crypto_pwhash_SALTBYTES;
+    } else {
+      session->file_offset = 0;
+    }
     session_send_frame(session, NASFS_CMD_PUT_ACK, NULL, 0, 1);
   }
   uv_fs_req_cleanup(req);
@@ -435,6 +496,25 @@ static void on_get_fs_read(uv_fs_t* req) {
   } else {
     size_t bytes = req->result;
     session->file_offset += bytes;
+    if (session->file_encryption_enabled) {
+      nasfs_block_meta_t meta;
+      meta.seq_num = session->server_block_seq;
+      meta.size = bytes;
+      if (crypto_generichash(meta.hash, sizeof(meta.hash),
+                             (const uint8_t*)ctx->buf.base, bytes, NULL, 0) != 0) {
+        log_all(LOG_ERROR, "GET: Hash computation failed.");
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"Hash calculation failed", 23, 1);
+        session_close((uv_handle_t*)&session->handle);
+        if (ctx->buf.base) free(ctx->buf.base);
+        uv_fs_req_cleanup(req);
+        free(ctx);
+        return;
+      }
+      session_send_frame(session, NASFS_CMD_GET_BLOCK_META, (const uint8_t*)&meta,
+                         sizeof(meta), 1);
+      session->server_block_seq++;
+    }
     session_send_frame(session, NASFS_CMD_GET_DATA, (uint8_t*)ctx->buf.base,
                        bytes, 0);
   }
@@ -449,7 +529,11 @@ static void do_get_next_chunk(client_session_t* session) {
     return;
   nasfs_fs_ctx_t* ctx = malloc(sizeof(nasfs_fs_ctx_t));
   if (!ctx) return;
-  ctx->buf = uv_buf_init(malloc(IO_CHUNK_SIZE), IO_CHUNK_SIZE);
+  size_t chunk_size = IO_CHUNK_SIZE;
+  if (session->file_encryption_enabled) {
+    chunk_size = IO_CHUNK_SIZE + crypto_secretbox_MACBYTES;
+  }
+  ctx->buf = uv_buf_init(malloc(chunk_size), chunk_size);
   ctx->session = session;
   ctx->req.data = ctx;
   if (uv_fs_read(session->handle.loop, &ctx->req, session->active_fd, &ctx->buf,
@@ -468,8 +552,27 @@ static void on_get_fs_open(uv_fs_t* req) {
     session->state = SESSION_STATE_AUTHENTICATED;
   } else {
     session->active_fd = (uv_file)req->result;
-    session->file_offset = 0;
-    session_send_frame(session, NASFS_CMD_GET_ACK, NULL, 0, 1);
+    if (session->file_encryption_enabled) {
+      uint8_t salt[crypto_pwhash_SALTBYTES];
+      uv_fs_t read_req;
+      uv_buf_t buf = uv_buf_init((char*)salt, crypto_pwhash_SALTBYTES);
+      int rc = uv_fs_read(session->handle.loop, &read_req, session->active_fd, &buf, 1, 0, NULL);
+      uv_fs_req_cleanup(&read_req);
+      if (rc < (int)crypto_pwhash_SALTBYTES) {
+        log_all(LOG_ERROR, "GET: Salt read failed: read %d bytes", rc);
+        session_send_frame(session, NASFS_CMD_ERROR, (const uint8_t*)"Salt read failed", 16, 1);
+        session->state = SESSION_STATE_AUTHENTICATED;
+        uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd, NULL);
+        session->active_fd = -1;
+        uv_fs_req_cleanup(req);
+        return;
+      }
+      session->file_offset = crypto_pwhash_SALTBYTES;
+      session_send_frame(session, NASFS_CMD_GET_ACK, salt, crypto_pwhash_SALTBYTES, 1);
+    } else {
+      session->file_offset = 0;
+      session_send_frame(session, NASFS_CMD_GET_ACK, NULL, 0, 1);
+    }
     do_get_next_chunk(session);
   }
   uv_fs_req_cleanup(req);
@@ -655,9 +758,27 @@ static void session_dispatch_frame(client_session_t* session,
         session_close((uv_handle_t*)&session->handle);
         break;
       }
+      int is_enc = 0;
+      const uint8_t* filename_ptr = plain_frame.payload;
+      size_t filename_len = plain_frame.payload_len;
+      if (plain_frame.payload_len > 1 && (plain_frame.payload[0] == 0 || plain_frame.payload[0] == 1)) {
+        is_enc = plain_frame.payload[0];
+        if (is_enc && plain_frame.payload_len >= (1 + crypto_pwhash_SALTBYTES)) {
+          memcpy(session->file_salt, plain_frame.payload + 1, crypto_pwhash_SALTBYTES);
+          filename_ptr = plain_frame.payload + (1 + crypto_pwhash_SALTBYTES);
+          filename_len = plain_frame.payload_len - (1 + crypto_pwhash_SALTBYTES);
+        } else {
+          filename_ptr = plain_frame.payload + 1;
+          filename_len = plain_frame.payload_len - 1;
+        }
+      }
+      session->file_encryption_enabled = is_enc;
+      session->has_pending_block_meta = 0;
+      session->server_block_seq = 0;
+
       char raw[256] = {0};
-      memcpy(raw, plain_frame.payload,
-             plain_frame.payload_len < 255 ? plain_frame.payload_len : 255);
+      memcpy(raw, filename_ptr,
+             filename_len < 255 ? filename_len : 255);
       char path[1024];
       snprintf(path, sizeof(path), "%s/%s",
                global_config.storage_dir ? global_config.storage_dir : ".",
@@ -669,10 +790,77 @@ static void session_dispatch_frame(client_session_t* session,
       break;
     }
 
+    case NASFS_CMD_PUT_BLOCK_META: {
+      if (session->is_authenticated &&
+          session->state == SESSION_STATE_RECEIVING_FILE) {
+        if (plain_frame.payload_len < sizeof(nasfs_block_meta_t)) {
+          log_all(LOG_ERROR, "PUT: Received invalid block meta payload size.");
+          session_send_frame(session, NASFS_CMD_ERROR,
+                             (const uint8_t*)"Invalid block meta", 18, 1);
+          session_close((uv_handle_t*)&session->handle);
+          break;
+        }
+        nasfs_block_meta_t* meta = (nasfs_block_meta_t*)plain_frame.payload;
+        session->expected_block_seq = meta->seq_num;
+        session->expected_block_size = meta->size;
+        memcpy(session->expected_block_hash, meta->hash, 32);
+        session->has_pending_block_meta = 1;
+      }
+      break;
+    }
+
     case NASFS_CMD_PUT_DATA: {  // Unencrypted
       if (session->is_authenticated &&
           session->state == SESSION_STATE_RECEIVING_FILE &&
           session->active_fd != -1) {
+        if (session->file_encryption_enabled) {
+          if (!session->has_pending_block_meta) {
+            log_all(LOG_ERROR, "PUT: Received data block without metadata.");
+            session_send_frame(session, NASFS_CMD_ERROR,
+                               (const uint8_t*)"Data block without metadata", 27, 1);
+            session_close((uv_handle_t*)&session->handle);
+            break;
+          }
+          if (frame->payload_len != session->expected_block_size) {
+            log_all(LOG_ERROR, "PUT: Received data block size mismatch. Expected %u, got %zu.",
+                    session->expected_block_size, frame->payload_len);
+            session_send_frame(session, NASFS_CMD_ERROR,
+                               (const uint8_t*)"Block size mismatch", 19, 1);
+            session_close((uv_handle_t*)&session->handle);
+            break;
+          }
+          if (session->expected_block_seq != session->server_block_seq) {
+            log_all(LOG_ERROR, "PUT: Sequence number mismatch. Expected %llu, got %llu.",
+                    (unsigned long long)session->server_block_seq, (unsigned long long)session->expected_block_seq);
+            session_send_frame(session, NASFS_CMD_ERROR,
+                               (const uint8_t*)"Sequence mismatch", 17, 1);
+            session_close((uv_handle_t*)&session->handle);
+            break;
+          }
+
+          uint8_t computed_hash[32];
+          if (crypto_generichash(computed_hash, sizeof(computed_hash),
+                                 frame->payload, frame->payload_len, NULL, 0) != 0) {
+            log_all(LOG_ERROR, "PUT: Hash computation failed.");
+            session_send_frame(session, NASFS_CMD_ERROR,
+                               (const uint8_t*)"Hash failed", 11, 1);
+            session_close((uv_handle_t*)&session->handle);
+            break;
+          }
+
+          if (sodium_memcmp(computed_hash, session->expected_block_hash, 32) != 0) {
+            log_all(LOG_ERROR, "PUT: Hash verification failed for block %llu.",
+                    (unsigned long long)session->server_block_seq);
+            session_send_frame(session, NASFS_CMD_ERROR,
+                               (const uint8_t*)"Hash verification failed", 24, 1);
+            session_close((uv_handle_t*)&session->handle);
+            break;
+          }
+
+          session->has_pending_block_meta = 0;
+          session->server_block_seq++;
+        }
+
         nasfs_fs_ctx_t* ctx = malloc(sizeof(nasfs_fs_ctx_t));
         if (ctx) {
           ctx->buf =
@@ -707,9 +895,21 @@ static void session_dispatch_frame(client_session_t* session,
         session_close((uv_handle_t*)&session->handle);
         break;
       }
+      int is_enc = 0;
+      const uint8_t* filename_ptr = plain_frame.payload;
+      size_t filename_len = plain_frame.payload_len;
+      if (plain_frame.payload_len > 1 && (plain_frame.payload[0] == 0 || plain_frame.payload[0] == 1)) {
+        is_enc = plain_frame.payload[0];
+        filename_ptr = plain_frame.payload + 1;
+        filename_len = plain_frame.payload_len - 1;
+      }
+      session->file_encryption_enabled = is_enc;
+      session->has_pending_block_meta = 0;
+      session->server_block_seq = 0;
+
       char raw[256] = {0};
-      memcpy(raw, plain_frame.payload,
-             plain_frame.payload_len < 255 ? plain_frame.payload_len : 255);
+      memcpy(raw, filename_ptr,
+             filename_len < 255 ? filename_len : 255);
       char path[1024];
       snprintf(path, sizeof(path), "%s/%s",
                global_config.storage_dir ? global_config.storage_dir : ".",

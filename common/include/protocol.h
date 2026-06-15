@@ -48,6 +48,8 @@ typedef enum {
   NASFS_CMD_GET_REQ = 0x15,  /**< C->S: Request to download a file. */
   NASFS_CMD_GET_ACK = 0x16,  /**< S->C: Acknowledge GET request. */
   NASFS_CMD_GET_DONE = 0x17, /**< S->C: Indicate end of file download. */
+  NASFS_CMD_PUT_BLOCK_META = 0x18, /**< C->S: Metadata for the next put block (encrypted). */
+  NASFS_CMD_GET_BLOCK_META = 0x19, /**< S->C: Metadata for the next get block (encrypted). */
 
   /* Data Transfer Commands (Unencrypted Payload) */
   NASFS_CMD_PUT_DATA = 0x20, /**< C->S: Data chunk for file upload. */
@@ -100,5 +102,13 @@ int protocol_parse_frame(const uint8_t* buffer, size_t size,
  */
 uint8_t* protocol_pack_frame(nasfs_cmd_type_t type, const uint8_t* payload,
                              size_t payload_len, size_t* out_size);
+
+#pragma pack(push, 1)
+typedef struct {
+  uint64_t seq_num;
+  uint32_t size;
+  uint8_t hash[32];
+} nasfs_block_meta_t;
+#pragma pack(pop)
 
 #endif /* NASFS_PROTOCOL_H */
