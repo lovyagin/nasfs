@@ -1,8 +1,8 @@
 # NASFS
 
 NASFS is a network file storage prototype with a post-quantum, SSH-like
-control-channel negotiation layer. The data plane for file transfer remains
-unencrypted by design; only the control channel is protected.
+control-channel negotiation layer and client-side end-to-end file encryption (E2EE).
+The server acts as a "dumb storage" node, having zero knowledge of the file contents.
 
 Current protocol characteristics:
 - TCP server/client built on `libuv`
@@ -12,7 +12,8 @@ Current protocol characteristics:
 - post-quantum KEX via `liboqs`
 - post-quantum signatures for public-key authentication via `liboqs`
 - encrypted control channel via `libsodium`
-- bulk `PUT/GET` file data transferred in clear text
+- client-side zero-knowledge file encryption via `libsodium` (XSalsa20-Poly1305 + Argon2id)
+- cryptographic protection against file truncation and block reordering
 
 ## Dependencies
 
@@ -175,7 +176,7 @@ At the moment:
 - KEX is negotiable
 - control-channel cipher is negotiable
 - user authentication method is selectable
-- file payload encryption is intentionally not implemented
+- file payload encryption (E2EE) is fully supported and enabled via client-side keys
 
 ## Authentication
 
@@ -278,6 +279,13 @@ Download:
 nasfs_client get remote.bin ./local.bin
 ```
 
+Upload and Download with E2E Encryption:
+
+```sh
+NASFS_ENCRYPTION_KEY="super-secret-key" nasfs_client put ./local.bin encrypted_remote.bin
+NASFS_ENCRYPTION_KEY="super-secret-key" nasfs_client get encrypted_remote.bin ./local_decrypted.bin
+```
+
 Override client-side preference lists:
 
 ```sh
@@ -307,16 +315,19 @@ Test suite contents:
 - handshake unit test
 - config parser unit test
 - auth payload unit test
+- file encryption unit test
 - end-to-end `PUT/GET` integration test
+- end-to-end file encryption integration test
 
-The integration test validates:
+The integration tests validate:
 - server startup
 - secure control-channel negotiation
 - failed authentication rejection
-- password authentication
-- post-quantum public-key authentication
-- upload integrity
-- download integrity
+- password and post-quantum public-key authentication
+- cleartext upload/download integrity
+- client-side key derivation (Argon2id)
+- encrypted chunk processing and block substitution protection
+- zero-knowledge encrypted upload/download integrity
 
 ## Linting and CI
 
