@@ -122,15 +122,29 @@ target_include_directories(test_auth PRIVATE common/include)
 target_compile_options(test_auth PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(test_auth PRIVATE nasfs_common)
 
+add_executable(test_encryption tests/test_encryption.c)
+target_include_directories(test_encryption PRIVATE common/include)
+target_compile_options(test_encryption PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(test_encryption PRIVATE nasfs_common)
+
 add_test(NAME unit_handshake COMMAND test_handshake)
 add_test(NAME unit_config COMMAND test_config)
 add_test(NAME unit_auth COMMAND test_auth)
+add_test(NAME unit_encryption COMMAND test_encryption)
 add_test(NAME integration_e2e COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_end_to_end.sh)
 set_tests_properties(
   integration_e2e
   PROPERTIES
   ENVIRONMENT
     "NASFS_SERVER_BIN=$<TARGET_FILE:nasfs_server>;NASFS_CLIENT_BIN=$<TARGET_FILE:nasfs_client>;NASFS_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/tests-workspace;NASFS_STORAGE_DIR=${CMAKE_CURRENT_BINARY_DIR}/storage"
+)
+
+add_test(NAME integration_encryption COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_file_encryption.sh)
+set_tests_properties(
+  integration_encryption
+  PROPERTIES
+  ENVIRONMENT
+    "NASFS_SERVER_BIN=$<TARGET_FILE:nasfs_server>;NASFS_CLIENT_BIN=$<TARGET_FILE:nasfs_client>;NASFS_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/tests-workspace-enc;NASFS_STORAGE_DIR=${CMAKE_CURRENT_BINARY_DIR}/storage-enc"
 )
 
 install(TARGETS nasfs_server nasfs_client
