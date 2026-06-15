@@ -69,13 +69,20 @@ typedef struct {
       recv_crypto_state; /**< Client->server control channel state. */
 
   /* Block Integrity Verification / Encryption info */
-  int file_encryption_enabled;  /**< Flag indicating if the current file transfer has encryption/integrity enabled. */
-  int has_pending_block_meta;   /**< Flag indicating if we received block metadata but not yet the data. */
-  uint64_t expected_block_seq;  /**< Expected sequence number of the next block. */
-  uint32_t expected_block_size; /**< Expected size of the next block's ciphertext. */
-  uint8_t expected_block_hash[32]; /**< Expected hash of the next block's ciphertext. */
-  uint64_t server_block_seq;    /**< Current block sequence counter on the server. */
-  uint8_t file_salt[crypto_pwhash_SALTBYTES];        /**< Per-file random salt used for key derivation. */
+  int file_encryption_enabled; /**< Flag indicating if the current file transfer
+                                  has encryption/integrity enabled. */
+  int has_pending_block_meta; /**< Flag indicating if we received block metadata
+                                 but not yet the data. */
+  uint64_t
+      expected_block_seq; /**< Expected sequence number of the next block. */
+  uint32_t
+      expected_block_size; /**< Expected size of the next block's ciphertext. */
+  uint8_t expected_block_hash[32]; /**< Expected hash of the next block's
+                                      ciphertext. */
+  uint64_t
+      server_block_seq; /**< Current block sequence counter on the server. */
+  uint8_t file_salt[crypto_pwhash_SALTBYTES]; /**< Per-file random salt used for
+                                                 key derivation. */
 
 } client_session_t;
 

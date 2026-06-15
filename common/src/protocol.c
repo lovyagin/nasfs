@@ -33,6 +33,13 @@ int protocol_parse_frame(const uint8_t* buffer, size_t size,
   memcpy(&network_len, buffer, sizeof(uint32_t));
   uint32_t frame_len = ntohl(network_len);
 
+  // Validate frame_len to prevent integer overflow and denial of service /
+  // memory corruption. 16 MB is a very generous maximum limit for a single
+  // protocol frame (with 64KB blocks).
+  if (frame_len > 1024 * 1024 * 16) {
+    return -1;
+  }
+
   uint32_t total_required = sizeof(uint32_t) + frame_len;
   if (size < total_required) {
     return 0;

@@ -11,17 +11,17 @@ EXTRA_DIST = test_end_to_end.sh test_file_encryption.sh
 AM_CFLAGS = -I$(top_srcdir)/common/include -I$(top_srcdir)/server/include
 
 test_handshake_SOURCES = test_handshake.c
-test_handshake_LDADD = $(top_builddir)/common/libnasfs_common.a
+test_handshake_LDADD = $(top_builddir)/common/libnasfs_common.a $(SODIUM_LIBS) $(OQS_LIBS)
 
 test_config_SOURCES = \
 	test_config.c \
 	$(top_srcdir)/server/src/config/config.c
 
 test_auth_SOURCES = test_auth.c
-test_auth_LDADD = $(top_builddir)/common/libnasfs_common.a
+test_auth_LDADD = $(top_builddir)/common/libnasfs_common.a $(SODIUM_LIBS) $(OQS_LIBS)
 
 test_encryption_SOURCES = test_encryption.c
-test_encryption_LDADD = $(top_builddir)/common/libnasfs_common.a
+test_encryption_LDADD = $(top_builddir)/common/libnasfs_common.a $(SODIUM_LIBS) $(OQS_LIBS)
 
 # Clean up temporary test artifacts
 clean-local:

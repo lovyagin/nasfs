@@ -1,17 +1,18 @@
 /**
  * @file test_encryption.c
- * @brief Unit tests for NASFS file encryption and block integrity verification helpers.
+ * @brief Unit tests for NASFS file encryption and block integrity verification
+ * helpers.
  */
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
+#include <sodium.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sodium.h>
 
 #include "protocol.h"
 
@@ -25,8 +26,8 @@ static int test_key_derivation_and_encryption_round_trip(void) {
 
   // Derive 32-byte key using BLAKE2b hash of the passphrase
   if (crypto_generichash(derived_key, sizeof(derived_key),
-                         (const uint8_t*)passphrase, strlen(passphrase),
-                         NULL, 0) != 0) {
+                         (const uint8_t*)passphrase, strlen(passphrase), NULL,
+                         0) != 0) {
     return 1;
   }
 
@@ -48,13 +49,15 @@ static int test_key_derivation_and_encryption_round_trip(void) {
     return 1;
   }
 
-  if (crypto_secretbox_easy(ciphertext, plaintext, sizeof(plaintext), nonce, derived_key) != 0) {
+  if (crypto_secretbox_easy(ciphertext, plaintext, sizeof(plaintext), nonce,
+                            derived_key) != 0) {
     free(ciphertext);
     return 1;
   }
 
   // Verify ciphertext is different from plaintext
-  if (memcmp(ciphertext + crypto_secretbox_MACBYTES, plaintext, sizeof(plaintext)) == 0) {
+  if (memcmp(ciphertext + crypto_secretbox_MACBYTES, plaintext,
+             sizeof(plaintext)) == 0) {
     free(ciphertext);
     return 1;
   }
@@ -66,7 +69,8 @@ static int test_key_derivation_and_encryption_round_trip(void) {
     return 1;
   }
 
-  if (crypto_secretbox_open_easy(decrypted, ciphertext, ciphertext_len, nonce, derived_key) != 0) {
+  if (crypto_secretbox_open_easy(decrypted, ciphertext, ciphertext_len, nonce,
+                                 derived_key) != 0) {
     free(ciphertext);
     free(decrypted);
     return 1;
@@ -89,8 +93,11 @@ static int test_decryption_failure_cases(void) {
   uint8_t key[crypto_secretbox_KEYBYTES];
   uint8_t wrong_key[crypto_secretbox_KEYBYTES];
 
-  crypto_generichash(key, sizeof(key), (const uint8_t*)passphrase, strlen(passphrase), NULL, 0);
-  crypto_generichash(wrong_key, sizeof(wrong_key), (const uint8_t*)"wrong-password", strlen("wrong-password"), NULL, 0);
+  crypto_generichash(key, sizeof(key), (const uint8_t*)passphrase,
+                     strlen(passphrase), NULL, 0);
+  crypto_generichash(wrong_key, sizeof(wrong_key),
+                     (const uint8_t*)"wrong-password", strlen("wrong-password"),
+                     NULL, 0);
 
   uint8_t plaintext[50] = {0};
   uint64_t seq = 0;
@@ -104,7 +111,8 @@ static int test_decryption_failure_cases(void) {
   uint8_t* decrypted = malloc(sizeof(plaintext));
 
   // 1. Decrypt with WRONG key (should fail)
-  if (crypto_secretbox_open_easy(decrypted, ciphertext, ciphertext_len, nonce, wrong_key) == 0) {
+  if (crypto_secretbox_open_easy(decrypted, ciphertext, ciphertext_len, nonce,
+                                 wrong_key) == 0) {
     free(ciphertext);
     free(decrypted);
     return 1;
@@ -114,15 +122,17 @@ static int test_decryption_failure_cases(void) {
   uint8_t wrong_nonce[crypto_secretbox_NONCEBYTES] = {0};
   uint64_t wrong_seq = 999;
   memcpy(wrong_nonce, &wrong_seq, sizeof(wrong_seq));
-  if (crypto_secretbox_open_easy(decrypted, ciphertext, ciphertext_len, wrong_nonce, key) == 0) {
+  if (crypto_secretbox_open_easy(decrypted, ciphertext, ciphertext_len,
+                                 wrong_nonce, key) == 0) {
     free(ciphertext);
     free(decrypted);
     return 1;
   }
 
   // 3. Decrypt with TAMPERED ciphertext (should fail)
-  ciphertext[10] ^= 0xFF; // Flip a bit
-  if (crypto_secretbox_open_easy(decrypted, ciphertext, ciphertext_len, nonce, key) == 0) {
+  ciphertext[10] ^= 0xFF;  // Flip a bit
+  if (crypto_secretbox_open_easy(decrypted, ciphertext, ciphertext_len, nonce,
+                                 key) == 0) {
     free(ciphertext);
     free(decrypted);
     return 1;
@@ -144,9 +154,8 @@ static int test_block_metadata_integrity(void) {
   meta.size = sizeof(mock_ciphertext);
 
   // Compute BLAKE2b hash of the ciphertext
-  if (crypto_generichash(meta.hash, sizeof(meta.hash),
-                         mock_ciphertext, sizeof(mock_ciphertext),
-                         NULL, 0) != 0) {
+  if (crypto_generichash(meta.hash, sizeof(meta.hash), mock_ciphertext,
+                         sizeof(mock_ciphertext), NULL, 0) != 0) {
     return 1;
   }
 
@@ -157,7 +166,8 @@ static int test_block_metadata_integrity(void) {
 
   // Re-verify computed hash
   uint8_t computed[32];
-  crypto_generichash(computed, sizeof(computed), mock_ciphertext, sizeof(mock_ciphertext), NULL, 0);
+  crypto_generichash(computed, sizeof(computed), mock_ciphertext,
+                     sizeof(mock_ciphertext), NULL, 0);
   if (memcmp(meta.hash, computed, 32) != 0) {
     return 1;
   }
@@ -169,8 +179,8 @@ static int test_request_payload_parsing_backward_compatibility(void) {
   // Scenario 1: New client with encryption enabled (prefix 0x01 + 24-byte salt)
   {
     uint8_t payload[1 + 24 + 8] = {0};
-    payload[0] = 0x01; // encrypted
-    memset(payload + 1, 0xAB, 24); // mock salt
+    payload[0] = 0x01;              // encrypted
+    memset(payload + 1, 0xAB, 24);  // mock salt
     memcpy(payload + 25, "file.txt", 8);
     size_t payload_len = sizeof(payload);
 
@@ -191,7 +201,8 @@ static int test_request_payload_parsing_backward_compatibility(void) {
       }
     }
 
-    if (is_enc != 1 || filename_len != 8 || memcmp(filename_ptr, "file.txt", 8) != 0 || extracted_salt[0] != 0xAB) {
+    if (is_enc != 1 || filename_len != 8 ||
+        memcmp(filename_ptr, "file.txt", 8) != 0 || extracted_salt[0] != 0xAB) {
       return 1;
     }
   }
@@ -218,12 +229,14 @@ static int test_request_payload_parsing_backward_compatibility(void) {
       }
     }
 
-    if (is_enc != 0 || filename_len != 8 || memcmp(filename_ptr, "file.txt", 8) != 0) {
+    if (is_enc != 0 || filename_len != 8 ||
+        memcmp(filename_ptr, "file.txt", 8) != 0) {
       return 1;
     }
   }
 
-  // Scenario 3: Legacy client with no prefix (plain filename starting with 'f' = 0x66)
+  // Scenario 3: Legacy client with no prefix (plain filename starting with 'f'
+  // = 0x66)
   {
     uint8_t payload[] = {'f', 'i', 'l', 'e', '.', 't', 'x', 't'};
     size_t payload_len = sizeof(payload);
@@ -245,7 +258,8 @@ static int test_request_payload_parsing_backward_compatibility(void) {
       }
     }
 
-    if (is_enc != 0 || filename_len != 8 || memcmp(filename_ptr, "file.txt", 8) != 0) {
+    if (is_enc != 0 || filename_len != 8 ||
+        memcmp(filename_ptr, "file.txt", 8) != 0) {
       return 1;
     }
   }
@@ -275,7 +289,8 @@ int main(void) {
   }
 
   if (test_request_payload_parsing_backward_compatibility() != 0) {
-    fprintf(stderr, "test_request_payload_parsing_backward_compatibility failed\n");
+    fprintf(stderr,
+            "test_request_payload_parsing_backward_compatibility failed\n");
     return 1;
   }
 

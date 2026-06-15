@@ -48,8 +48,10 @@ typedef enum {
   NASFS_CMD_GET_REQ = 0x15,  /**< C->S: Request to download a file. */
   NASFS_CMD_GET_ACK = 0x16,  /**< S->C: Acknowledge GET request. */
   NASFS_CMD_GET_DONE = 0x17, /**< S->C: Indicate end of file download. */
-  NASFS_CMD_PUT_BLOCK_META = 0x18, /**< C->S: Metadata for the next put block (encrypted). */
-  NASFS_CMD_GET_BLOCK_META = 0x19, /**< S->C: Metadata for the next get block (encrypted). */
+  NASFS_CMD_PUT_BLOCK_META =
+      0x18, /**< C->S: Metadata for the next put block (encrypted). */
+  NASFS_CMD_GET_BLOCK_META =
+      0x19, /**< S->C: Metadata for the next get block (encrypted). */
 
   /* Data Transfer Commands (Unencrypted Payload) */
   NASFS_CMD_PUT_DATA = 0x20, /**< C->S: Data chunk for file upload. */
