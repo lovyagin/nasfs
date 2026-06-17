@@ -360,20 +360,28 @@ static char* select_cipher_algorithm(const char* client_cipher_list,
 
 /* --- Core Session Lifecycle --- */
 
+static void session_free(client_session_t* session) {
+  if (!session) return;
+  if (session->recv_buffer) free(session->recv_buffer);
+  if (session->kem) OQS_KEM_free(session->kem);
+  if (session->kem_secret_key) free(session->kem_secret_key);
+  if (session->shared_secret) sodium_free(session->shared_secret);
+  if (session->kex_algorithm) free(session->kex_algorithm);
+  if (session->cipher_algorithm) free(session->cipher_algorithm);
+  free(session);
+  log_all(LOG_DEBUG, "Session resources deallocated.");
+}
+
 static void on_session_handle_closed(uv_handle_t* handle) {
   client_session_t* session = (client_session_t*)handle->data;
-  if (session) {
-    if (session->recv_buffer) free(session->recv_buffer);
-    if (session->kem) OQS_KEM_free(session->kem);
-    if (session->kem_secret_key) free(session->kem_secret_key);
-    if (session->shared_secret) {
-      sodium_free(session->shared_secret);
-    }
-    if (session->kex_algorithm) free(session->kex_algorithm);
-    if (session->cipher_algorithm) free(session->cipher_algorithm);
-    free(session);
-    log_all(LOG_DEBUG, "Session resources deallocated.");
+  if (!session) return;
+  if (session->pending_writes > 0) {
+    /* Write callbacks still hold a pointer to this session; they will free it
+     * once the last one fires (via pending_close). */
+    session->pending_close = 1;
+    return;
   }
+  session_free(session);
 }
 
 void session_close(uv_handle_t* handle) {
@@ -463,14 +471,32 @@ static const char* sanitize_path(const char* path) {
 }
 
 /* --- File I/O Callbacks --- */
-
 static void on_put_fs_write(uv_fs_t* req) {
   nasfs_fs_ctx_t* ctx = (nasfs_fs_ctx_t*)req->data;
+  client_session_t* session = ctx->session;
   if (req->result < 0)
     log_all(LOG_ERROR, "PUT: Write error: %s", uv_strerror((int)req->result));
   if (ctx->buf.base) free(ctx->buf.base);
   uv_fs_req_cleanup(req);
   free(ctx);
+
+  if (session->pending_writes > 0) session->pending_writes--;
+
+  if (session->pending_writes == 0) {
+    /* If PUT_DONE arrived before this write completed, close the file now. */
+    if (session->close_after_writes) {
+      session->close_after_writes = 0;
+      if (session->active_fd != -1) {
+        uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd,
+                    NULL);
+        session->active_fd = -1;
+      }
+    }
+    /* If the TCP handle closed while writes were in flight, free the session. */
+    if (session->pending_close) {
+      session_free(session);
+    }
+  }
 }
 
 static void on_put_fs_open(uv_fs_t* req) {
@@ -972,8 +998,11 @@ static void session_dispatch_frame(client_session_t* session,
           }
           memcpy(ctx->buf.base, plain_frame.payload, plain_frame.payload_len);
           ctx->req.data = ctx;
+          ctx->session = session;
+          session->pending_writes++;
           uv_fs_write(session->handle.loop, &ctx->req, session->active_fd,
-                      &ctx->buf, 1, session->file_offset, on_put_fs_write);
+                      &ctx->buf, 1, (int64_t)session->file_offset,
+                      on_put_fs_write);
           session->file_offset += plain_frame.payload_len;
         }
       }
@@ -984,7 +1013,10 @@ static void session_dispatch_frame(client_session_t* session,
       if (session->is_authenticated &&
           session->state == SESSION_STATE_RECEIVING_FILE) {
         log_all(LOG_INFO, "Upload complete.");
-        if (session->active_fd != -1) {
+        if (session->pending_writes > 0) {
+          /* Async writes still in flight; let the last callback close the fd. */
+          session->close_after_writes = 1;
+        } else if (session->active_fd != -1) {
           uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd,
                       NULL);
           session->active_fd = -1;
@@ -1132,6 +1164,9 @@ void session_on_new_connection(uv_stream_t* server, int status) {
 
   session->state = SESSION_STATE_NEW;
   session->active_fd = -1;
+  session->pending_writes = 0;
+  session->close_after_writes = 0;
+  session->pending_close = 0;
 
   if (uv_tcp_init(server->loop, &session->handle) != 0) {
     free(session);

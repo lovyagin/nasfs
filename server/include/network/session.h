@@ -90,6 +90,12 @@ typedef struct {
   uint8_t file_cipher_algo; /**< nasfs_cipher_algo_t for this file's blocks. */
   uint8_t file_hash_algo;   /**< nasfs_hash_algo_t for block integrity. */
 
+  /* Async write tracking — prevents closing the fd before queued writes land. */
+  int pending_writes;     /**< Number of outstanding async uv_fs_write calls. */
+  int close_after_writes; /**< Set by PUT_DONE when writes are still in flight. */
+  int pending_close;      /**< Set by close callback if writes were still in
+                               flight; the last write callback frees the session. */
+
 } client_session_t;
 
 /**
