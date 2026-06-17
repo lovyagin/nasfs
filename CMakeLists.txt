@@ -52,6 +52,9 @@ add_library(nasfs_common STATIC
   common/src/protocol.c
   common/src/handshake.c
   common/src/auth.c
+  common/src/ecc.c
+  common/src/crypto_engine.c
+  common/src/pake.c
 )
 target_include_directories(nasfs_common PUBLIC
   common/include
@@ -127,10 +130,32 @@ target_include_directories(test_encryption PRIVATE common/include)
 target_compile_options(test_encryption PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(test_encryption PRIVATE nasfs_common)
 
+add_executable(test_ecc tests/test_ecc.c)
+target_include_directories(test_ecc PRIVATE common/include)
+target_compile_options(test_ecc PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(test_ecc PRIVATE nasfs_common)
+
+add_executable(test_pake tests/test_pake.c)
+target_include_directories(test_pake PRIVATE common/include)
+target_compile_options(test_pake PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(test_pake PRIVATE nasfs_common)
+
+add_executable(benchmark tests/benchmark.c)
+target_include_directories(benchmark PRIVATE common/include)
+target_compile_options(benchmark PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(benchmark PRIVATE nasfs_common)
+
+add_executable(nasfs_optimizer utils/nasfs_optimizer.c)
+target_include_directories(nasfs_optimizer PRIVATE ${UV_INCLUDE_DIRS})
+target_link_directories(nasfs_optimizer PRIVATE ${UV_LIBRARY_DIRS})
+target_link_libraries(nasfs_optimizer PRIVATE ${UV_LIBRARIES})
+
 add_test(NAME unit_handshake COMMAND test_handshake)
 add_test(NAME unit_config COMMAND test_config)
 add_test(NAME unit_auth COMMAND test_auth)
 add_test(NAME unit_encryption COMMAND test_encryption)
+add_test(NAME unit_ecc COMMAND test_ecc)
+add_test(NAME unit_pake COMMAND test_pake)
 add_test(NAME integration_e2e COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_end_to_end.sh)
 set_tests_properties(
   integration_e2e
