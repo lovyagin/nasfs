@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <uv.h>
 
+#include "crypto_engine.h"
 #include "protocol.h"
 
 /**
@@ -83,6 +84,11 @@ typedef struct {
       server_block_seq; /**< Current block sequence counter on the server. */
   uint8_t file_salt[crypto_pwhash_SALTBYTES]; /**< Per-file random salt used for
                                                  key derivation. */
+  uint64_t expected_plaintext_size; /**< Plaintext file size announced by the
+                                       client on PUT; returned on GET so the
+                                       client can verify no truncation. */
+  uint8_t file_cipher_algo; /**< nasfs_cipher_algo_t for this file's blocks. */
+  uint8_t file_hash_algo;   /**< nasfs_hash_algo_t for block integrity. */
 
 } client_session_t;
 

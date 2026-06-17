@@ -13,6 +13,7 @@
 #include "config.h"
 #endif
 
+#include <errno.h>
 #include <fcntl.h>
 #include <oqs/oqs.h>
 #include <pthread.h>
@@ -24,11 +25,28 @@
 #include <uv.h>
 
 #include "auth.h"
+#include "crypto_engine.h"
 #include "handshake.h"
 #include "protocol.h"
 
+static nasfs_cipher_algo_t parse_cipher_algo(const char* s) {
+  if (!s) return NASFS_CIPHER_XSALSA20_POLY1305;
+  if (strcmp(s, "xchacha20poly1305") == 0) return NASFS_CIPHER_XCHACHA20_POLY1305;
+  if (strcmp(s, "aes256gcm") == 0) return NASFS_CIPHER_AES_256_GCM;
+  return NASFS_CIPHER_XSALSA20_POLY1305; /* default */
+}
+
+static nasfs_hash_algo_t parse_hash_algo(const char* s) {
+  if (!s) return NASFS_HASH_BLAKE2B;
+  if (strcmp(s, "sha256") == 0) return NASFS_HASH_SHA256;
+  if (strcmp(s, "adler32") == 0) return NASFS_HASH_ADLER32;
+  if (strcmp(s, "crc32") == 0) return NASFS_HASH_CRC32;
+  return NASFS_HASH_BLAKE2B; /* default */
+}
+
 #define IO_CHUNK_SIZE (64 * 1024)
 #define CLIENT_INITIAL_BUFFER 16384
+#define CLIENT_MAX_RECV_BUFFER (64 * 1024 * 1024)
 #define DEFAULT_KEX_ALGORITHMS "ML-KEM-512,Kyber512,ML-KEM-768,Kyber768"
 #define DEFAULT_CIPHER_ALGORITHMS NASFS_CONTROL_CIPHER_XCHACHA20POLY1305
 
@@ -79,11 +97,20 @@ int file_encryption_enabled = 0;
 char* raw_encryption_password = NULL;
 uint8_t file_salt[crypto_pwhash_SALTBYTES] = {0};
 uint8_t encryption_key[crypto_secretbox_KEYBYTES] = {0};
+uint8_t master_key[32] = {0};
 uint64_t client_block_seq = 0;
 int has_pending_block_meta = 0;
 uint64_t expected_block_seq = 0;
 uint32_t expected_block_size = 0;
 uint8_t expected_block_hash[32] = {0};
+
+/* File size tracking for truncation detection */
+uint64_t put_plaintext_size = 0;      /* size of local file being uploaded */
+uint64_t expected_plaintext_size = 0; /* expected size announced in GET_ACK */
+
+/* Modular algorithm selection */
+nasfs_cipher_algo_t file_cipher_algo = NASFS_CIPHER_XSALSA20_POLY1305;
+nasfs_hash_algo_t file_hash_algo = NASFS_HASH_BLAKE2B;
 
 #define SERVER_PORT 8080
 #define SERVER_IP "127.0.0.1"
@@ -202,8 +229,8 @@ static int load_identity_file(const char* path, const char* expected_algorithm,
   FILE* file;
   char header[128];
   char alg_line[128];
-  char public_hex[32768];
-  char secret_hex[32768];
+  char public_hex[10000];
+  char secret_hex[10000];
 
   if (!path || !algorithm || !public_key || !public_key_len || !secret_key ||
       !secret_key_len) {
@@ -218,8 +245,7 @@ static int load_identity_file(const char* path, const char* expected_algorithm,
 
   if (!fgets(header, sizeof(header), file) ||
       !fgets(alg_line, sizeof(alg_line), file) ||
-      !fgets(public_hex, sizeof(public_hex), file) ||
-      !fgets(secret_hex, sizeof(secret_hex), file)) {
+      !fgets(public_hex, 10000, file) || !fgets(secret_hex, 10000, file)) {
     fclose(file);
     return -1;
   }
@@ -239,6 +265,7 @@ static int load_identity_file(const char* path, const char* expected_algorithm,
   *algorithm = strdup(alg_line);
   *public_key = nasfs_hex_decode(public_hex, public_key_len);
   *secret_key = nasfs_hex_decode(secret_hex, secret_key_len);
+
   if (!*algorithm || !*public_key || !*secret_key) {
     free(*algorithm);
     free(*public_key);
@@ -381,13 +408,23 @@ static void send_auth(uv_stream_t* stream) {
 }
 
 void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
-  (void)handle;
   if (client_recv_capacity - client_recv_length < suggested_size) {
     size_t new_cap = client_recv_capacity == 0 ? CLIENT_INITIAL_BUFFER
                                                : client_recv_capacity * 2;
     while (new_cap - client_recv_length < suggested_size) new_cap *= 2;
+    if (new_cap > CLIENT_MAX_RECV_BUFFER) {
+      buf->base = NULL;
+      buf->len = 0;
+      uv_close(handle, on_close);
+      return;
+    }
     uint8_t* new_buf = realloc(client_recv_buffer, new_cap);
-    if (!new_buf) exit(1);
+    if (!new_buf) {
+      buf->base = NULL;
+      buf->len = 0;
+      uv_close(handle, on_close);
+      return;
+    }
     client_recv_buffer = new_buf;
     client_recv_capacity = new_cap;
   }
@@ -484,7 +521,7 @@ void on_local_read(uv_fs_t* req) {
     file_offset += bytes_read;
 
     if (file_encryption_enabled) {
-      size_t ciphertext_len = bytes_read + crypto_secretbox_MACBYTES;
+      size_t ciphertext_len = bytes_read + 32; /* max overhead for any cipher */
       uint8_t* ciphertext = malloc(ciphertext_len);
       if (!ciphertext) {
         fprintf(stderr, "\nOut of memory for encryption\n");
@@ -496,9 +533,7 @@ void on_local_read(uv_fs_t* req) {
         return;
       }
 
-      uint8_t nonce[crypto_secretbox_NONCEBYTES] = {0};
-      memcpy(nonce, &client_block_seq, sizeof(client_block_seq));
-
+      /* Derive a per-block key: BLAKE2b(encryption_key || file_salt || seq) */
       uint8_t block_key[crypto_secretbox_KEYBYTES];
       uint8_t key_input[crypto_secretbox_KEYBYTES + crypto_pwhash_SALTBYTES +
                         sizeof(client_block_seq)];
@@ -510,8 +545,11 @@ void on_local_read(uv_fs_t* req) {
       crypto_generichash(block_key, sizeof(block_key), key_input,
                          sizeof(key_input), NULL, 0);
 
-      if (crypto_secretbox_easy(ciphertext, (const uint8_t*)ctx->buf.base,
-                                bytes_read, nonce, block_key) != 0) {
+      size_t actual_ciphertext_len = 0;
+      if (crypto_engine_encrypt_block(file_cipher_algo,
+                                      (const uint8_t*)ctx->buf.base, bytes_read,
+                                      block_key, client_block_seq, ciphertext,
+                                      &actual_ciphertext_len) != 0) {
         fprintf(stderr, "\nEncryption failed\n");
         free(ciphertext);
         client_exit_code = 1;
@@ -521,12 +559,15 @@ void on_local_read(uv_fs_t* req) {
         free(ctx);
         return;
       }
+      ciphertext_len = actual_ciphertext_len;
 
       nasfs_block_meta_t meta;
       meta.seq_num = client_block_seq;
-      meta.size = ciphertext_len;
-      if (crypto_generichash(meta.hash, sizeof(meta.hash), ciphertext,
-                             ciphertext_len, NULL, 0) != 0) {
+      meta.size = (uint32_t)ciphertext_len;
+      memset(meta.hash, 0, sizeof(meta.hash));
+      size_t hash_out_len = 0;
+      if (crypto_engine_hash(file_hash_algo, ciphertext, ciphertext_len,
+                             meta.hash, &hash_out_len) != 0) {
         fprintf(stderr, "\nHash computation failed\n");
         free(ciphertext);
         client_exit_code = 1;
@@ -545,7 +586,7 @@ void on_local_read(uv_fs_t* req) {
       free(ciphertext);
     } else {
       send_command(stream, NASFS_CMD_PUT_DATA, (uint8_t*)ctx->buf.base,
-                   bytes_read, 0);
+                   bytes_read, 1);
     }
 
     printf("\rUploaded %llu bytes...", (unsigned long long)file_offset);
@@ -672,30 +713,34 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               if (current_op == OP_PUT) {
                 size_t fn_len = strlen(remote_filename);
                 if (file_encryption_enabled) {
-                  size_t payload_len = 1 + crypto_pwhash_SALTBYTES + fn_len + 1;
+                  /* [1 enc][16 salt][8 size][1 cipher][1 hash][name\0] */
+                  size_t payload_len = 1 + crypto_pwhash_SALTBYTES +
+                                       sizeof(uint64_t) + 2 + fn_len + 1;
                   uint8_t* req_payload = malloc(payload_len);
                   if (req_payload) {
                     req_payload[0] = 1;
                     randombytes_buf(file_salt, crypto_pwhash_SALTBYTES);
 
-                    // Derive encryption key using Argon2id (memory-hard,
-                    // GPU-resistant)
-                    if (crypto_pwhash(encryption_key, sizeof(encryption_key),
-                                      raw_encryption_password,
-                                      strlen(raw_encryption_password),
-                                      file_salt,
-                                      crypto_pwhash_OPSLIMIT_INTERACTIVE,
-                                      crypto_pwhash_MEMLIMIT_INTERACTIVE,
-                                      crypto_pwhash_ALG_ARGON2ID13) != 0) {
+                    if (crypto_engine_derive_key(
+                            NASFS_KDF_HKDF_SHA256, (const char*)master_key,
+                            file_salt, crypto_pwhash_SALTBYTES, encryption_key,
+                            sizeof(encryption_key)) != 0) {
                       fprintf(stderr,
-                              "Failed to derive file key using Argon2id\n");
+                              "Failed to derive file key using HKDF-SHA256\n");
                       free(req_payload);
                       uv_close((uv_handle_t*)stream, on_close);
                       return;
                     }
-                    memcpy(req_payload + 1, file_salt, crypto_pwhash_SALTBYTES);
-                    memcpy(req_payload + (1 + crypto_pwhash_SALTBYTES),
-                           (const uint8_t*)remote_filename, fn_len + 1);
+                    size_t off = 1;
+                    memcpy(req_payload + off, file_salt, crypto_pwhash_SALTBYTES);
+                    off += crypto_pwhash_SALTBYTES;
+                    memcpy(req_payload + off, &put_plaintext_size,
+                           sizeof(uint64_t));
+                    off += sizeof(uint64_t);
+                    req_payload[off++] = (uint8_t)file_cipher_algo;
+                    req_payload[off++] = (uint8_t)file_hash_algo;
+                    memcpy(req_payload + off, (const uint8_t*)remote_filename,
+                           fn_len + 1);
                     send_command(stream, NASFS_CMD_PUT_REQ, req_payload,
                                  payload_len, 1);
                     free(req_payload);
@@ -749,24 +794,30 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
             }
             case NASFS_CMD_GET_ACK: {
               if (file_encryption_enabled) {
-                if (plain_frame.payload_len < crypto_pwhash_SALTBYTES) {
+                /* GET_ACK payload: [16 salt][8 size][1 cipher][1 hash] */
+                size_t expected_ack_len =
+                    crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2;
+                if (plain_frame.payload_len < expected_ack_len) {
                   fprintf(stderr,
-                          "Failed to download: Server GET_ACK did not contain "
-                          "salt.\n");
+                          "Failed to download: Server GET_ACK too short.\n");
                   client_exit_code = 1;
                   if (decrypted_payload) free(decrypted_payload);
                   uv_close((uv_handle_t*)stream, on_close);
                   return;
                 }
                 memcpy(file_salt, plain_frame.payload, crypto_pwhash_SALTBYTES);
+                memcpy(&expected_plaintext_size,
+                       plain_frame.payload + crypto_pwhash_SALTBYTES,
+                       sizeof(uint64_t));
+                file_cipher_algo = (nasfs_cipher_algo_t)plain_frame.payload[
+                    crypto_pwhash_SALTBYTES + sizeof(uint64_t)];
+                file_hash_algo = (nasfs_hash_algo_t)plain_frame.payload[
+                    crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 1];
 
-                // Derive file key using Argon2id (memory-hard, GPU-resistant)
-                if (crypto_pwhash(encryption_key, sizeof(encryption_key),
-                                  raw_encryption_password,
-                                  strlen(raw_encryption_password), file_salt,
-                                  crypto_pwhash_OPSLIMIT_INTERACTIVE,
-                                  crypto_pwhash_MEMLIMIT_INTERACTIVE,
-                                  crypto_pwhash_ALG_ARGON2ID13) != 0) {
+                if (crypto_engine_derive_key(
+                        NASFS_KDF_HKDF_SHA256, (const char*)master_key,
+                        file_salt, crypto_pwhash_SALTBYTES, encryption_key,
+                        sizeof(encryption_key)) != 0) {
                   fprintf(stderr,
                           "Failed to derive file key from downloaded salt\n");
                   client_exit_code = 1;
@@ -857,10 +908,11 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                   return;
                 }
 
-                uint8_t computed_hash[32];
-                if (crypto_generichash(computed_hash, sizeof(computed_hash),
-                                       plain_frame.payload,
-                                       plain_frame.payload_len, NULL, 0) != 0) {
+                uint8_t computed_hash[32] = {0};
+                size_t computed_hash_len = 0;
+                if (crypto_engine_hash(file_hash_algo, plain_frame.payload,
+                                       plain_frame.payload_len, computed_hash,
+                                       &computed_hash_len) != 0) {
                   fprintf(stderr, "\nError: Hash computation failed.\n");
                   client_exit_code = 1;
                   if (decrypted_payload) free(decrypted_payload);
@@ -880,19 +932,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                   return;
                 }
 
-                if (plain_frame.payload_len < crypto_secretbox_MACBYTES) {
-                  fprintf(stderr,
-                          "\nError: Corrupt block size too small for "
-                          "decryption.\n");
-                  client_exit_code = 1;
-                  if (decrypted_payload) free(decrypted_payload);
-                  uv_close((uv_handle_t*)stream, on_close);
-                  return;
-                }
-
-                size_t plaintext_len =
-                    plain_frame.payload_len - crypto_secretbox_MACBYTES;
-                decrypted_buf = malloc(plaintext_len);
+                decrypted_buf = malloc(plain_frame.payload_len);
                 if (!decrypted_buf) {
                   fprintf(stderr, "\nError: Out of memory for decryption.\n");
                   client_exit_code = 1;
@@ -901,9 +941,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                   return;
                 }
 
-                uint8_t nonce[crypto_secretbox_NONCEBYTES] = {0};
-                memcpy(nonce, &client_block_seq, sizeof(client_block_seq));
-
+                /* Derive per-block key: BLAKE2b(encryption_key||salt||seq) */
                 uint8_t block_key[crypto_secretbox_KEYBYTES];
                 uint8_t key_input[crypto_secretbox_KEYBYTES +
                                   crypto_pwhash_SALTBYTES +
@@ -917,19 +955,21 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 crypto_generichash(block_key, sizeof(block_key), key_input,
                                    sizeof(key_input), NULL, 0);
 
-                if (crypto_secretbox_open_easy(
-                        decrypted_buf, plain_frame.payload,
-                        plain_frame.payload_len, nonce, block_key) != 0) {
+                size_t plaintext_len = 0;
+                if (crypto_engine_decrypt_block(
+                        file_cipher_algo, plain_frame.payload,
+                        plain_frame.payload_len, block_key, client_block_seq,
+                        decrypted_buf, &plaintext_len) != 0) {
                   fprintf(stderr,
-                          "\nError: Decryption failed. Incorrect encryption "
-                          "key or corrupted data.\n");
+                          "\nError: Decryption failed. Wrong key or corrupted "
+                          "data on block %llu.\n",
+                          (unsigned long long)client_block_seq);
                   free(decrypted_buf);
                   client_exit_code = 1;
                   if (decrypted_payload) free(decrypted_payload);
                   uv_close((uv_handle_t*)stream, on_close);
                   return;
                 }
-
                 write_data = decrypted_buf;
                 write_len = plaintext_len;
 
@@ -959,6 +999,17 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               break;
             }
             case NASFS_CMD_GET_DONE:
+              if (file_encryption_enabled && expected_plaintext_size > 0 &&
+                  file_offset != expected_plaintext_size) {
+                fprintf(stderr,
+                        "\nIntegrity error: expected %llu bytes, got %llu "
+                        "(file truncated or padded by server).\n",
+                        (unsigned long long)expected_plaintext_size,
+                        (unsigned long long)file_offset);
+                client_exit_code = 1;
+                uv_close((uv_handle_t*)stream, on_close);
+                break;
+              }
               printf("\nDownload complete.\n");
               uv_close((uv_handle_t*)stream, on_close);
               break;
@@ -1095,10 +1146,76 @@ int main(int argc, char** argv) {
     client_server_port = atoi(env_server_port);
   }
 
+  const char* env_file_cipher = getenv("NASFS_FILE_CIPHER");
+  const char* env_file_hash = getenv("NASFS_FILE_HASH");
+  file_cipher_algo = parse_cipher_algo(env_file_cipher);
+  file_hash_algo = parse_hash_algo(env_file_hash);
+
   const char* env_encryption_key = getenv("NASFS_ENCRYPTION_KEY");
-  if (env_encryption_key && env_encryption_key[0] != '\0') {
-    file_encryption_enabled = 1;
-    raw_encryption_password = strdup(env_encryption_key);
+  if (!env_encryption_key || env_encryption_key[0] == '\0') {
+    fprintf(stderr, "\n[SECURITY AUDIT ENFORCEMENT]\n");
+    fprintf(stderr, "NASFS is now Secure-by-Default.\n");
+    fprintf(stderr, "Plaintext file transmission is strictly forbidden.\n");
+    fprintf(stderr,
+            "You MUST provide NASFS_ENCRYPTION_KEY environment variable.\n\n");
+    return 1;
+  }
+
+  file_encryption_enabled = 1;
+  raw_encryption_password = strdup(env_encryption_key);
+
+  /*
+   * Load or create a per-client random Argon2id salt stored in
+   * ~/.nasfs/master.salt.  A fixed salt would allow precomputation attacks
+   * against the master key; a random per-client salt prevents this.
+   */
+  uint8_t master_salt[crypto_pwhash_SALTBYTES];
+  {
+    const char* home = getenv("HOME");
+    char salt_path[512] = {0};
+    if (home && home[0] != '\0') {
+      snprintf(salt_path, sizeof(salt_path), "%s/.nasfs/master.salt", home);
+    }
+
+    int loaded = 0;
+    if (salt_path[0] != '\0') {
+      FILE* sf = fopen(salt_path, "rb");
+      if (sf) {
+        if (fread(master_salt, 1, sizeof(master_salt), sf) ==
+            sizeof(master_salt)) {
+          loaded = 1;
+        }
+        fclose(sf);
+      }
+
+      if (!loaded) {
+        randombytes_buf(master_salt, sizeof(master_salt));
+        /* Create ~/.nasfs/ if it doesn't exist */
+        char dir_path[512] = {0};
+        if (home) {
+          snprintf(dir_path, sizeof(dir_path), "%s/.nasfs", home);
+          mkdir(dir_path, 0700);
+        }
+        FILE* wf = fopen(salt_path, "wb");
+        if (wf) {
+          (void)fwrite(master_salt, 1, sizeof(master_salt), wf);
+          fclose(wf);
+          chmod(salt_path, S_IRUSR | S_IWUSR);
+        }
+      }
+    } else {
+      /* Fallback: derive from env if no HOME (CI / containers) */
+      memset(master_salt, 0x44, sizeof(master_salt));
+    }
+  }
+
+  if (crypto_pwhash(master_key, sizeof(master_key), raw_encryption_password,
+                    strlen(raw_encryption_password), master_salt,
+                    crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                    crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                    crypto_pwhash_ALG_ARGON2ID13) != 0) {
+    fprintf(stderr, "Failed to derive master key using Argon2id\n");
+    return 1;
   }
 
   if (env_auth_password && env_auth_password[0] != '\0') {
@@ -1115,6 +1232,10 @@ int main(int argc, char** argv) {
     current_op = OP_PUT;
     local_filename = argv[2];
     remote_filename = (argc >= 4) ? argv[3] : get_basename(local_filename);
+    struct stat put_st;
+    if (stat(local_filename, &put_st) == 0) {
+      put_plaintext_size = (uint64_t)put_st.st_size;
+    }
   } else if (strcmp(argv[1], "get") == 0) {
     current_op = OP_GET;
     remote_filename = argv[2];

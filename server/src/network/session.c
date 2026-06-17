@@ -26,6 +26,7 @@
 
 #include "auth.h"
 #include "config/config.h"
+#include "crypto_engine.h"
 #include "handshake.h"
 #include "logging/log.h"
 #include "network/session.h"
@@ -33,6 +34,10 @@
 #define INITIAL_RECV_BUFFER_SIZE 16384
 #define MAX_RECV_BUFFER_SIZE (64 * 1024 * 1024)
 #define IO_CHUNK_SIZE (64 * 1024)
+/* On-disk file header for encrypted files:
+ * [8 bytes LE plaintext_size][16 bytes salt][1 byte cipher_algo][1 byte hash_algo] */
+#define FILE_HEADER_SIZE (sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 2)
+#define NASFS_CIPHER_OVERHEAD 16 /* MAC tag bytes — true for all supported ciphers */
 /* --- Context Structs for Async Operations --- */
 typedef struct {
   uv_write_t req;
@@ -478,16 +483,24 @@ static void on_put_fs_open(uv_fs_t* req) {
   } else {
     session->active_fd = (uv_file)req->result;
     if (session->file_encryption_enabled) {
+      /* Write file header: [8 size][16 salt][1 cipher_algo][1 hash_algo] */
+      uint8_t header[FILE_HEADER_SIZE];
+      memcpy(header, &session->expected_plaintext_size, sizeof(uint64_t));
+      memcpy(header + sizeof(uint64_t), session->file_salt,
+             crypto_pwhash_SALTBYTES);
+      header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES] =
+          session->file_cipher_algo;
+      header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 1] =
+          session->file_hash_algo;
       uv_fs_t write_req;
-      uv_buf_t buf =
-          uv_buf_init((char*)session->file_salt, crypto_pwhash_SALTBYTES);
+      uv_buf_t buf = uv_buf_init((char*)header, sizeof(header));
       int rc = uv_fs_write(session->handle.loop, &write_req, session->active_fd,
                            &buf, 1, 0, NULL);
       uv_fs_req_cleanup(&write_req);
       if (rc < 0) {
-        log_all(LOG_ERROR, "PUT: Salt write failed: %s", uv_strerror(rc));
+        log_all(LOG_ERROR, "PUT: Header write failed: %s", uv_strerror(rc));
         session_send_frame(session, NASFS_CMD_ERROR,
-                           (const uint8_t*)"Salt write failed", 17, 1);
+                           (const uint8_t*)"Header write failed", 19, 1);
         session->state = SESSION_STATE_AUTHENTICATED;
         uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd,
                     NULL);
@@ -495,7 +508,7 @@ static void on_put_fs_open(uv_fs_t* req) {
         uv_fs_req_cleanup(req);
         return;
       }
-      session->file_offset = crypto_pwhash_SALTBYTES;
+      session->file_offset = FILE_HEADER_SIZE;
     } else {
       session->file_offset = 0;
     }
@@ -527,9 +540,11 @@ static void on_get_fs_read(uv_fs_t* req) {
       nasfs_block_meta_t meta;
       meta.seq_num = session->server_block_seq;
       meta.size = bytes;
-      if (crypto_generichash(meta.hash, sizeof(meta.hash),
-                             (const uint8_t*)ctx->buf.base, bytes, NULL,
-                             0) != 0) {
+      memset(meta.hash, 0, sizeof(meta.hash));
+      size_t hash_out_len = 0;
+      if (crypto_engine_hash((nasfs_hash_algo_t)session->file_hash_algo,
+                             (const uint8_t*)ctx->buf.base, bytes, meta.hash,
+                             &hash_out_len) != 0) {
         log_all(LOG_ERROR, "GET: Hash computation failed.");
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Hash calculation failed", 23, 1);
@@ -559,7 +574,7 @@ static void do_get_next_chunk(client_session_t* session) {
   if (!ctx) return;
   size_t chunk_size = IO_CHUNK_SIZE;
   if (session->file_encryption_enabled) {
-    chunk_size = IO_CHUNK_SIZE + crypto_secretbox_MACBYTES;
+    chunk_size = IO_CHUNK_SIZE + NASFS_CIPHER_OVERHEAD;
   }
   ctx->buf = uv_buf_init(malloc(chunk_size), chunk_size);
   ctx->session = session;
@@ -581,16 +596,17 @@ static void on_get_fs_open(uv_fs_t* req) {
   } else {
     session->active_fd = (uv_file)req->result;
     if (session->file_encryption_enabled) {
-      uint8_t salt[crypto_pwhash_SALTBYTES];
+      /* Read file header: [8 size][16 salt][1 cipher_algo][1 hash_algo] */
+      uint8_t file_header[FILE_HEADER_SIZE];
       uv_fs_t read_req;
-      uv_buf_t buf = uv_buf_init((char*)salt, crypto_pwhash_SALTBYTES);
+      uv_buf_t buf = uv_buf_init((char*)file_header, sizeof(file_header));
       int rc = uv_fs_read(session->handle.loop, &read_req, session->active_fd,
                           &buf, 1, 0, NULL);
       uv_fs_req_cleanup(&read_req);
-      if (rc < (int)crypto_pwhash_SALTBYTES) {
-        log_all(LOG_ERROR, "GET: Salt read failed: read %d bytes", rc);
+      if (rc < (int)sizeof(file_header)) {
+        log_all(LOG_ERROR, "GET: Header read failed: read %d bytes", rc);
         session_send_frame(session, NASFS_CMD_ERROR,
-                           (const uint8_t*)"Salt read failed", 16, 1);
+                           (const uint8_t*)"Header read failed", 18, 1);
         session->state = SESSION_STATE_AUTHENTICATED;
         uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd,
                     NULL);
@@ -598,9 +614,24 @@ static void on_get_fs_open(uv_fs_t* req) {
         uv_fs_req_cleanup(req);
         return;
       }
-      session->file_offset = crypto_pwhash_SALTBYTES;
-      session_send_frame(session, NASFS_CMD_GET_ACK, salt,
-                         crypto_pwhash_SALTBYTES, 1);
+      session->file_offset = FILE_HEADER_SIZE;
+      session->file_cipher_algo =
+          file_header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES];
+      session->file_hash_algo =
+          file_header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 1];
+
+      /* GET_ACK: [16 salt][8 size][1 cipher_algo][1 hash_algo] */
+      uint8_t ack_payload[FILE_HEADER_SIZE];
+      memcpy(ack_payload, file_header + sizeof(uint64_t),
+             crypto_pwhash_SALTBYTES);
+      memcpy(ack_payload + crypto_pwhash_SALTBYTES, file_header,
+             sizeof(uint64_t));
+      ack_payload[crypto_pwhash_SALTBYTES + sizeof(uint64_t)] =
+          session->file_cipher_algo;
+      ack_payload[crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 1] =
+          session->file_hash_algo;
+      session_send_frame(session, NASFS_CMD_GET_ACK, ack_payload,
+                         sizeof(ack_payload), 1);
     } else {
       session->file_offset = 0;
       session_send_frame(session, NASFS_CMD_GET_ACK, NULL, 0, 1);
@@ -793,16 +824,41 @@ static void session_dispatch_frame(client_session_t* session,
       int is_enc = 0;
       const uint8_t* filename_ptr = plain_frame.payload;
       size_t filename_len = plain_frame.payload_len;
+      session->expected_plaintext_size = 0;
+      session->file_cipher_algo = NASFS_CIPHER_XSALSA20_POLY1305;
+      session->file_hash_algo = NASFS_HASH_BLAKE2B;
       if (plain_frame.payload_len > 1 &&
           (plain_frame.payload[0] == 0 || plain_frame.payload[0] == 1)) {
         is_enc = plain_frame.payload[0];
-        if (is_enc &&
-            plain_frame.payload_len >= (1 + crypto_pwhash_SALTBYTES)) {
+        /* Encrypted PUT_REQ: [1 enc][16 salt][8 size][1 cipher][1 hash][name] */
+        if (is_enc && plain_frame.payload_len >=
+                          (1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2)) {
           memcpy(session->file_salt, plain_frame.payload + 1,
                  crypto_pwhash_SALTBYTES);
-          filename_ptr = plain_frame.payload + (1 + crypto_pwhash_SALTBYTES);
-          filename_len =
-              plain_frame.payload_len - (1 + crypto_pwhash_SALTBYTES);
+          memcpy(&session->expected_plaintext_size,
+                 plain_frame.payload + 1 + crypto_pwhash_SALTBYTES,
+                 sizeof(uint64_t));
+          uint8_t req_cipher =
+              plain_frame.payload[1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t)];
+          uint8_t req_hash =
+              plain_frame
+                  .payload[1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 1];
+          /* Validate algo values against enum ranges */
+          if (req_cipher > NASFS_CIPHER_AES_256_GCM ||
+              req_hash > NASFS_HASH_CRC32) {
+            log_all(LOG_ERROR, "PUT: Unknown cipher or hash algo requested.");
+            session_send_frame(session, NASFS_CMD_ERROR,
+                               (const uint8_t*)"Unknown crypto algo", 19, 1);
+            session_close((uv_handle_t*)&session->handle);
+            if (decrypted_payload) free(decrypted_payload);
+            return;
+          }
+          session->file_cipher_algo = req_cipher;
+          session->file_hash_algo = req_hash;
+          filename_ptr = plain_frame.payload +
+                         (1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2);
+          filename_len = plain_frame.payload_len -
+                         (1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2);
         } else {
           filename_ptr = plain_frame.payload + 1;
           filename_len = plain_frame.payload_len - 1;
@@ -878,10 +934,11 @@ static void session_dispatch_frame(client_session_t* session,
             break;
           }
 
-          uint8_t computed_hash[32];
-          if (crypto_generichash(computed_hash, sizeof(computed_hash),
-                                 frame->payload, frame->payload_len, NULL,
-                                 0) != 0) {
+          uint8_t computed_hash[32] = {0};
+          size_t computed_hash_len = 0;
+          if (crypto_engine_hash((nasfs_hash_algo_t)session->file_hash_algo,
+                                 frame->payload, frame->payload_len,
+                                 computed_hash, &computed_hash_len) != 0) {
             log_all(LOG_ERROR, "PUT: Hash computation failed.");
             session_send_frame(session, NASFS_CMD_ERROR,
                                (const uint8_t*)"Hash failed", 11, 1);
@@ -906,13 +963,18 @@ static void session_dispatch_frame(client_session_t* session,
 
         nasfs_fs_ctx_t* ctx = malloc(sizeof(nasfs_fs_ctx_t));
         if (ctx) {
-          ctx->buf =
-              uv_buf_init(malloc(frame->payload_len), frame->payload_len);
-          memcpy(ctx->buf.base, frame->payload, frame->payload_len);
+          ctx->buf = uv_buf_init(malloc(plain_frame.payload_len),
+                                 plain_frame.payload_len);
+          if (!ctx->buf.base) {
+            free(ctx);
+            session_close((uv_handle_t*)&session->handle);
+            break;
+          }
+          memcpy(ctx->buf.base, plain_frame.payload, plain_frame.payload_len);
           ctx->req.data = ctx;
           uv_fs_write(session->handle.loop, &ctx->req, session->active_fd,
                       &ctx->buf, 1, session->file_offset, on_put_fs_write);
-          session->file_offset += frame->payload_len;
+          session->file_offset += plain_frame.payload_len;
         }
       }
       break;

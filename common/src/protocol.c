@@ -65,6 +65,11 @@ uint8_t* protocol_pack_frame(nasfs_cmd_type_t type, const uint8_t* payload,
     return NULL;
   }
 
+  /* payload_len must fit in uint32_t - 1 to avoid integer overflow */
+  if (payload_len > (size_t)(UINT32_MAX - 1)) {
+    return NULL;
+  }
+
   uint32_t frame_len = 1 + (uint32_t)payload_len;
   size_t total_size = sizeof(uint32_t) + frame_len;
 

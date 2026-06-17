@@ -48,6 +48,7 @@ run_client() {
         NASFS_AUTH_PASSWORD="$auth_password" \
         NASFS_AUTH_SIG_ALGORITHM="$sig_algorithm" \
         NASFS_IDENTITY_FILE="$identity_file" \
+        NASFS_ENCRYPTION_KEY="test-e2e-encryption-key-for-audit" \
         "$CLIENT_BIN" "$@" > "$log_file" 2>&1
 }
 
@@ -208,18 +209,14 @@ if ! run_client "$LOG_DIR/client_put.log" "ML-KEM-512" "password" \
     exit 1
 fi
 
-# Verify file exists on server storage
+# Verify encrypted blob exists on server storage.
+# The stored file is E2EE ciphertext so its hash intentionally differs from
+# the plaintext hash; only verify presence here.
 if [ ! -f "$STORAGE_DIR/$REMOTE_NAME" ]; then
     printf "${RED}%s${NC}\n" "FAIL: Uploaded file not found in storage directory."
     exit 1
 fi
-
-UPLOAD_HASH=$(hash_file "$STORAGE_DIR/$REMOTE_NAME")
-if [ "$INPUT_HASH" != "$UPLOAD_HASH" ]; then
-    printf "${RED}%s${NC}\n" "FAIL: Uploaded file hash mismatch!"
-    exit 1
-fi
-printf "${GREEN}%s${NC}\n" "      PUT successful. Integrity verified."
+printf "${GREEN}%s${NC}\n" "      PUT successful. Ciphertext blob present on server."
 
 # 5. Test GET
 printf "${YELLOW}%s${NC}\n" "[4/4] Testing GET (Download)..."
