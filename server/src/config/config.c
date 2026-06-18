@@ -186,6 +186,15 @@ int load_config(const char* filename, server_config_t* config) {
         fclose(file);
         return -1;
       }
+    } else if (strcmp(key, "BlockSize") == 0) {
+      int bs = 0;
+      if (parse_config_int(value, &bs) != 0 || bs < 4096 || bs > 4194304) {
+        fprintf(stderr, "Invalid BlockSize value: %s (must be 4096–4194304)\n",
+                value);
+        fclose(file);
+        return -1;
+      }
+      config->block_size = bs;
     }
   }
 
@@ -212,6 +221,7 @@ void set_defaults(server_config_t* config) {
   config->auth_password = strdup("nasfs");
   config->authorized_keys_file = strdup("/usr/local/etc/nasfs/authorized_keys");
   config->pubkey_auth_algorithms = strdup("ML-DSA-65,ML-DSA-44");
+  config->block_size = 65536;
 }
 
 /* Release configuration resources.

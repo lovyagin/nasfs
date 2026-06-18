@@ -54,7 +54,7 @@ static nasfs_kdf_algo_t parse_kdf_algo(const char* s) {
   return NASFS_KDF_ARGON2ID; /* default */
 }
 
-#define IO_CHUNK_SIZE (64 * 1024)
+static size_t io_chunk_size = 64 * 1024;
 #define CLIENT_INITIAL_BUFFER 16384
 #define CLIENT_MAX_RECV_BUFFER (64 * 1024 * 1024)
 #define DEFAULT_KEX_ALGORITHMS "ML-KEM-512,Kyber512,ML-KEM-768,Kyber768"
@@ -693,7 +693,7 @@ void on_local_read(uv_fs_t* req) {
 void do_put_read_chunk(uv_stream_t* stream) {
   nasfs_fs_ctx_t* ctx = malloc(sizeof(nasfs_fs_ctx_t));
   if (!ctx) return;
-  ctx->buf = uv_buf_init(malloc(IO_CHUNK_SIZE), IO_CHUNK_SIZE);
+  ctx->buf = uv_buf_init(malloc(io_chunk_size), io_chunk_size);
   ctx->stream = stream;
   ctx->req.data = ctx;
   if (uv_fs_read(loop, &ctx->req, local_fd, &ctx->buf, 1, file_offset,
@@ -1257,9 +1257,14 @@ int main(int argc, char** argv) {
   const char* env_file_cipher = getenv("NASFS_FILE_CIPHER");
   const char* env_file_hash = getenv("NASFS_FILE_HASH");
   const char* env_kdf = getenv("NASFS_KDF");
+  const char* env_block_size = getenv("NASFS_BLOCK_SIZE");
   file_cipher_algo = parse_cipher_algo(env_file_cipher);
   file_hash_algo = parse_hash_algo(env_file_hash);
   master_kdf_algo = parse_kdf_algo(env_kdf);
+  if (env_block_size && env_block_size[0] != '\0') {
+    long bs = strtol(env_block_size, NULL, 10);
+    if (bs >= 4096 && bs <= 4194304) io_chunk_size = (size_t)bs;
+  }
 
   const char* env_encryption_key = getenv("NASFS_ENCRYPTION_KEY");
   if (!env_encryption_key || env_encryption_key[0] == '\0') {

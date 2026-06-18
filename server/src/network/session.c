@@ -34,7 +34,7 @@
 
 #define INITIAL_RECV_BUFFER_SIZE 16384
 #define MAX_RECV_BUFFER_SIZE (64 * 1024 * 1024)
-#define IO_CHUNK_SIZE (64 * 1024)
+#define IO_CHUNK_SIZE ((size_t)global_config.block_size)
 /* On-disk file header for encrypted files:
  * [8 bytes LE plaintext_size][16 bytes salt][1 byte cipher_algo][1 byte hash_algo] */
 #define FILE_HEADER_SIZE (sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 2)
