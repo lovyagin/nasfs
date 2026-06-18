@@ -147,11 +147,11 @@ target_link_libraries(benchmark PRIVATE nasfs_common)
 
 add_executable(nasfs_optimizer utils/nasfs_optimizer.c)
 target_include_directories(nasfs_optimizer PRIVATE
-    ${UV_INCLUDE_DIRS} ${SODIUM_INCLUDE_DIRS})
+    ${UV_INCLUDE_DIRS} ${SODIUM_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 target_link_directories(nasfs_optimizer PRIVATE
-    ${UV_LIBRARY_DIRS} ${SODIUM_LIBRARY_DIRS})
+    ${UV_LIBRARY_DIRS} ${SODIUM_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
 target_link_libraries(nasfs_optimizer PRIVATE
-    ${UV_LIBRARIES} ${SODIUM_LIBRARIES})
+    ${UV_LIBRARIES} ${SODIUM_LIBRARIES} ${OPENSSL_LIBRARIES})
 
 add_test(NAME unit_handshake COMMAND test_handshake)
 add_test(NAME unit_config COMMAND test_config)
