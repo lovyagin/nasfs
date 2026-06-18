@@ -551,8 +551,9 @@ static void send_put_req(uv_stream_t* stream) {
     req_payload[0] = 1;
     randombytes_buf(file_salt, crypto_pwhash_SALTBYTES);
     if (crypto_engine_derive_key(NASFS_KDF_HKDF_SHA256, (const char*)master_key,
-                                 file_salt, crypto_pwhash_SALTBYTES,
-                                 encryption_key, sizeof(encryption_key)) != 0) {
+                                 sizeof(master_key), file_salt,
+                                 crypto_pwhash_SALTBYTES, encryption_key,
+                                 sizeof(encryption_key)) != 0) {
       fprintf(stderr, "Failed to derive file key\n");
       free(req_payload);
       uv_close((uv_handle_t*)stream, on_close);
@@ -976,8 +977,8 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
 
                 if (crypto_engine_derive_key(
                         NASFS_KDF_HKDF_SHA256, (const char*)master_key,
-                        file_salt, crypto_pwhash_SALTBYTES, encryption_key,
-                        sizeof(encryption_key)) != 0) {
+                        sizeof(master_key), file_salt, crypto_pwhash_SALTBYTES,
+                        encryption_key, sizeof(encryption_key)) != 0) {
                   fprintf(stderr,
                           "Failed to derive file key from downloaded salt\n");
                   client_exit_code = 1;
@@ -1383,7 +1384,8 @@ int main(int argc, char** argv) {
   }
 
   if (crypto_engine_derive_key(master_kdf_algo, raw_encryption_password,
-                               master_salt, crypto_pwhash_SALTBYTES, master_key,
+                               strlen(raw_encryption_password), master_salt,
+                               crypto_pwhash_SALTBYTES, master_key,
                                sizeof(master_key)) != 0) {
     fprintf(stderr, "Failed to derive master key\n");
     return 1;

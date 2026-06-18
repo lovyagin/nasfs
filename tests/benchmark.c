@@ -248,7 +248,8 @@ int main(void) {
   start = uv_hrtime();
   for (int i = 0; i < KDF_ITERATIONS; i++) {
     crypto_engine_derive_key(NASFS_KDF_ARGON2ID, "my-super-secret-password-123",
-                             salt, 16, key, 32);
+                             strlen("my-super-secret-password-123"), salt, 16,
+                             key, 32);
   }
   end = uv_hrtime();
   duration = (double)(end - start) / 1e9;
@@ -260,8 +261,9 @@ int main(void) {
   // We can do more iterations here because it's faster
   int pbkdf2_iters = KDF_ITERATIONS * 10;
   for (int i = 0; i < pbkdf2_iters; i++) {
-    crypto_engine_derive_key(NASFS_KDF_PBKDF2_SHA256,
-                             "my-super-secret-password-123", salt, 16, key, 32);
+    crypto_engine_derive_key(
+        NASFS_KDF_PBKDF2_SHA256, "my-super-secret-password-123",
+        strlen("my-super-secret-password-123"), salt, 16, key, 32);
   }
   end = uv_hrtime();
   duration = (double)(end - start) / 1e9;
@@ -272,8 +274,9 @@ int main(void) {
   start = uv_hrtime();
   int hkdf_iters = HASH_ITERATIONS;  // HKDF is ultra-fast, run 10,000 times
   for (int i = 0; i < hkdf_iters; i++) {
-    crypto_engine_derive_key(NASFS_KDF_HKDF_SHA256,
-                             "my-super-secret-password-123", salt, 16, key, 32);
+    crypto_engine_derive_key(
+        NASFS_KDF_HKDF_SHA256, "my-super-secret-password-123",
+        strlen("my-super-secret-password-123"), salt, 16, key, 32);
   }
   end = uv_hrtime();
   duration = (double)(end - start) / 1e9;

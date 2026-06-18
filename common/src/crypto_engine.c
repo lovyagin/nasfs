@@ -43,21 +43,22 @@ static uint32_t calc_crc32(const uint8_t* data, size_t len) {
 /* --- KDF interface --- */
 
 int crypto_engine_derive_key(nasfs_kdf_algo_t algo, const char* password,
-                             const uint8_t* salt, size_t salt_len,
-                             uint8_t* out_key, size_t out_key_len) {
+                             size_t password_len, const uint8_t* salt,
+                             size_t salt_len, uint8_t* out_key,
+                             size_t out_key_len) {
   if (!password || !salt || !out_key) return -1;
 
   switch (algo) {
     case NASFS_KDF_ARGON2ID:
       if (salt_len != crypto_pwhash_SALTBYTES) return -1;
-      return crypto_pwhash(out_key, out_key_len, password, strlen(password),
-                           salt, crypto_pwhash_OPSLIMIT_INTERACTIVE,
+      return crypto_pwhash(out_key, out_key_len, password, password_len, salt,
+                           crypto_pwhash_OPSLIMIT_INTERACTIVE,
                            crypto_pwhash_MEMLIMIT_INTERACTIVE,
                            crypto_pwhash_ALG_ARGON2ID13);
 
     case NASFS_KDF_PBKDF2_SHA256:
       // Traditional industry-standard key derivation using OpenSSL PKCS5 PBKDF2
-      if (PKCS5_PBKDF2_HMAC(password, strlen(password), salt, salt_len, 4096,
+      if (PKCS5_PBKDF2_HMAC(password, (int)password_len, salt, salt_len, 4096,
                             EVP_sha256(), out_key_len, out_key) != 1) {
         return -1;
       }
@@ -71,7 +72,7 @@ int crypto_engine_derive_key(nasfs_kdf_algo_t algo, const char* password,
 
       // Step 1: Extract (PRK = HMAC-Hash(Salt, IKM))
       if (!HMAC(EVP_sha256(), salt, salt_len, (const unsigned char*)password,
-                strlen(password), prk, &prk_len)) {
+                password_len, prk, &prk_len)) {
         return -1;
       }
 

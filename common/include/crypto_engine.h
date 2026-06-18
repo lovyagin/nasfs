@@ -78,8 +78,9 @@ typedef struct {
  * @brief Derive a key using the specified KDF algorithm.
  */
 int crypto_engine_derive_key(nasfs_kdf_algo_t algo, const char* password,
-                             const uint8_t* salt, size_t salt_len,
-                             uint8_t* out_key, size_t out_key_len);
+                             size_t password_len, const uint8_t* salt,
+                             size_t salt_len, uint8_t* out_key,
+                             size_t out_key_len);
 
 /**
  * @brief Encrypt a block of data.

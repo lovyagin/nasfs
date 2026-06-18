@@ -202,9 +202,9 @@ expect_client_failure "$LOG_DIR/client_bad_auth.log" \
 if ! run_client "$LOG_DIR/client_put.log" "ML-KEM-512" "password" \
     "e2e-password" "" "ML-DSA-65" put "$TEST_INPUT" "$REMOTE_NAME"; then
     printf "${RED}%s${NC}\n" "FAIL: Client PUT command failed."
-    printf "--- Client Logs ---\n"
+    printf "%s\n" "--- Client Logs ---"
     cat "$LOG_DIR/client_put.log"
-    printf "--- Server Logs ---\n"
+    printf "%s\n" "--- Server Logs ---"
     cat "$LOG_DIR/server.log" 2>/dev/null
     exit 1
 fi
