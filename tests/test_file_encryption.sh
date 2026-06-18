@@ -87,13 +87,17 @@ printf "${GREEN}Server started successfully.${NC}\n"
 printf "${YELLOW}1. Uploading file with encryption enabled...${NC}\n"
 export NASFS_ENCRYPTION_KEY="my-secret-encryption-password-123!"
 
-env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
+if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
     NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
     NASFS_AUTH_METHOD="password" \
     NASFS_AUTH_USER="e2e" \
     NASFS_AUTH_PASSWORD="super-secret" \
     NASFS_ENCRYPTION_KEY="my-secret-encryption-password-123!" \
-    "$CLIENT_BIN" put "$TEST_INPUT" "encrypted_remote.bin" > "$LOG_DIR/client_put.log" 2>&1
+    "$CLIENT_BIN" put "$TEST_INPUT" "encrypted_remote.bin" > "$LOG_DIR/client_put.log" 2>&1; then
+  printf "${RED}FAIL: Client PUT command failed.${NC}\n"
+  cat "$LOG_DIR/client_put.log"
+  exit 1
+fi
 
 # Check if file exists in server storage
 SERVER_STORED_FILE="$STORAGE_DIR/encrypted_remote.bin"
@@ -116,13 +120,17 @@ printf "${GREEN}Success: Stored file is encrypted and does not match plaintext h
 printf "${YELLOW}2. Downloading and decrypting file with the CORRECT key...${NC}\n"
 TEST_OUTPUT_CORRECT="$TEST_ROOT/decrypted_correct.bin"
 
-env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
+if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
     NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
     NASFS_AUTH_METHOD="password" \
     NASFS_AUTH_USER="e2e" \
     NASFS_AUTH_PASSWORD="super-secret" \
     NASFS_ENCRYPTION_KEY="my-secret-encryption-password-123!" \
-    "$CLIENT_BIN" get "encrypted_remote.bin" "$TEST_OUTPUT_CORRECT" > "$LOG_DIR/client_get_correct.log" 2>&1
+    "$CLIENT_BIN" get "encrypted_remote.bin" "$TEST_OUTPUT_CORRECT" > "$LOG_DIR/client_get_correct.log" 2>&1; then
+  printf "${RED}FAIL: Client GET (correct key) command failed.${NC}\n"
+  cat "$LOG_DIR/client_get_correct.log"
+  exit 1
+fi
 
 CORRECT_HASH=$(hash_file "$TEST_OUTPUT_CORRECT")
 printf "Decrypted file hash: %s\n" "$CORRECT_HASH"

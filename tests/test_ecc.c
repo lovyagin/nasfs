@@ -17,8 +17,9 @@ int main(void) {
   size_t num_blocks = 4;      // Let's have 4 blocks of data
 
   // Allocate memory for blocks
-  uint8_t** original_blocks = malloc(num_blocks * sizeof(uint8_t*));
-  uint8_t** healthy_blocks = malloc((num_blocks - 1) * sizeof(uint8_t*));
+  uint8_t** original_blocks = (uint8_t**)malloc(num_blocks * sizeof(uint8_t*));
+  uint8_t** healthy_blocks =
+      (uint8_t**)malloc((num_blocks - 1) * sizeof(uint8_t*));
   uint8_t* parity_block = malloc(block_size);
   uint8_t* reconstructed_block = malloc(block_size);
 
@@ -91,8 +92,8 @@ int main(void) {
   for (size_t b = 0; b < num_blocks; b++) {
     free(original_blocks[b]);
   }
-  free(original_blocks);
-  free(healthy_blocks);
+  free((void*)original_blocks);
+  free((void*)healthy_blocks);
   free(parity_block);
   free(reconstructed_block);
 
