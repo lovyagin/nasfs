@@ -392,10 +392,15 @@ void session_close(uv_handle_t* handle) {
   log_all(LOG_INFO, "Closing session for client.");
 
   if (session->active_fd != -1) {
-    uv_fs_t close_req;
-    uv_fs_close(handle->loop, &close_req, session->active_fd, NULL);
-    uv_fs_req_cleanup(&close_req);
-    session->active_fd = -1;
+    if (session->pending_writes > 0) {
+      /* Async writes still queued; let on_put_fs_write close the fd when done. */
+      session->close_after_writes = 1;
+    } else {
+      uv_fs_t close_req;
+      uv_fs_close(handle->loop, &close_req, session->active_fd, NULL);
+      uv_fs_req_cleanup(&close_req);
+      session->active_fd = -1;
+    }
   }
 
   if (!uv_is_closing(handle)) {

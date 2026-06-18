@@ -82,6 +82,25 @@ run_client() {
         "$CLIENT_BIN" "${args[@]}" >/dev/null 2>&1
 }
 
+run_client_hkdf() {
+    local cipher=$1; shift
+    local args=("$@")
+    env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
+        NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
+        NASFS_AUTH_METHOD="password" \
+        NASFS_AUTH_USER="bench" \
+        NASFS_AUTH_PASSWORD="bench-pass" \
+        NASFS_ENCRYPTION_KEY="benchmark-encryption-key-32chars!" \
+        NASFS_FILE_CIPHER="$cipher" \
+        NASFS_FILE_HASH="blake2b" \
+        NASFS_KDF="hkdf" \
+        HOME="$BENCH_DIR" \
+        "$CLIENT_BIN" "${args[@]}" >/dev/null 2>&1
+}
+# HKDF = no per-session key stretch; shows throughput ceiling with E2EE on
+# but without Argon2id overhead (Argon2id runs once per session anyway,
+# so for large files it barely matters — this mainly shows small-file delta).
+
 maybe_nice() {
     if [[ $THROTTLE -eq 1 ]]; then
         nice -n 19 "$@"
@@ -195,8 +214,9 @@ printf "${Y}══════════════════════�
 # ── CSV header ─────────────────────────────────────────────────────────────────
 echo "mode,tool,cipher,file_size,direction,throughput_mbs,elapsed_s" > "$CSV_OUT"
 
-# ── Benchmark function ─────────────────────────────────────────────────────────
-declare -A RESULTS  # key: "cipher|size|direction" → throughput MB/s
+# ── Benchmark functions ────────────────────────────────────────────────────────
+declare -A RESULTS      # key: "cipher|size|direction" → throughput MB/s
+declare -A NOENC_RESULTS  # key: "size|direction" → throughput MB/s (no E2EE)
 
 bench_nasfs() {
     local cipher=$1 size_label=$2 filepath=$3 direction=$4
@@ -240,6 +260,39 @@ bench_nasfs() {
     RESULTS[$key]="$mbs"
 
     echo "$MODE_LABEL,nasfs,$cipher,$size_label,$direction,$mbs,$best" >> "$CSV_OUT"
+}
+
+bench_nasfs_hkdf() {
+    local cipher=$1 size_label=$2 filepath=$3 direction=$4
+    local bytes
+    bytes=$(wc -c < "$filepath" | tr -d ' ')
+    local remote_name="bench_hkdf_${cipher}_${size_label// /_}_${direction}.bin"
+    local out_file="$BENCH_DIR/got_hkdf_${cipher}_${size_label// /_}.bin"
+
+    if [[ "$direction" == "put" ]]; then
+        run_client_hkdf "$cipher" put "$filepath" "$remote_name" 2>/dev/null || true
+    fi
+
+    local elapsed_arr=()
+    for run in 1 2 3; do
+        rm -f "$out_file" "$STORAGE_DIR/$remote_name"
+        local t0 t1
+        if [[ "$direction" == "put" ]]; then
+            t0=$(ts); run_client_hkdf "$cipher" put "$filepath" "$remote_name"; t1=$(ts)
+        else
+            run_client_hkdf "$cipher" put "$filepath" "$remote_name" 2>/dev/null || true
+            t0=$(ts); run_client_hkdf "$cipher" get "$remote_name" "$out_file"; t1=$(ts)
+        fi
+        elapsed_arr+=("$(elapsed "$t0" "$t1")")
+    done
+
+    local best
+    best=$(median_of_3 "${elapsed_arr[0]}" "${elapsed_arr[1]}" "${elapsed_arr[2]}")
+    local mbs
+    mbs=$(throughput_mbs "$bytes" "$best")
+
+    NOENC_RESULTS["${size_label}|${direction}"]="$mbs"
+    echo "$MODE_LABEL,nasfs,hkdf+$cipher,$size_label,$direction,$mbs,$best" >> "$CSV_OUT"
 }
 
 # ── SFTP helper ─────────────────────────────────────────────────────────────────
@@ -306,6 +359,9 @@ for size_label in "${FILE_ORDER[@]}"; do
         bench_nasfs "$cipher" "$size_label" "$filepath" "put"
         bench_nasfs "$cipher" "$size_label" "$filepath" "get"
     done
+    printf "."
+    bench_nasfs_hkdf "xchacha20poly1305" "$size_label" "$filepath" "put"
+    bench_nasfs_hkdf "xchacha20poly1305" "$size_label" "$filepath" "get"
     printf " done\n"
 done
 
@@ -340,14 +396,15 @@ printf "${Y}  Throughput in MB/s  (median of 3 runs)  —  mode: %s${NC}\n" "$MO
 printf "${Y}══════════════════════════════════════════════════════════════════════════════════${NC}\n"
 
 # Header row
-printf "\n%-12s │ %s │ %s │ %s │ %s │ %s │ %s │ %s\n" \
+printf "\n%-12s │ %s │ %s │ %s │ %s │ %s │ %s │ %s │ %s\n" \
     "" \
     "xsalsa20  PUT" "xsalsa20  GET" \
     "xchacha20 PUT" "xchacha20 GET" \
     "aes256gcm PUT" "aes256gcm GET" \
+    "no-enc  PUT/GET" \
     "sftp-cha20 P/G  sftp-aes256 P/G"
 
-printf "%s\n" "────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┼─────────────────────────────────"
+printf "%s\n" "────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┼─────────────────┼─────────────────────────────────"
 
 for size_label in "${FILE_ORDER[@]}"; do
     get_r() {
@@ -358,6 +415,10 @@ for size_label in "${FILE_ORDER[@]}"; do
         local k="${1}|${2}|${3}"
         echo "${SFTP_RESULTS[$k]:-  ---  }"
     }
+    get_n() {
+        local k="${1}|${2}"
+        echo "${NOENC_RESULTS[$k]:-  ---  }"
+    }
 
     xs_put=$(get_r "xsalsa20poly1305" "$size_label" "put")
     xs_get=$(get_r "xsalsa20poly1305" "$size_label" "get")
@@ -365,16 +426,19 @@ for size_label in "${FILE_ORDER[@]}"; do
     xc_get=$(get_r "xchacha20poly1305" "$size_label" "get")
     ag_put=$(get_r "aes256gcm" "$size_label" "put")
     ag_get=$(get_r "aes256gcm" "$size_label" "get")
+    ne_put=$(get_n "$size_label" "put")
+    ne_get=$(get_n "$size_label" "get")
     sc_put=$(get_s "sftp-chacha20" "$size_label" "put")
     sc_get=$(get_s "sftp-chacha20" "$size_label" "get")
     sa_put=$(get_s "sftp-aes256gcm" "$size_label" "put")
     sa_get=$(get_s "sftp-aes256gcm" "$size_label" "get")
 
-    printf "%-12s │ %12s │ %12s │ %12s │ %12s │ %12s │ %12s │ %8s / %-8s    %8s / %-8s\n" \
+    printf "%-12s │ %12s │ %12s │ %12s │ %12s │ %12s │ %12s │ %8s / %-8s │ %8s / %-8s    %8s / %-8s\n" \
         "$size_label" \
         "$xs_put" "$xs_get" \
         "$xc_put" "$xc_get" \
         "$ag_put" "$ag_get" \
+        "$ne_put" "$ne_get" \
         "$sc_put" "$sc_get" \
         "$sa_put" "$sa_get"
 done

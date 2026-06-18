@@ -44,6 +44,15 @@ static nasfs_hash_algo_t parse_hash_algo(const char* s) {
   return NASFS_HASH_BLAKE2B; /* default */
 }
 
+static nasfs_kdf_algo_t parse_kdf_algo(const char* s) {
+  if (!s) return NASFS_KDF_ARGON2ID;
+  if (strcmp(s, "hkdf") == 0 || strcmp(s, "hkdf-sha256") == 0)
+    return NASFS_KDF_HKDF_SHA256;
+  if (strcmp(s, "pbkdf2") == 0 || strcmp(s, "pbkdf2-sha256") == 0)
+    return NASFS_KDF_PBKDF2_SHA256;
+  return NASFS_KDF_ARGON2ID; /* default */
+}
+
 #define IO_CHUNK_SIZE (64 * 1024)
 #define CLIENT_INITIAL_BUFFER 16384
 #define CLIENT_MAX_RECV_BUFFER (64 * 1024 * 1024)
@@ -111,6 +120,7 @@ uint64_t expected_plaintext_size = 0; /* expected size announced in GET_ACK */
 /* Modular algorithm selection */
 nasfs_cipher_algo_t file_cipher_algo = NASFS_CIPHER_XSALSA20_POLY1305;
 nasfs_hash_algo_t file_hash_algo = NASFS_HASH_BLAKE2B;
+nasfs_kdf_algo_t master_kdf_algo = NASFS_KDF_ARGON2ID;
 
 #define SERVER_PORT 8080
 #define SERVER_IP "127.0.0.1"
@@ -1148,8 +1158,10 @@ int main(int argc, char** argv) {
 
   const char* env_file_cipher = getenv("NASFS_FILE_CIPHER");
   const char* env_file_hash = getenv("NASFS_FILE_HASH");
+  const char* env_kdf = getenv("NASFS_KDF");
   file_cipher_algo = parse_cipher_algo(env_file_cipher);
   file_hash_algo = parse_hash_algo(env_file_hash);
+  master_kdf_algo = parse_kdf_algo(env_kdf);
 
   const char* env_encryption_key = getenv("NASFS_ENCRYPTION_KEY");
   if (!env_encryption_key || env_encryption_key[0] == '\0') {
@@ -1209,12 +1221,10 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (crypto_pwhash(master_key, sizeof(master_key), raw_encryption_password,
-                    strlen(raw_encryption_password), master_salt,
-                    crypto_pwhash_OPSLIMIT_INTERACTIVE,
-                    crypto_pwhash_MEMLIMIT_INTERACTIVE,
-                    crypto_pwhash_ALG_ARGON2ID13) != 0) {
-    fprintf(stderr, "Failed to derive master key using Argon2id\n");
+  if (crypto_engine_derive_key(master_kdf_algo, raw_encryption_password,
+                               master_salt, crypto_pwhash_SALTBYTES, master_key,
+                               sizeof(master_key)) != 0) {
+    fprintf(stderr, "Failed to derive master key\n");
     return 1;
   }
 
