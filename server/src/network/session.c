@@ -28,17 +28,19 @@
 #include "config/config.h"
 #include "crypto_engine.h"
 #include "handshake.h"
-#include "pake.h"
 #include "logging/log.h"
 #include "network/session.h"
+#include "pake.h"
 
 #define INITIAL_RECV_BUFFER_SIZE 16384
 #define MAX_RECV_BUFFER_SIZE (64 * 1024 * 1024)
 #define IO_CHUNK_SIZE ((size_t)global_config.block_size)
 /* On-disk file header for encrypted files:
- * [8 bytes LE plaintext_size][16 bytes salt][1 byte cipher_algo][1 byte hash_algo] */
+ * [8 bytes LE plaintext_size][16 bytes salt][1 byte cipher_algo][1 byte
+ * hash_algo] */
 #define FILE_HEADER_SIZE (sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 2)
-#define NASFS_CIPHER_OVERHEAD 16 /* MAC tag bytes — true for all supported ciphers */
+#define NASFS_CIPHER_OVERHEAD \
+  16 /* MAC tag bytes — true for all supported ciphers */
 /* --- Context Structs for Async Operations --- */
 typedef struct {
   uv_write_t req;
@@ -242,13 +244,17 @@ static int verify_auth_payload(client_session_t* session,
     }
     uint8_t expected_proof[32];
     const uint8_t tag[] = "client";
-    if (crypto_generichash(expected_proof, sizeof(expected_proof), K,
-                           sizeof(K), tag, sizeof(tag) - 1) != 0) {
+    if (crypto_generichash(expected_proof, sizeof(expected_proof), K, sizeof(K),
+                           tag, sizeof(tag) - 1) != 0) {
       return 0;
     }
-    char* expected_hex = nasfs_hex_encode(expected_proof, sizeof(expected_proof));
+    char* expected_hex =
+        nasfs_hex_encode(expected_proof, sizeof(expected_proof));
     if (!expected_hex) return 0;
-    if (strlen(auth->password) != 64) { free(expected_hex); return 0; }
+    if (strlen(auth->password) != 64) {
+      free(expected_hex);
+      return 0;
+    }
     int rc = sodium_memcmp(auth->password, expected_hex, 64);
     free(expected_hex);
     return rc == 0;
@@ -418,7 +424,8 @@ void session_close(uv_handle_t* handle) {
 
   if (session->active_fd != -1) {
     if (session->pending_writes > 0) {
-      /* Async writes still queued; let on_put_fs_write close the fd when done. */
+      /* Async writes still queued; let on_put_fs_write close the fd when done.
+       */
       session->close_after_writes = 1;
     } else {
       uv_fs_t close_req;
@@ -522,7 +529,8 @@ static void on_put_fs_write(uv_fs_t* req) {
         session->active_fd = -1;
       }
     }
-    /* If the TCP handle closed while writes were in flight, free the session. */
+    /* If the TCP handle closed while writes were in flight, free the session.
+     */
     if (session->pending_close) {
       session_free(session);
     }
@@ -872,17 +880,18 @@ static void session_dispatch_frame(client_session_t* session,
         session_close((uv_handle_t*)&session->handle);
         break;
       }
-      memcpy(session->pake_X,
-             plain_frame.payload + 1 + ulen,
+      memcpy(session->pake_X, plain_frame.payload + 1 + ulen,
              crypto_core_ristretto255_BYTES);
 
       if (!global_config.auth_password) {
         session_send_frame(session, NASFS_CMD_ERROR,
-                           (const uint8_t*)"No PAKE password configured", 27, 1);
+                           (const uint8_t*)"No PAKE password configured", 27,
+                           1);
         session_close((uv_handle_t*)&session->handle);
         break;
       }
-      if (pake_derive_scalar(global_config.auth_password, session->pake_w) != 0) {
+      if (pake_derive_scalar(global_config.auth_password, session->pake_w) !=
+          0) {
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"PAKE internal error", 19, 1);
         session_close((uv_handle_t*)&session->handle);
@@ -903,8 +912,7 @@ static void session_dispatch_frame(client_session_t* session,
         break;
       }
       session->pake_hello_received = 1;
-      session_send_frame(session, NASFS_CMD_PAKE_RESPONSE,
-                         Y, sizeof(Y), 1);
+      session_send_frame(session, NASFS_CMD_PAKE_RESPONSE, Y, sizeof(Y), 1);
       break;
     }
 
@@ -946,16 +954,18 @@ static void session_dispatch_frame(client_session_t* session,
       if (plain_frame.payload_len > 1 &&
           (plain_frame.payload[0] == 0 || plain_frame.payload[0] == 1)) {
         is_enc = plain_frame.payload[0];
-        /* Encrypted PUT_REQ: [1 enc][16 salt][8 size][1 cipher][1 hash][name] */
-        if (is_enc && plain_frame.payload_len >=
-                          (1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2)) {
+        /* Encrypted PUT_REQ: [1 enc][16 salt][8 size][1 cipher][1 hash][name]
+         */
+        if (is_enc && plain_frame.payload_len >= (1 + crypto_pwhash_SALTBYTES +
+                                                  sizeof(uint64_t) + 2)) {
           memcpy(session->file_salt, plain_frame.payload + 1,
                  crypto_pwhash_SALTBYTES);
           memcpy(&session->expected_plaintext_size,
                  plain_frame.payload + 1 + crypto_pwhash_SALTBYTES,
                  sizeof(uint64_t));
           uint8_t req_cipher =
-              plain_frame.payload[1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t)];
+              plain_frame
+                  .payload[1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t)];
           uint8_t req_hash =
               plain_frame
                   .payload[1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 1];
@@ -1104,7 +1114,8 @@ static void session_dispatch_frame(client_session_t* session,
           session->state == SESSION_STATE_RECEIVING_FILE) {
         log_all(LOG_INFO, "Upload complete.");
         if (session->pending_writes > 0) {
-          /* Async writes still in flight; let the last callback close the fd. */
+          /* Async writes still in flight; let the last callback close the fd.
+           */
           session->close_after_writes = 1;
         } else if (session->active_fd != -1) {
           uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd,

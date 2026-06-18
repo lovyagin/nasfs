@@ -32,7 +32,8 @@
 
 static nasfs_cipher_algo_t parse_cipher_algo(const char* s) {
   if (!s) return NASFS_CIPHER_XSALSA20_POLY1305;
-  if (strcmp(s, "xchacha20poly1305") == 0) return NASFS_CIPHER_XCHACHA20_POLY1305;
+  if (strcmp(s, "xchacha20poly1305") == 0)
+    return NASFS_CIPHER_XCHACHA20_POLY1305;
   if (strcmp(s, "aes256gcm") == 0) return NASFS_CIPHER_AES_256_GCM;
   return NASFS_CIPHER_XSALSA20_POLY1305; /* default */
 }
@@ -74,6 +75,18 @@ typedef struct {
   uv_stream_t* stream;
 } nasfs_fs_ctx_t;
 
+/* Batch operation queue — used by mput / mget */
+#define NASFS_MAX_BATCH 512
+typedef struct {
+  client_op_t op;
+  const char* local_path;
+  const char* remote_name;
+  uint64_t plaintext_size;
+} nasfs_batch_op_t;
+static nasfs_batch_op_t batch_queue[NASFS_MAX_BATCH];
+static int batch_count = 0;
+static int batch_idx = 0;
+
 /* Global State */
 uv_loop_t* loop;
 client_op_t current_op = OP_NONE;
@@ -97,8 +110,8 @@ const char* client_cipher_algorithms = DEFAULT_CIPHER_ALGORITHMS;
 const char* client_auth_method = NASFS_AUTH_METHOD_PASSWORD;
 
 /* PAKE ephemeral state — valid only during pake handshake */
-static uint8_t pake_x[32];  /* client ephemeral scalar */
-static uint8_t pake_w[32];  /* password scalar */
+static uint8_t pake_x[32]; /* client ephemeral scalar */
+static uint8_t pake_w[32]; /* password scalar */
 const char* client_auth_user = "user";
 const char* client_auth_password = "nasfs";
 const char* client_identity_file = NULL;
@@ -138,6 +151,9 @@ void send_command(uv_stream_t* stream, nasfs_cmd_type_t cmd,
                   const uint8_t* payload, size_t payload_len, int encrypt);
 void do_put_read_chunk(uv_stream_t* stream);
 void on_close(uv_handle_t* handle);
+static void send_put_req(uv_stream_t* stream);
+static void send_get_req(uv_stream_t* stream);
+static void start_next_operation(uv_stream_t* stream);
 
 static void trim_line(char* line) {
   size_t len;
@@ -389,8 +405,7 @@ static void send_pake_hello(uv_stream_t* stream) {
   free(payload);
 }
 
-static void send_pake_auth_proof(uv_stream_t* stream,
-                                 const uint8_t* Y) {
+static void send_pake_auth_proof(uv_stream_t* stream, const uint8_t* Y) {
   uint8_t K[32];
   if (pake_client_derive_key(pake_w, pake_x, Y, K) != 0) {
     fprintf(stderr, "PAKE: failed to derive session key\n");
@@ -401,8 +416,8 @@ static void send_pake_auth_proof(uv_stream_t* stream,
 
   uint8_t proof[32];
   const uint8_t tag[] = "client";
-  if (crypto_generichash(proof, sizeof(proof), K, sizeof(K),
-                         tag, sizeof(tag) - 1) != 0) {
+  if (crypto_generichash(proof, sizeof(proof), K, sizeof(K), tag,
+                         sizeof(tag) - 1) != 0) {
     client_exit_code = 1;
     uv_close((uv_handle_t*)stream, on_close);
     return;
@@ -525,12 +540,102 @@ void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
   buf->len = client_recv_capacity - client_recv_length;
 }
 
+/* Send PUT_REQ for the current local_filename / remote_filename. */
+static void send_put_req(uv_stream_t* stream) {
+  size_t fn_len = strlen(remote_filename);
+  if (file_encryption_enabled) {
+    size_t payload_len =
+        1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2 + fn_len + 1;
+    uint8_t* req_payload = malloc(payload_len);
+    if (!req_payload) return;
+    req_payload[0] = 1;
+    randombytes_buf(file_salt, crypto_pwhash_SALTBYTES);
+    if (crypto_engine_derive_key(NASFS_KDF_HKDF_SHA256, (const char*)master_key,
+                                 file_salt, crypto_pwhash_SALTBYTES,
+                                 encryption_key, sizeof(encryption_key)) != 0) {
+      fprintf(stderr, "Failed to derive file key\n");
+      free(req_payload);
+      uv_close((uv_handle_t*)stream, on_close);
+      return;
+    }
+    size_t off = 1;
+    memcpy(req_payload + off, file_salt, crypto_pwhash_SALTBYTES);
+    off += crypto_pwhash_SALTBYTES;
+    memcpy(req_payload + off, &put_plaintext_size, sizeof(uint64_t));
+    off += sizeof(uint64_t);
+    req_payload[off++] = (uint8_t)file_cipher_algo;
+    req_payload[off++] = (uint8_t)file_hash_algo;
+    memcpy(req_payload + off, (const uint8_t*)remote_filename, fn_len + 1);
+    send_command(stream, NASFS_CMD_PUT_REQ, req_payload, payload_len, 1);
+    free(req_payload);
+  } else {
+    size_t payload_len = 1 + fn_len + 1;
+    uint8_t* req_payload = malloc(payload_len);
+    if (!req_payload) return;
+    req_payload[0] = 0;
+    memcpy(req_payload + 1, (const uint8_t*)remote_filename, fn_len + 1);
+    send_command(stream, NASFS_CMD_PUT_REQ, req_payload, payload_len, 1);
+    free(req_payload);
+  }
+}
+
+/* Send GET_REQ for the current remote_filename. */
+static void send_get_req(uv_stream_t* stream) {
+  size_t fn_len = strlen(remote_filename);
+  size_t payload_len = 1 + fn_len + 1;
+  uint8_t* req_payload = malloc(payload_len);
+  if (!req_payload) return;
+  req_payload[0] = file_encryption_enabled ? 1 : 0;
+  memcpy(req_payload + 1, (const uint8_t*)remote_filename, fn_len + 1);
+  send_command(stream, NASFS_CMD_GET_REQ, req_payload, payload_len, 1);
+  free(req_payload);
+}
+
+/* Reset per-file transfer state and start the next queued operation. */
+static void start_next_operation(uv_stream_t* stream) {
+  if (local_fd != -1) {
+    uv_fs_t close_req;
+    uv_fs_close(loop, &close_req, local_fd, NULL);
+    uv_fs_req_cleanup(&close_req);
+    local_fd = -1;
+  }
+  file_offset = 0;
+  client_block_seq = 0;
+  has_pending_block_meta = 0;
+  expected_block_size = 0;
+  expected_plaintext_size = 0;
+
+  if (batch_idx >= batch_count) {
+    uv_close((uv_handle_t*)stream, on_close);
+    return;
+  }
+
+  nasfs_batch_op_t* op = &batch_queue[batch_idx++];
+  current_op = op->op;
+  local_filename = op->local_path;
+  remote_filename = op->remote_name;
+  put_plaintext_size = op->plaintext_size;
+
+  printf("\n[%d/%d] %s %s\n", batch_idx, batch_count,
+         current_op == OP_PUT ? "PUT" : "GET",
+         current_op == OP_PUT ? local_filename : remote_filename);
+
+  if (current_op == OP_PUT) {
+    send_put_req(stream);
+  } else {
+    send_get_req(stream);
+  }
+}
+
 void on_close(uv_handle_t* handle) {
   if (client_recv_buffer) free(client_recv_buffer);
   if (shared_secret) sodium_free(shared_secret);
   if (negotiated_kex_algorithm) free(negotiated_kex_algorithm);
   if (negotiated_cipher_algorithm) free(negotiated_cipher_algorithm);
-  if (local_fd != -1) uv_fs_close(loop, &(uv_fs_t){}, local_fd, NULL);
+  if (local_fd != -1) {
+    uv_fs_t close_req;
+    uv_fs_close(loop, &close_req, local_fd, NULL);
+  }
   free(handle);
   printf("\nConnection closed.\n");
 }
@@ -552,7 +657,7 @@ void on_write(uv_write_t* req, int status) {
     }
     if (ctx->type == NASFS_CMD_PUT_DONE) {
       free(ctx);
-      uv_close((uv_handle_t*)stream, on_close);
+      start_next_operation(stream);
       return;
     }
   }
@@ -807,8 +912,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
 
           switch (plain_frame.type) {
             case NASFS_CMD_PAKE_RESPONSE:
-              if (plain_frame.payload_len !=
-                  crypto_core_ristretto255_BYTES) {
+              if (plain_frame.payload_len != crypto_core_ristretto255_BYTES) {
                 fprintf(stderr, "PAKE: bad response length\n");
                 client_exit_code = 1;
                 uv_close((uv_handle_t*)stream, on_close);
@@ -819,64 +923,9 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
 
             case NASFS_CMD_AUTH_ACK:
               if (current_op == OP_PUT) {
-                size_t fn_len = strlen(remote_filename);
-                if (file_encryption_enabled) {
-                  /* [1 enc][16 salt][8 size][1 cipher][1 hash][name\0] */
-                  size_t payload_len = 1 + crypto_pwhash_SALTBYTES +
-                                       sizeof(uint64_t) + 2 + fn_len + 1;
-                  uint8_t* req_payload = malloc(payload_len);
-                  if (req_payload) {
-                    req_payload[0] = 1;
-                    randombytes_buf(file_salt, crypto_pwhash_SALTBYTES);
-
-                    if (crypto_engine_derive_key(
-                            NASFS_KDF_HKDF_SHA256, (const char*)master_key,
-                            file_salt, crypto_pwhash_SALTBYTES, encryption_key,
-                            sizeof(encryption_key)) != 0) {
-                      fprintf(stderr,
-                              "Failed to derive file key using HKDF-SHA256\n");
-                      free(req_payload);
-                      uv_close((uv_handle_t*)stream, on_close);
-                      return;
-                    }
-                    size_t off = 1;
-                    memcpy(req_payload + off, file_salt, crypto_pwhash_SALTBYTES);
-                    off += crypto_pwhash_SALTBYTES;
-                    memcpy(req_payload + off, &put_plaintext_size,
-                           sizeof(uint64_t));
-                    off += sizeof(uint64_t);
-                    req_payload[off++] = (uint8_t)file_cipher_algo;
-                    req_payload[off++] = (uint8_t)file_hash_algo;
-                    memcpy(req_payload + off, (const uint8_t*)remote_filename,
-                           fn_len + 1);
-                    send_command(stream, NASFS_CMD_PUT_REQ, req_payload,
-                                 payload_len, 1);
-                    free(req_payload);
-                  }
-                } else {
-                  size_t payload_len = 1 + fn_len + 1;
-                  uint8_t* req_payload = malloc(payload_len);
-                  if (req_payload) {
-                    req_payload[0] = 0;
-                    memcpy(req_payload + 1, (const uint8_t*)remote_filename,
-                           fn_len + 1);
-                    send_command(stream, NASFS_CMD_PUT_REQ, req_payload,
-                                 payload_len, 1);
-                    free(req_payload);
-                  }
-                }
+                send_put_req(stream);
               } else if (current_op == OP_GET) {
-                size_t fn_len = strlen(remote_filename);
-                size_t payload_len = 1 + fn_len + 1;
-                uint8_t* req_payload = malloc(payload_len);
-                if (req_payload) {
-                  req_payload[0] = file_encryption_enabled ? 1 : 0;
-                  memcpy(req_payload + 1, (const uint8_t*)remote_filename,
-                         fn_len + 1);
-                  send_command(stream, NASFS_CMD_GET_REQ, req_payload,
-                               payload_len, 1);
-                  free(req_payload);
-                }
+                send_get_req(stream);
               }
               break;
             case NASFS_CMD_PUT_ACK: {
@@ -917,10 +966,13 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 memcpy(&expected_plaintext_size,
                        plain_frame.payload + crypto_pwhash_SALTBYTES,
                        sizeof(uint64_t));
-                file_cipher_algo = (nasfs_cipher_algo_t)plain_frame.payload[
-                    crypto_pwhash_SALTBYTES + sizeof(uint64_t)];
-                file_hash_algo = (nasfs_hash_algo_t)plain_frame.payload[
-                    crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 1];
+                file_cipher_algo =
+                    (nasfs_cipher_algo_t)plain_frame
+                        .payload[crypto_pwhash_SALTBYTES + sizeof(uint64_t)];
+                file_hash_algo =
+                    (nasfs_hash_algo_t)
+                        plain_frame.payload[crypto_pwhash_SALTBYTES +
+                                            sizeof(uint64_t) + 1];
 
                 if (crypto_engine_derive_key(
                         NASFS_KDF_HKDF_SHA256, (const char*)master_key,
@@ -1119,7 +1171,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 break;
               }
               printf("\nDownload complete.\n");
-              uv_close((uv_handle_t*)stream, on_close);
+              start_next_operation(stream);
               break;
             case NASFS_CMD_ERROR:
               fprintf(stderr, "Server error: %.*s\n",
@@ -1202,10 +1254,15 @@ int main(int argc, char** argv) {
 
   if (argc < 3) {
     fprintf(stderr,
-            "Usage:\n  %s put <local_file> [remote_file]\n  %s get "
-            "<remote_file> [local_file]\n  %s keygen <private_key> "
-            "<authorized_keys> [signature_algorithm]\n",
-            argv[0], argv[0], argv[0]);
+            "Usage:\n"
+            "  %s put  <local_file> [remote_name]   -- single upload\n"
+            "  %s get  <remote_file> [local_file]   -- single download\n"
+            "  %s mput <file1> <file2> ...           -- batch upload (one "
+            "session)\n"
+            "  %s mget <remote1> <remote2> ...       -- batch download (one "
+            "session)\n"
+            "  %s keygen <private_key> <authorized_keys> [sig_algo]\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 1;
   }
 
@@ -1251,7 +1308,8 @@ int main(int argc, char** argv) {
     client_server_ip = env_server_ip;
   }
   if (env_server_port && env_server_port[0] != '\0') {
-    client_server_port = atoi(env_server_port);
+    long p = strtol(env_server_port, NULL, 10);
+    if (p > 0 && p <= 65535) client_server_port = (int)p;
   }
 
   const char* env_file_cipher = getenv("NASFS_FILE_CIPHER");
@@ -1343,27 +1401,59 @@ int main(int argc, char** argv) {
   }
   if (strcmp(client_auth_method, NASFS_AUTH_METHOD_PAKE) == 0 &&
       (!client_auth_password || client_auth_password[0] == '\0')) {
-    fprintf(stderr,
-            "NASFS_AUTH_PASSWORD required for PAKE authentication\n");
+    fprintf(stderr, "NASFS_AUTH_PASSWORD required for PAKE authentication\n");
     return 1;
   }
 
   if (strcmp(argv[1], "put") == 0) {
-    current_op = OP_PUT;
-    local_filename = argv[2];
-    remote_filename = (argc >= 4) ? argv[3] : get_basename(local_filename);
-    struct stat put_st;
-    if (stat(local_filename, &put_st) == 0) {
-      put_plaintext_size = (uint64_t)put_st.st_size;
-    }
+    /* Single PUT: put <local> [remote] */
+    const char* loc = argv[2];
+    const char* rem = (argc >= 4) ? argv[3] : get_basename(loc);
+    struct stat st;
+    uint64_t psz = 0;
+    if (stat(loc, &st) == 0) psz = (uint64_t)st.st_size;
+    batch_queue[0] = (nasfs_batch_op_t){OP_PUT, loc, rem, psz};
+    batch_count = 1;
   } else if (strcmp(argv[1], "get") == 0) {
-    current_op = OP_GET;
-    remote_filename = argv[2];
-    local_filename = (argc >= 4) ? argv[3] : get_basename(remote_filename);
+    /* Single GET: get <remote> [local] */
+    const char* rem = argv[2];
+    const char* loc = (argc >= 4) ? argv[3] : get_basename(rem);
+    batch_queue[0] = (nasfs_batch_op_t){OP_GET, loc, rem, 0};
+    batch_count = 1;
+  } else if (strcmp(argv[1], "mput") == 0) {
+    /* Batch PUT: mput file1 file2 ... */
+    if (argc < 3) {
+      fprintf(stderr, "mput requires at least one file\n");
+      return 1;
+    }
+    for (int i = 2; i < argc && batch_count < NASFS_MAX_BATCH; i++) {
+      struct stat st;
+      uint64_t psz = 0;
+      if (stat(argv[i], &st) == 0) psz = (uint64_t)st.st_size;
+      batch_queue[batch_count++] =
+          (nasfs_batch_op_t){OP_PUT, argv[i], get_basename(argv[i]), psz};
+    }
+  } else if (strcmp(argv[1], "mget") == 0) {
+    /* Batch GET: mget remote1 remote2 ... */
+    if (argc < 3) {
+      fprintf(stderr, "mget requires at least one file\n");
+      return 1;
+    }
+    for (int i = 2; i < argc && batch_count < NASFS_MAX_BATCH; i++) {
+      batch_queue[batch_count++] =
+          (nasfs_batch_op_t){OP_GET, get_basename(argv[i]), argv[i], 0};
+    }
   } else {
-    fprintf(stderr, "Invalid operation. Use 'put' or 'get'.\n");
+    fprintf(stderr, "Invalid operation. Use put, get, mput, or mget.\n");
     return 1;
   }
+
+  /* Load first operation into the active globals */
+  current_op = batch_queue[0].op;
+  local_filename = batch_queue[0].local_path;
+  remote_filename = batch_queue[0].remote_name;
+  put_plaintext_size = batch_queue[0].plaintext_size;
+  batch_idx = 1;
 
   loop = uv_default_loop();
   uv_tcp_t* socket = malloc(sizeof(uv_tcp_t));

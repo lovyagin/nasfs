@@ -11,6 +11,7 @@
 #                                  [--ciphers xchacha20poly1305,aes256gcm]
 
 set -euo pipefail
+export LC_ALL=C LANG=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"

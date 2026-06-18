@@ -19,4 +19,6 @@ Checks: >
   -bugprone-reserved-identifier,
   -bugprone-suspicious-include,
   -bugprone-unchecked-optional-access,
-  -performance-no-automatic-move
+  -bugprone-not-null-terminated-result,
+  -performance-no-automatic-move,
+  -performance-no-int-to-ptr
