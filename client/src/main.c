@@ -27,6 +27,7 @@
 #include "auth.h"
 #include "crypto_engine.h"
 #include "handshake.h"
+#include "pake.h"
 #include "protocol.h"
 
 static nasfs_cipher_algo_t parse_cipher_algo(const char* s) {
@@ -94,6 +95,10 @@ crypto_secretstream_xchacha20poly1305_state recv_crypto_state;
 const char* client_kex_algorithms = DEFAULT_KEX_ALGORITHMS;
 const char* client_cipher_algorithms = DEFAULT_CIPHER_ALGORITHMS;
 const char* client_auth_method = NASFS_AUTH_METHOD_PASSWORD;
+
+/* PAKE ephemeral state — valid only during pake handshake */
+static uint8_t pake_x[32];  /* client ephemeral scalar */
+static uint8_t pake_w[32];  /* password scalar */
 const char* client_auth_user = "user";
 const char* client_auth_password = "nasfs";
 const char* client_identity_file = NULL;
@@ -347,6 +352,84 @@ out:
   free(secret_key);
   free(message);
   return rc;
+}
+
+static void send_pake_hello(uv_stream_t* stream) {
+  if (pake_derive_scalar(client_auth_password, pake_w) != 0) {
+    fprintf(stderr, "PAKE: failed to derive password scalar\n");
+    client_exit_code = 1;
+    uv_close((uv_handle_t*)stream, on_close);
+    return;
+  }
+  randombytes_buf(pake_x, sizeof(pake_x));
+  pake_x[0] &= 248;
+  pake_x[31] &= 63;
+  pake_x[31] |= 64;
+
+  uint8_t X[crypto_core_ristretto255_BYTES];
+  if (pake_client_compute_share(pake_w, pake_x, X) != 0) {
+    fprintf(stderr, "PAKE: failed to compute client share\n");
+    client_exit_code = 1;
+    uv_close((uv_handle_t*)stream, on_close);
+    return;
+  }
+
+  uint8_t ulen = (uint8_t)strlen(client_auth_user);
+  size_t payload_len = 1 + ulen + sizeof(X);
+  uint8_t* payload = malloc(payload_len);
+  if (!payload) {
+    client_exit_code = 1;
+    uv_close((uv_handle_t*)stream, on_close);
+    return;
+  }
+  payload[0] = ulen;
+  memcpy(payload + 1, client_auth_user, ulen);
+  memcpy(payload + 1 + ulen, X, sizeof(X));
+  send_command(stream, NASFS_CMD_PAKE_HELLO, payload, payload_len, 1);
+  free(payload);
+}
+
+static void send_pake_auth_proof(uv_stream_t* stream,
+                                 const uint8_t* Y) {
+  uint8_t K[32];
+  if (pake_client_derive_key(pake_w, pake_x, Y, K) != 0) {
+    fprintf(stderr, "PAKE: failed to derive session key\n");
+    client_exit_code = 1;
+    uv_close((uv_handle_t*)stream, on_close);
+    return;
+  }
+
+  uint8_t proof[32];
+  const uint8_t tag[] = "client";
+  if (crypto_generichash(proof, sizeof(proof), K, sizeof(K),
+                         tag, sizeof(tag) - 1) != 0) {
+    client_exit_code = 1;
+    uv_close((uv_handle_t*)stream, on_close);
+    return;
+  }
+
+  char* proof_hex = nasfs_hex_encode(proof, sizeof(proof));
+  if (!proof_hex) {
+    client_exit_code = 1;
+    uv_close((uv_handle_t*)stream, on_close);
+    return;
+  }
+
+  nasfs_auth_payload_t auth = {0};
+  auth.method = (char*)NASFS_AUTH_METHOD_PAKE;
+  auth.username = (char*)client_auth_user;
+  auth.password = proof_hex;
+
+  size_t payload_len = 0;
+  uint8_t* payload = nasfs_auth_pack(&auth, &payload_len);
+  free(proof_hex);
+  if (!payload) {
+    client_exit_code = 1;
+    uv_close((uv_handle_t*)stream, on_close);
+    return;
+  }
+  send_command(stream, NASFS_CMD_AUTH, payload, payload_len, 1);
+  free(payload);
 }
 
 static void send_auth(uv_stream_t* stream) {
@@ -694,7 +777,11 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
             printf(
                 "PQC Handshake successful. Channel is now secure. Sending "
                 "AUTH...\n");
-            send_auth(stream);
+            if (strcmp(client_auth_method, NASFS_AUTH_METHOD_PAKE) == 0) {
+              send_pake_hello(stream);
+            } else {
+              send_auth(stream);
+            }
           }
         } else {
           unsigned long long decrypted_len;
@@ -719,6 +806,17 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
           }
 
           switch (plain_frame.type) {
+            case NASFS_CMD_PAKE_RESPONSE:
+              if (plain_frame.payload_len !=
+                  crypto_core_ristretto255_BYTES) {
+                fprintf(stderr, "PAKE: bad response length\n");
+                client_exit_code = 1;
+                uv_close((uv_handle_t*)stream, on_close);
+                break;
+              }
+              send_pake_auth_proof(stream, plain_frame.payload);
+              break;
+
             case NASFS_CMD_AUTH_ACK:
               if (current_op == OP_PUT) {
                 size_t fn_len = strlen(remote_filename);
@@ -1233,8 +1331,15 @@ int main(int argc, char** argv) {
   }
 
   if (!auth_method_requires_password(client_auth_method) &&
-      !auth_method_requires_publickey(client_auth_method)) {
+      !auth_method_requires_publickey(client_auth_method) &&
+      strcmp(client_auth_method, NASFS_AUTH_METHOD_PAKE) != 0) {
     fprintf(stderr, "Invalid NASFS_AUTH_METHOD: %s\n", client_auth_method);
+    return 1;
+  }
+  if (strcmp(client_auth_method, NASFS_AUTH_METHOD_PAKE) == 0 &&
+      (!client_auth_password || client_auth_password[0] == '\0')) {
+    fprintf(stderr,
+            "NASFS_AUTH_PASSWORD required for PAKE authentication\n");
     return 1;
   }
 

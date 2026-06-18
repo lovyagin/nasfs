@@ -20,6 +20,7 @@
 #include <uv.h>
 
 #include "crypto_engine.h"
+#include "pake.h"
 #include "protocol.h"
 
 /**
@@ -95,6 +96,12 @@ typedef struct {
   int close_after_writes; /**< Set by PUT_DONE when writes are still in flight. */
   int pending_close;      /**< Set by close callback if writes were still in
                                flight; the last write callback frees the session. */
+
+  /* PAKE (SPAKE2) auth state — valid only during pake auth handshake. */
+  uint8_t pake_y[32];      /**< Server ephemeral scalar y. */
+  uint8_t pake_X[32];      /**< Client share X received in CMD_PAKE_HELLO. */
+  uint8_t pake_w[32];      /**< Password scalar w derived from server password. */
+  int pake_hello_received; /**< Set when CMD_PAKE_HELLO has been processed. */
 
 } client_session_t;
 

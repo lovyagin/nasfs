@@ -12,6 +12,7 @@
 #define NASFS_AUTH_METHOD_PASSWORD "password"
 #define NASFS_AUTH_METHOD_PUBLICKEY "publickey"
 #define NASFS_AUTH_METHOD_PASSWORD_PUBLICKEY "password+publickey"
+#define NASFS_AUTH_METHOD_PAKE "pake"
 #define NASFS_AUTH_DEFAULT_SIG_ALGORITHM "ML-DSA-65"
 
 typedef struct {

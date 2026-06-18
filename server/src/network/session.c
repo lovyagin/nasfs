@@ -28,6 +28,7 @@
 #include "config/config.h"
 #include "crypto_engine.h"
 #include "handshake.h"
+#include "pake.h"
 #include "logging/log.h"
 #include "network/session.h"
 
@@ -227,6 +228,30 @@ static int verify_auth_payload(client_session_t* session,
   if (method_requires_publickey(auth->method) &&
       !verify_publickey_auth(session, auth)) {
     return 0;
+  }
+
+  if (strcmp(auth->method, NASFS_AUTH_METHOD_PAKE) == 0) {
+    if (!session->pake_hello_received || !auth->password) {
+      return 0;
+    }
+    /* proof = BLAKE2b(K_pake || "client") sent as hex */
+    uint8_t K[32];
+    if (pake_server_derive_key(session->pake_w, session->pake_y,
+                               session->pake_X, K) != 0) {
+      return 0;
+    }
+    uint8_t expected_proof[32];
+    const uint8_t tag[] = "client";
+    if (crypto_generichash(expected_proof, sizeof(expected_proof), K,
+                           sizeof(K), tag, sizeof(tag) - 1) != 0) {
+      return 0;
+    }
+    char* expected_hex = nasfs_hex_encode(expected_proof, sizeof(expected_proof));
+    if (!expected_hex) return 0;
+    if (strlen(auth->password) != 64) { free(expected_hex); return 0; }
+    int rc = sodium_memcmp(auth->password, expected_hex, 64);
+    free(expected_hex);
+    return rc == 0;
   }
 
   return method_requires_password(auth->method) ||
@@ -823,6 +848,66 @@ static void session_dispatch_frame(client_session_t* session,
   }
 
   switch (plain_frame.type) {
+    case NASFS_CMD_PAKE_HELLO: {
+      /* Payload: [u8 ulen][username][X(32)] */
+      if (!session->is_secure || session->is_authenticated ||
+          plain_frame.payload_len < 2 + crypto_core_ristretto255_BYTES) {
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"Bad PAKE_HELLO", 14, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+      if (!csv_list_contains(global_config.auth_methods,
+                             NASFS_AUTH_METHOD_PAKE)) {
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"PAKE not enabled", 16, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+      uint8_t ulen = plain_frame.payload[0];
+      if (1 + ulen + (size_t)crypto_core_ristretto255_BYTES >
+          plain_frame.payload_len) {
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"Bad PAKE_HELLO", 14, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+      memcpy(session->pake_X,
+             plain_frame.payload + 1 + ulen,
+             crypto_core_ristretto255_BYTES);
+
+      if (!global_config.auth_password) {
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"No PAKE password configured", 27, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+      if (pake_derive_scalar(global_config.auth_password, session->pake_w) != 0) {
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"PAKE internal error", 19, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+      /* Generate ephemeral scalar y and compute server share Y */
+      randombytes_buf(session->pake_y, sizeof(session->pake_y));
+      /* Clamp to valid scalar range */
+      session->pake_y[0] &= 248;
+      session->pake_y[31] &= 63;
+      session->pake_y[31] |= 64;
+
+      uint8_t Y[crypto_core_ristretto255_BYTES];
+      if (pake_server_compute_share(session->pake_w, session->pake_y, Y) != 0) {
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"PAKE internal error", 19, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+      session->pake_hello_received = 1;
+      session_send_frame(session, NASFS_CMD_PAKE_RESPONSE,
+                         Y, sizeof(Y), 1);
+      break;
+    }
+
     case NASFS_CMD_AUTH: {
       nasfs_auth_payload_t auth = {0};
       if (nasfs_auth_unpack(plain_frame.payload, plain_frame.payload_len,
@@ -1172,6 +1257,10 @@ void session_on_new_connection(uv_stream_t* server, int status) {
   session->pending_writes = 0;
   session->close_after_writes = 0;
   session->pending_close = 0;
+  session->pake_hello_received = 0;
+  memset(session->pake_y, 0, sizeof(session->pake_y));
+  memset(session->pake_X, 0, sizeof(session->pake_X));
+  memset(session->pake_w, 0, sizeof(session->pake_w));
 
   if (uv_tcp_init(server->loop, &session->handle) != 0) {
     free(session);

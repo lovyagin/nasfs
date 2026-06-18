@@ -52,6 +52,10 @@ typedef enum {
       0x18, /**< C->S: Metadata for the next put block (encrypted). */
   NASFS_CMD_GET_BLOCK_META =
       0x19, /**< S->C: Metadata for the next get block (encrypted). */
+  NASFS_CMD_PAKE_HELLO =
+      0x1A, /**< C->S: SPAKE2 client share [u8 ulen][username][X(32)]. */
+  NASFS_CMD_PAKE_RESPONSE =
+      0x1B, /**< S->C: SPAKE2 server share [Y(32)]. */
 
   /* Data Transfer Commands (Unencrypted Payload) */
   NASFS_CMD_PUT_DATA = 0x20, /**< C->S: Data chunk for file upload. */
