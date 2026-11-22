@@ -82,6 +82,7 @@ add_executable(nasfs_server
   server/src/config/config.c
   server/src/logging/log.c
   server/src/network/session.c
+  server/src/storage.c
   server/src/utils/daemon.c
   server/src/utils/pid_file.c
   server/src/utils/signal_handler.c

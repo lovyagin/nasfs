@@ -231,6 +231,16 @@ if ! grep -Eq "Negotiated KEX: (ML-KEM-512|Kyber512|ML-KEM-768|Kyber768); contro
 fi
 printf "${GREEN}%s${NC}\n" "      Negotiated suite verified in server logs."
 
+ln -s "$REMOTE_NAME" "$STORAGE_DIR/storage-link.bin"
+STORED_HASH=$(hash_file "$STORAGE_DIR/$REMOTE_NAME")
+expect_client_failure "$LOG_DIR/client_storage_link.log" "Server error:" \
+    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
+    get "storage-link.bin" "$TEST_DIR/storage-link.bin"
+grep -Fq "GET: Open failed:" "$LOG_DIR/server.log"
+test ! -e "$TEST_DIR/storage-link.bin"
+test -L "$STORAGE_DIR/storage-link.bin"
+test "$(hash_file "$STORAGE_DIR/$REMOTE_NAME")" = "$STORED_HASH"
+
 expect_client_failure "$LOG_DIR/client_missing_source.log" "Cannot open PUT source" \
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
     put "$TEST_DIR/missing-source.bin" "missing-source.bin"

@@ -22,6 +22,7 @@
 #include "crypto_engine.h"
 #include "pake.h"
 #include "protocol.h"
+#include "storage.h"
 
 /**
  * @enum session_state_t
@@ -43,6 +44,7 @@ typedef enum {
 typedef struct {
   uv_tcp_t handle;       /**< libuv TCP handle for the connection. */
   session_state_t state; /**< Current state of the session. */
+  const nasfs_storage_t* storage;
 
   /* Receive Buffer */
   uint8_t* recv_buffer; /**< Buffer for accumulating incomplete TCP frames. */

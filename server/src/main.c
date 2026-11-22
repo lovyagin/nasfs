@@ -22,6 +22,7 @@
 #include "logging/log.h"
 #include "network/session.h"
 #include "protocol.h"
+#include "storage.h"
 #include "utils/daemon.h"
 #include "utils/pid_file.h"
 #include "utils/signal_handler.h"
@@ -96,9 +97,20 @@ int main(int argc, char** argv) {
     }
   }
 
+  nasfs_storage_t storage;
+  const char* storage_dir =
+      global_config.storage_dir ? global_config.storage_dir : ".";
+  int r = nasfs_storage_init(&storage, storage_dir);
+  if (r < 0) {
+    log_all(LOG_ERROR, "Cannot open storage directory '%s': %s", storage_dir,
+            uv_strerror(r));
+    exit_code = 1;
+    goto cleanup;
+  }
+
   loop = uv_default_loop();
 
-  int r = uv_signal_init(loop, &sigint_watcher);
+  r = uv_signal_init(loop, &sigint_watcher);
   if (r == 0) r = uv_signal_start(&sigint_watcher, on_signal, SIGINT);
   if (r == 0) r = uv_signal_init(loop, &sigterm_watcher);
   if (r == 0) r = uv_signal_start(&sigterm_watcher, on_signal, SIGTERM);
@@ -109,6 +121,7 @@ int main(int argc, char** argv) {
     goto close_handles;
   }
 
+  server.data = &storage;
   struct sockaddr_in addr;
   const char* bind_addr =
       global_config.bind_address ? global_config.bind_address : "0.0.0.0";
@@ -152,6 +165,7 @@ close_handles:
     log_all(LOG_ERROR, "Event loop close failed: %s", uv_strerror(r));
     exit_code = 1;
   }
+  nasfs_storage_close(&storage);
 
 cleanup:
   free_config(&global_config);

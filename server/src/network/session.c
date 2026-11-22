@@ -480,31 +480,6 @@ static void session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
   }
 }
 
-static const char* sanitize_path(const char* path) {
-  if (!path) return "invalid_filename";
-
-  // Completely strip out any directory structure, only allowing the actual
-  // filename
-  const char* last_slash = strrchr(path, '/');
-  const char* last_backslash = strrchr(path, '\\');
-  const char* base = path;
-  if (last_slash && last_slash > base) {
-    base = last_slash + 1;
-  }
-  if (last_backslash && last_backslash > base) {
-    base = last_backslash + 1;
-  }
-
-  // If the resulting base name is empty, or contains dot-dot sequences or
-  // directory traversal, fall back to safe name
-  if (strlen(base) == 0 || strcmp(base, ".") == 0 || strcmp(base, "..") == 0 ||
-      strstr(base, "..") != NULL) {
-    return "safe_file.dat";
-  }
-
-  return base;
-}
-
 /* --- File I/O Callbacks --- */
 static void release_fs_request(nasfs_fs_ctx_t* ctx) {
   uv_fs_req_cleanup(&ctx->req);
@@ -512,9 +487,7 @@ static void release_fs_request(nasfs_fs_ctx_t* ctx) {
   free(ctx);
 }
 
-static void finish_fs_request(nasfs_fs_ctx_t* ctx) {
-  client_session_t* session = ctx->session;
-  release_fs_request(ctx);
+static void finish_file_request(client_session_t* session) {
   session->pending_fs--;
   if (session->state == SESSION_STATE_ERROR) {
     finish_session_close(session);
@@ -524,6 +497,12 @@ static void finish_fs_request(nasfs_fs_ctx_t* ctx) {
     session->state = SESSION_STATE_AUTHENTICATED;
     process_session_frames(session);
   }
+}
+
+static void finish_fs_request(nasfs_fs_ctx_t* ctx) {
+  client_session_t* session = ctx->session;
+  release_fs_request(ctx);
+  finish_file_request(session);
 }
 
 static void fs_submission_failed(nasfs_fs_ctx_t* ctx, int rc) {
@@ -545,23 +524,14 @@ static void on_put_fs_write(uv_fs_t* req) {
   finish_fs_request(ctx);
 }
 
-static void on_put_fs_open(uv_fs_t* req) {
-  nasfs_fs_ctx_t* ctx = req->data;
-  client_session_t* session = ctx->session;
-
-  if (session->state == SESSION_STATE_ERROR) {
-    if (req->result >= 0) session->active_fd = (uv_file)req->result;
-    finish_fs_request(ctx);
-    return;
-  }
-
-  if (req->result < 0) {
-    log_all(LOG_ERROR, "PUT: Open failed: %s", uv_strerror((int)req->result));
+static void on_put_fs_open(client_session_t* session, int result) {
+  if (result < 0) {
+    log_all(LOG_ERROR, "PUT: Open failed: %s", uv_strerror((int)result));
     session_send_frame(session, NASFS_CMD_ERROR, (const uint8_t*)"Open failed",
                        11, 1);
     session->state = SESSION_STATE_AUTHENTICATED;
   } else {
-    session->active_fd = (uv_file)req->result;
+    session->active_fd = (uv_file)result;
     if (session->file_encryption_enabled) {
       /* Write file header: [8 size][16 salt][1 cipher_algo][1 hash_algo] */
       uint8_t header[FILE_HEADER_SIZE];
@@ -583,7 +553,6 @@ static void on_put_fs_open(uv_fs_t* req) {
                            (const uint8_t*)"Header write failed", 19, 1);
         session->state = SESSION_STATE_AUTHENTICATED;
         close_active_file(session);
-        finish_fs_request(ctx);
         return;
       }
       session->file_offset = FILE_HEADER_SIZE;
@@ -592,7 +561,6 @@ static void on_put_fs_open(uv_fs_t* req) {
     }
     session_send_frame(session, NASFS_CMD_PUT_ACK, NULL, 0, 1);
   }
-  finish_fs_request(ctx);
 }
 
 static void on_get_fs_read(uv_fs_t* req) {
@@ -673,23 +641,14 @@ static void do_get_next_chunk(client_session_t* session) {
   session->pending_fs++;
 }
 
-static void on_get_fs_open(uv_fs_t* req) {
-  nasfs_fs_ctx_t* ctx = req->data;
-  client_session_t* session = ctx->session;
-
-  if (session->state == SESSION_STATE_ERROR) {
-    if (req->result >= 0) session->active_fd = (uv_file)req->result;
-    finish_fs_request(ctx);
-    return;
-  }
-
-  if (req->result < 0) {
-    log_all(LOG_ERROR, "GET: Open failed: %s", uv_strerror((int)req->result));
+static void on_get_fs_open(client_session_t* session, int result) {
+  if (result < 0) {
+    log_all(LOG_ERROR, "GET: Open failed: %s", uv_strerror((int)result));
     session_send_frame(session, NASFS_CMD_ERROR,
                        (const uint8_t*)"File not found", 14, 1);
     session->state = SESSION_STATE_AUTHENTICATED;
   } else {
-    session->active_fd = (uv_file)req->result;
+    session->active_fd = (uv_file)result;
     if (session->file_encryption_enabled) {
       /* Read file header: [8 size][16 salt][1 cipher_algo][1 hash_algo] */
       uint8_t file_header[FILE_HEADER_SIZE];
@@ -704,7 +663,6 @@ static void on_get_fs_open(uv_fs_t* req) {
                            (const uint8_t*)"Header read failed", 18, 1);
         session->state = SESSION_STATE_AUTHENTICATED;
         close_active_file(session);
-        finish_fs_request(ctx);
         return;
       }
       session->file_offset = FILE_HEADER_SIZE;
@@ -731,22 +689,62 @@ static void on_get_fs_open(uv_fs_t* req) {
     }
     do_get_next_chunk(session);
   }
-  finish_fs_request(ctx);
 }
 
-static void submit_file_open(client_session_t* session, const char* path,
-                             int flags, int mode, uv_fs_cb callback) {
-  nasfs_fs_ctx_t* ctx = calloc(1, sizeof(*ctx));
+typedef struct {
+  uv_work_t req;
+  client_session_t* session;
+  char name[NASFS_STORAGE_NAME_MAX + 1];
+  nasfs_storage_mode_t mode;
+  int result;
+} nasfs_open_ctx_t;
+
+static void open_storage_object(uv_work_t* req) {
+  nasfs_open_ctx_t* ctx = req->data;
+  ctx->result =
+      nasfs_storage_open_object(ctx->session->storage, ctx->name, ctx->mode);
+}
+
+static void on_storage_opened(uv_work_t* req, int status) {
+  nasfs_open_ctx_t* ctx = req->data;
+  client_session_t* session = ctx->session;
+  int result = status < 0 ? status : ctx->result;
+  if (session->state == SESSION_STATE_ERROR) {
+    if (result >= 0) session->active_fd = result;
+  } else if (ctx->mode == NASFS_STORAGE_REPLACE) {
+    on_put_fs_open(session, result);
+  } else {
+    on_get_fs_open(session, result);
+  }
+  free(ctx);
+  finish_file_request(session);
+}
+
+static void submit_file_open(client_session_t* session, const uint8_t* name,
+                             size_t length, nasfs_storage_mode_t mode) {
+  nasfs_open_ctx_t* ctx = malloc(sizeof(*ctx));
   if (!ctx) {
     session_close((uv_handle_t*)&session->handle);
     return;
   }
+  if (nasfs_storage_parse_name(name, length, ctx->name) < 0) {
+    free(ctx);
+    log_all(LOG_WARNING, "Rejected invalid storage object name.");
+    session_send_frame(session, NASFS_CMD_ERROR,
+                       (const uint8_t*)"Invalid file name",
+                       sizeof("Invalid file name") - 1, 1);
+    session->state = SESSION_STATE_AUTHENTICATED;
+    return;
+  }
   ctx->session = session;
+  ctx->mode = mode;
   ctx->req.data = ctx;
-  int rc =
-      uv_fs_open(session->handle.loop, &ctx->req, path, flags, mode, callback);
+  int rc = uv_queue_work(session->handle.loop, &ctx->req, open_storage_object,
+                         on_storage_opened);
   if (rc < 0) {
-    fs_submission_failed(ctx, rc);
+    free(ctx);
+    log_all(LOG_ERROR, "Open request submission failed: %s", uv_strerror(rc));
+    session_close((uv_handle_t*)&session->handle);
     return;
   }
   session->pending_fs++;
@@ -1050,15 +1048,9 @@ static void session_dispatch_frame(client_session_t* session,
       session->has_pending_block_meta = 0;
       session->server_block_seq = 0;
 
-      char raw[256] = {0};
-      memcpy(raw, filename_ptr, filename_len < 255 ? filename_len : 255);
-      char path[1024];
-      snprintf(path, sizeof(path), "%s/%s",
-               global_config.storage_dir ? global_config.storage_dir : ".",
-               sanitize_path(raw));
       session->state = SESSION_STATE_RECEIVING_FILE;
-      submit_file_open(session, path, O_WRONLY | O_CREAT | O_TRUNC, 0644,
-                       on_put_fs_open);
+      submit_file_open(session, filename_ptr, filename_len,
+                       NASFS_STORAGE_REPLACE);
       break;
     }
 
@@ -1207,14 +1199,8 @@ static void session_dispatch_frame(client_session_t* session,
       session->has_pending_block_meta = 0;
       session->server_block_seq = 0;
 
-      char raw[256] = {0};
-      memcpy(raw, filename_ptr, filename_len < 255 ? filename_len : 255);
-      char path[1024];
-      snprintf(path, sizeof(path), "%s/%s",
-               global_config.storage_dir ? global_config.storage_dir : ".",
-               sanitize_path(raw));
       session->state = SESSION_STATE_SENDING_FILE;
-      submit_file_open(session, path, O_RDONLY, 0, on_get_fs_open);
+      submit_file_open(session, filename_ptr, filename_len, NASFS_STORAGE_READ);
       break;
     }
     default:
@@ -1333,6 +1319,7 @@ void session_on_new_connection(uv_stream_t* server, int status) {
   }
 
   session->handle.data = session;
+  session->storage = server->data;
   if (uv_accept(server, (uv_stream_t*)&session->handle) != 0) {
     session_close((uv_handle_t*)&session->handle);
     return;
