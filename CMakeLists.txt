@@ -163,16 +163,18 @@ add_test(NAME integration_e2e COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_end
 set_tests_properties(
   integration_e2e
   PROPERTIES
+  TIMEOUT 60
   ENVIRONMENT
-    "NASFS_SERVER_BIN=$<TARGET_FILE:nasfs_server>;NASFS_CLIENT_BIN=$<TARGET_FILE:nasfs_client>;NASFS_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/tests-workspace;NASFS_STORAGE_DIR=${CMAKE_CURRENT_BINARY_DIR}/storage"
+    "NASFS_SERVER_BIN=$<TARGET_FILE:nasfs_server>;NASFS_CLIENT_BIN=$<TARGET_FILE:nasfs_client>"
 )
 
 add_test(NAME integration_encryption COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_file_encryption.sh)
 set_tests_properties(
   integration_encryption
   PROPERTIES
+  TIMEOUT 60
   ENVIRONMENT
-    "NASFS_SERVER_BIN=$<TARGET_FILE:nasfs_server>;NASFS_CLIENT_BIN=$<TARGET_FILE:nasfs_client>;NASFS_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/tests-workspace-enc;NASFS_STORAGE_DIR=${CMAKE_CURRENT_BINARY_DIR}/storage-enc"
+    "NASFS_SERVER_BIN=$<TARGET_FILE:nasfs_server>;NASFS_CLIENT_BIN=$<TARGET_FILE:nasfs_client>"
 )
 
 install(TARGETS nasfs_server nasfs_client

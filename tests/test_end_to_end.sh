@@ -16,10 +16,11 @@ export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${LD_LIBRARY_PATH:-}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_BIN="${NASFS_SERVER_BIN:-$ROOT_DIR/server/nasfs_server}"
 CLIENT_BIN="${NASFS_CLIENT_BIN:-$ROOT_DIR/client/nasfs_client}"
-TEST_ROOT="${NASFS_TEST_ROOT:-$ROOT_DIR/tests/workspace}"
-STORAGE_DIR="${NASFS_STORAGE_DIR:-$ROOT_DIR/storage}"
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/integration_helpers.sh"
+setup_integration
+
 TEST_DIR="$TEST_ROOT"
-LOG_DIR="$TEST_DIR/logs"
 CLIENT_KEY="$TEST_DIR/client_mldsa.key"
 CLIENT_KEY_44="$TEST_DIR/client_mldsa44.key"
 AUTHORIZED_KEYS="$TEST_DIR/authorized_keys"
@@ -53,14 +54,15 @@ run_client() {
 }
 
 expect_client_failure() {
-    local log_file=$1
-    shift
+    local log_file=$1 expected_error=$2
+    shift 2
 
     if run_client "$log_file" "$@"; then
         printf "${RED}%s${NC}\n" "FAIL: Client command unexpectedly succeeded."
         cat "$log_file"
         exit 1
     fi
+    grep -Fq "$expected_error" "$log_file"
 }
 
 verify_download_hash() {
@@ -103,41 +105,6 @@ try_kex_download() {
     exit 1
 }
 
-# Ensure directories exist
-mkdir -p "$STORAGE_DIR"
-mkdir -p "$LOG_DIR"
-
-printf "${YELLOW}%s${NC}\n" "=============================================="
-printf "${YELLOW}%s${NC}\n" "    NASFS End-to-End Integration Test         "
-printf "${YELLOW}%s${NC}\n" "=============================================="
-
-# 1. Pre-flight checks
-if [ ! -f "$SERVER_BIN" ] || [ ! -f "$CLIENT_BIN" ]; then
-    printf "${RED}%s${NC}\n" "Error: Binaries not found. Run 'make' first."
-    exit 1
-fi
-
-# shellcheck disable=SC2317,SC2329
-cleanup() {
-    printf "${YELLOW}%s${NC}" "Cleaning up processes and temporary files..."
-    # Kill server if it's running
-    if [ -f "$LOG_DIR/server.pid" ]; then
-        PID=$(cat "$LOG_DIR/server.pid")
-        kill "$PID" 2>/dev/null || true
-    fi
-    # Hard cleanup of any leaked instances
-    pkill -f nasfs_server 2>/dev/null || true
-
-    rm -f "$TEST_DIR"/test_file_* "$CLIENT_KEY" "$CLIENT_KEY_44" \
-        "$AUTHORIZED_KEYS" "$TEST_DIR"/authorized_keys_*
-    printf "${GREEN}%s${NC}\n" " Done."
-}
-trap cleanup EXIT
-
-# Ensure no server is already running on port 8080
-pkill -f nasfs_server 2>/dev/null || true
-sleep 1
-
 # 2. Setup Test Data
 printf "${YELLOW}%s${NC}\n" "[1/4] Preparing test data..."
 TEST_INPUT="$TEST_DIR/test_file_input.bin"
@@ -165,7 +132,7 @@ printf "${YELLOW}%s${NC}\n" "[2/4] Starting server..."
 # Create a test config
 cat <<EOF > "$TEST_DIR/test_server.conf"
 ListenAddr 127.0.0.1
-Port 8080
+Port 0
 MaxConn 10
 LogFile $LOG_DIR/server.log
 LogLevel Debug
@@ -180,24 +147,17 @@ AuthorizedKeysFile $AUTHORIZED_KEYS
 PubKeyAuthAlgorithms ML-DSA-65,ML-DSA-44
 EOF
 
-"$SERVER_BIN" "$TEST_DIR/test_server.conf" > "$LOG_DIR/server_stdout.log" 2>&1 &
-SERVER_PROC_PID=$!
-sleep 2
-
-if ! kill -0 $SERVER_PROC_PID 2>/dev/null; then
-    printf "${RED}%s${NC}\n" "FAIL: Server failed to start. Logs:"
-    cat "$LOG_DIR/server.log" 2>/dev/null || cat "$LOG_DIR/server_stdout.log"
-    exit 1
-fi
-printf "${GREEN}%s${NC}\n" "      Server is running."
+start_integration_server "$TEST_DIR/test_server.conf"
 
 # 4. Test PUT
 printf "${YELLOW}%s${NC}\n" "[3/4] Testing PUT (Upload)..."
 REMOTE_NAME="e2e_test_upload.bin"
 
-expect_client_failure "$LOG_DIR/client_bad_auth.log" \
+expect_client_failure "$LOG_DIR/client_bad_auth.log" "PQC Handshake successful" \
     "ML-KEM-512" "password" "wrong-password" "" "ML-DSA-65" \
     put "$TEST_INPUT" "bad-auth.bin"
+grep -Fq "Client authentication failed." "$LOG_DIR/server.log"
+test ! -e "$STORAGE_DIR/bad-auth.bin"
 
 if ! run_client "$LOG_DIR/client_put.log" "ML-KEM-512" "password" \
     "e2e-password" "" "ML-DSA-65" put "$TEST_INPUT" "$REMOTE_NAME"; then
@@ -241,9 +201,11 @@ fi
 verify_download_hash "$INPUT_HASH" "$TEST_DIR/test_file_both_auth.bin"
 printf "${GREEN}%s${NC}\n" "      password+publickey auth verified."
 
-expect_client_failure "$LOG_DIR/client_unauthorized_key.log" \
+expect_client_failure "$LOG_DIR/client_wrong_identity_algorithm.log" \
+    "Failed to load identity file" \
     "ML-KEM-512" "publickey" "" "$CLIENT_KEY" "ML-DSA-44" \
-    get "$REMOTE_NAME" "$TEST_DIR/test_file_unauthorized_key.bin"
+    get "$REMOTE_NAME" "$TEST_DIR/test_file_wrong_identity_algorithm.bin"
+test ! -e "$TEST_DIR/test_file_wrong_identity_algorithm.bin"
 
 if [ "$HAS_ML_DSA_44" -eq 1 ]; then
     if ! run_client "$LOG_DIR/client_mldsa44.log" "ML-KEM-512" "publickey" \

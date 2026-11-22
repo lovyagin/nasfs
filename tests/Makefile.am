@@ -2,11 +2,9 @@ check_PROGRAMS = test_handshake test_config test_auth test_encryption
 TESTS = $(check_PROGRAMS) test_end_to_end.sh test_file_encryption.sh
 TESTS_ENVIRONMENT = \
 	NASFS_SERVER_BIN="$(top_builddir)/server/nasfs_server" \
-	NASFS_CLIENT_BIN="$(top_builddir)/client/nasfs_client" \
-	NASFS_TEST_ROOT="$(abs_builddir)/workspace" \
-	NASFS_STORAGE_DIR="$(abs_builddir)/storage"
+	NASFS_CLIENT_BIN="$(top_builddir)/client/nasfs_client"
 
-EXTRA_DIST = test_end_to_end.sh test_file_encryption.sh
+EXTRA_DIST = test_end_to_end.sh test_file_encryption.sh integration_helpers.sh
 
 AM_CFLAGS = -I$(top_srcdir)/common/include -I$(top_srcdir)/server/include
 
@@ -22,7 +20,3 @@ test_auth_LDADD = $(top_builddir)/common/libnasfs_common.a $(SODIUM_LIBS) $(OQS_
 
 test_encryption_SOURCES = test_encryption.c
 test_encryption_LDADD = $(top_builddir)/common/libnasfs_common.a $(SODIUM_LIBS) $(OQS_LIBS)
-
-# Clean up temporary test artifacts
-clean-local:
-	rm -rf workspace

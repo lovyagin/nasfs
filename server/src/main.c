@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
   struct sockaddr_in addr;
   const char* bind_addr =
       global_config.bind_address ? global_config.bind_address : "0.0.0.0";
-  int port = global_config.port > 0 ? global_config.port : 8080;
+  int port = global_config.port >= 0 ? global_config.port : 8080;
 
   uv_ip4_addr(bind_addr, port, &addr);
 
@@ -112,15 +112,26 @@ int main(int argc, char** argv) {
   if (r) {
     log_all(LOG_ERROR, "Listen error: %s", uv_strerror(r));
     exit_code = 1;
-    goto cleanup;
+    goto close_handles;
   }
 
-  log_all(LOG_INFO, "nasfs_server listening on %s:%d...", bind_addr, port);
+  struct sockaddr_in bound_addr;
+  int bound_addr_len = sizeof(bound_addr);
+  r = uv_tcp_getsockname(&server, (struct sockaddr*)&bound_addr,
+                         &bound_addr_len);
+  if (r) {
+    log_all(LOG_ERROR, "Cannot determine listening port: %s", uv_strerror(r));
+    exit_code = 1;
+    goto close_handles;
+  }
+  log_all(LOG_INFO, "nasfs_server listening on %s:%d...", bind_addr,
+          ntohs(bound_addr.sin_port));
 
   uv_run(loop, UV_RUN_DEFAULT);
 
   log_all(LOG_INFO, "NASFS server shutting down cleanly...");
 
+close_handles:
   uv_close((uv_handle_t*)&sigint_watcher, NULL);
   uv_close((uv_handle_t*)&sigterm_watcher, NULL);
   uv_close((uv_handle_t*)&server, NULL);

@@ -12,9 +12,9 @@ NC='\033[0m'
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_BIN="${NASFS_SERVER_BIN:-$ROOT_DIR/build/nasfs_server}"
 CLIENT_BIN="${NASFS_CLIENT_BIN:-$ROOT_DIR/build/nasfs_client}"
-TEST_ROOT="${NASFS_TEST_ROOT:-$ROOT_DIR/tests/workspace_enc}"
-STORAGE_DIR="${NASFS_STORAGE_DIR:-$ROOT_DIR/tests/storage_enc}"
-LOG_DIR="$TEST_ROOT/logs"
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/integration_helpers.sh"
+setup_integration
 
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -23,25 +23,6 @@ hash_file() {
         shasum -a 256 "$1" | awk '{print $1}'
     fi
 }
-
-cleanup() {
-    printf "${YELLOW}%s${NC}\n" "Cleaning up processes and files..."
-    if [ -f "$LOG_DIR/server.pid" ]; then
-        PID=$(cat "$LOG_DIR/server.pid")
-        kill "$PID" 2>/dev/null || true
-    fi
-    pkill -f nasfs_server 2>/dev/null || true
-    rm -rf "$TEST_ROOT" "$STORAGE_DIR"
-    printf "${GREEN}%s${NC}\n" "Cleanup complete."
-}
-trap cleanup EXIT
-
-# Clear any lingering servers
-pkill -f nasfs_server 2>/dev/null || true
-sleep 1
-
-mkdir -p "$STORAGE_DIR"
-mkdir -p "$LOG_DIR"
 
 # Generate 512KB of test data
 TEST_INPUT="$TEST_ROOT/plaintext.bin"
@@ -52,7 +33,7 @@ printf "Created 512KB test file. Plaintext hash: %s\n" "$INPUT_HASH"
 # Configure server
 cat <<EOF > "$TEST_ROOT/server.conf"
 ListenAddr 127.0.0.1
-Port 8081
+Port 0
 MaxConn 10
 LogFile $LOG_DIR/server.log
 LogLevel Debug
@@ -65,26 +46,10 @@ AuthMethods password
 AuthPassword super-secret
 EOF
 
-# Modify SERVER_IP/SERVER_PORT in CLIENT_BIN is not needed if we run on localhost:8080.
-# Wait! In client/src/main.c, SERVER_PORT is hardcoded to 8080!
-# Ah! Let's make sure our server port in the config is 8080!
-sed -i.bak 's/Port 8081/Port 8080/g' "$TEST_ROOT/server.conf" || sed -i '' 's/Port 8081/Port 8080/g' "$TEST_ROOT/server.conf"
-
-# Start server
-printf "Starting server...\n"
-"$SERVER_BIN" "$TEST_ROOT/server.conf" > "$LOG_DIR/server_stdout.log" 2>&1 &
-SERVER_PID=$!
-sleep 2
-
-if ! kill -0 $SERVER_PID 2>/dev/null; then
-    printf "${RED}Server failed to start!${NC}\n"
-    cat "$LOG_DIR/server_stdout.log"
-    exit 1
-fi
-printf "${GREEN}Server started successfully.${NC}\n"
+start_integration_server "$TEST_ROOT/server.conf"
 
 # Test 1: Upload with encryption enabled
-printf "${YELLOW}1. Uploading file with encryption enabled...${NC}\n"
+printf '%b%s%b\n' "$YELLOW" "1. Uploading file with encryption enabled..." "$NC"
 export NASFS_ENCRYPTION_KEY="my-secret-encryption-password-123!"
 
 if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
@@ -94,7 +59,7 @@ if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
     NASFS_AUTH_PASSWORD="super-secret" \
     NASFS_ENCRYPTION_KEY="my-secret-encryption-password-123!" \
     "$CLIENT_BIN" put "$TEST_INPUT" "encrypted_remote.bin" > "$LOG_DIR/client_put.log" 2>&1; then
-  printf "${RED}FAIL: Client PUT command failed.${NC}\n"
+  printf '%b%s%b\n' "$RED" "FAIL: Client PUT command failed." "$NC"
   cat "$LOG_DIR/client_put.log"
   exit 1
 fi
@@ -102,7 +67,7 @@ fi
 # Check if file exists in server storage
 SERVER_STORED_FILE="$STORAGE_DIR/encrypted_remote.bin"
 if [ ! -f "$SERVER_STORED_FILE" ]; then
-    printf "${RED}FAIL: Stored file not found on server!${NC}\n"
+    printf '%b%s%b\n' "$RED" "FAIL: Stored file not found on server!" "$NC"
     cat "$LOG_DIR/client_put.log"
     exit 1
 fi
@@ -111,13 +76,13 @@ STORED_HASH=$(hash_file "$SERVER_STORED_FILE")
 printf "Server stored file hash: %s\n" "$STORED_HASH"
 
 if [ "$INPUT_HASH" == "$STORED_HASH" ]; then
-    printf "${RED}FAIL: Stored file is NOT encrypted! It matches the plaintext hash.${NC}\n"
+    printf '%b%s%b\n' "$RED" "FAIL: Stored file is NOT encrypted! It matches the plaintext hash." "$NC"
     exit 1
 fi
-printf "${GREEN}Success: Stored file is encrypted and does not match plaintext hash.${NC}\n"
+printf '%b%s%b\n' "$GREEN" "Success: Stored file is encrypted and does not match plaintext hash." "$NC"
 
 # Test 2: Download and decrypt with the correct key
-printf "${YELLOW}2. Downloading and decrypting file with the CORRECT key...${NC}\n"
+printf '%b%s%b\n' "$YELLOW" "2. Downloading and decrypting file with the CORRECT key..." "$NC"
 TEST_OUTPUT_CORRECT="$TEST_ROOT/decrypted_correct.bin"
 
 if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
@@ -127,7 +92,7 @@ if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
     NASFS_AUTH_PASSWORD="super-secret" \
     NASFS_ENCRYPTION_KEY="my-secret-encryption-password-123!" \
     "$CLIENT_BIN" get "encrypted_remote.bin" "$TEST_OUTPUT_CORRECT" > "$LOG_DIR/client_get_correct.log" 2>&1; then
-  printf "${RED}FAIL: Client GET (correct key) command failed.${NC}\n"
+  printf '%b%s%b\n' "$RED" "FAIL: Client GET (correct key) command failed." "$NC"
   cat "$LOG_DIR/client_get_correct.log"
   exit 1
 fi
@@ -136,13 +101,13 @@ CORRECT_HASH=$(hash_file "$TEST_OUTPUT_CORRECT")
 printf "Decrypted file hash: %s\n" "$CORRECT_HASH"
 
 if [ "$INPUT_HASH" != "$CORRECT_HASH" ]; then
-    printf "${RED}FAIL: Decrypted file does not match original file!${NC}\n"
+    printf '%b%s%b\n' "$RED" "FAIL: Decrypted file does not match original file!" "$NC"
     exit 1
 fi
-printf "${GREEN}Success: Decrypted file matches the original file exactly!${NC}\n"
+printf '%b%s%b\n' "$GREEN" "Success: Decrypted file matches the original file exactly!" "$NC"
 
 # Test 3: Download and decrypt with an INCORRECT key
-printf "${YELLOW}3. Downloading and decrypting with an INCORRECT key (should fail)...${NC}\n"
+printf '%b%s%b\n' "$YELLOW" "3. Downloading and decrypting with an INCORRECT key (should fail)..." "$NC"
 TEST_OUTPUT_INCORRECT="$TEST_ROOT/decrypted_incorrect.bin"
 
 if env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
@@ -152,12 +117,16 @@ if env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
     NASFS_AUTH_PASSWORD="super-secret" \
     NASFS_ENCRYPTION_KEY="wrong-password-here!!!" \
     "$CLIENT_BIN" get "encrypted_remote.bin" "$TEST_OUTPUT_INCORRECT" > "$LOG_DIR/client_get_incorrect.log" 2>&1; then
-    printf "${RED}FAIL: Client get command unexpectedly succeeded with a wrong key!${NC}\n"
+    printf '%b%s%b\n' "$RED" "FAIL: Client get command unexpectedly succeeded with a wrong key!" "$NC"
     exit 1
 fi
 
-printf "${GREEN}Success: Decryption failed as expected when using an incorrect key.${NC}\n"
+grep -Fq "Decryption failed. Wrong key or corrupted data" "$LOG_DIR/client_get_incorrect.log"
+test ! -s "$TEST_OUTPUT_INCORRECT"
+test "$(hash_file "$SERVER_STORED_FILE")" = "$STORED_HASH"
 
-printf "${GREEN}==============================================${NC}\n"
-printf "${GREEN}    ALL FILE ENCRYPTION TESTS PASSED!         ${NC}\n"
-printf "${GREEN}==============================================${NC}\n"
+printf '%b%s%b\n' "$GREEN" "Success: Decryption failed as expected when using an incorrect key." "$NC"
+
+printf '%b%s%b\n' "$GREEN" "==============================================" "$NC"
+printf '%b%s%b\n' "$GREEN" "    ALL FILE ENCRYPTION TESTS PASSED!         " "$NC"
+printf '%b%s%b\n' "$GREEN" "==============================================" "$NC"
