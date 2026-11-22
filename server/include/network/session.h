@@ -51,7 +51,6 @@ typedef struct {
 
   /* File Transfer State */
   uv_file active_fd;    /**< File descriptor for active transfers (PUT/GET). */
-  uv_fs_t fs_req;       /**< Filesystem request handle for async operations. */
   uint64_t file_offset; /**< Current offset in the active file. */
 
   /* Crypto State */
@@ -91,13 +90,10 @@ typedef struct {
   uint8_t file_cipher_algo; /**< nasfs_cipher_algo_t for this file's blocks. */
   uint8_t file_hash_algo;   /**< nasfs_hash_algo_t for block integrity. */
 
-  /* Async write tracking — prevents closing the fd before queued writes land.
-   */
-  int pending_writes;     /**< Number of outstanding async uv_fs_write calls. */
-  int close_after_writes; /**< Set by PUT_DONE when writes are still in flight.
-                           */
-  int pending_close;      /**< Set by close callback if writes were still in
-                               flight; the last write callback frees the session. */
+  size_t
+      pending_fs;   /**< File requests whose callbacks still own the session. */
+  int put_draining; /**< PUT_DONE received while writes are outstanding. */
+  int handle_closed; /**< TCP close callback has run. */
 
   /* PAKE (SPAKE2) auth state — valid only during pake auth handshake. */
   uint8_t pake_y[32]; /**< Server ephemeral scalar y. */

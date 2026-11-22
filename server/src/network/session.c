@@ -64,6 +64,7 @@ static void session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
                                const uint8_t* payload, size_t payload_len,
                                int encrypt);
 static void do_get_next_chunk(client_session_t* session);
+static void process_session_frames(client_session_t* session);
 static void session_dispatch_frame(client_session_t* session,
                                    nasfs_frame_t* frame);
 static int csv_list_contains(const char* csv_list, const char* candidate);
@@ -403,41 +404,38 @@ static void session_free(client_session_t* session) {
   log_all(LOG_DEBUG, "Session resources deallocated.");
 }
 
-static void on_session_handle_closed(uv_handle_t* handle) {
-  client_session_t* session = (client_session_t*)handle->data;
-  if (!session) return;
-  if (session->pending_writes > 0) {
-    /* Write callbacks still hold a pointer to this session; they will free it
-     * once the last one fires (via pending_close). */
-    session->pending_close = 1;
-    return;
+static void close_active_file(client_session_t* session) {
+  if (session->active_fd == -1) return;
+
+  uv_fs_t req;
+  int rc = uv_fs_close(session->handle.loop, &req, session->active_fd, NULL);
+  uv_fs_req_cleanup(&req);
+  session->active_fd = -1;
+  if (rc < 0) {
+    log_all(LOG_ERROR, "File close failed: %s", uv_strerror(rc));
   }
-  session_free(session);
+}
+
+static void finish_session_close(client_session_t* session) {
+  if (session->pending_fs != 0) return;
+  close_active_file(session);
+  if (session->handle_closed) session_free(session);
+}
+
+static void on_session_handle_closed(uv_handle_t* handle) {
+  client_session_t* session = handle->data;
+  session->handle_closed = 1;
+  finish_session_close(session);
 }
 
 void session_close(uv_handle_t* handle) {
-  client_session_t* session = (client_session_t*)handle->data;
+  client_session_t* session = handle->data;
   if (!session || session->state == SESSION_STATE_ERROR) return;
 
   session->state = SESSION_STATE_ERROR;
   log_all(LOG_INFO, "Closing session for client.");
-
-  if (session->active_fd != -1) {
-    if (session->pending_writes > 0) {
-      /* Async writes still queued; let on_put_fs_write close the fd when done.
-       */
-      session->close_after_writes = 1;
-    } else {
-      uv_fs_t close_req;
-      uv_fs_close(handle->loop, &close_req, session->active_fd, NULL);
-      uv_fs_req_cleanup(&close_req);
-      session->active_fd = -1;
-    }
-  }
-
-  if (!uv_is_closing(handle)) {
-    uv_close(handle, on_session_handle_closed);
-  }
+  uv_close(handle, on_session_handle_closed);
+  finish_session_close(session);
 }
 
 /* --- Protocol & Crypto Implementation --- */
@@ -508,37 +506,55 @@ static const char* sanitize_path(const char* path) {
 }
 
 /* --- File I/O Callbacks --- */
-static void on_put_fs_write(uv_fs_t* req) {
-  nasfs_fs_ctx_t* ctx = (nasfs_fs_ctx_t*)req->data;
-  client_session_t* session = ctx->session;
-  if (req->result < 0)
-    log_all(LOG_ERROR, "PUT: Write error: %s", uv_strerror((int)req->result));
-  if (ctx->buf.base) free(ctx->buf.base);
-  uv_fs_req_cleanup(req);
+static void release_fs_request(nasfs_fs_ctx_t* ctx) {
+  uv_fs_req_cleanup(&ctx->req);
+  free(ctx->buf.base);
   free(ctx);
+}
 
-  if (session->pending_writes > 0) session->pending_writes--;
-
-  if (session->pending_writes == 0) {
-    /* If PUT_DONE arrived before this write completed, close the file now. */
-    if (session->close_after_writes) {
-      session->close_after_writes = 0;
-      if (session->active_fd != -1) {
-        uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd,
-                    NULL);
-        session->active_fd = -1;
-      }
-    }
-    /* If the TCP handle closed while writes were in flight, free the session.
-     */
-    if (session->pending_close) {
-      session_free(session);
-    }
+static void finish_fs_request(nasfs_fs_ctx_t* ctx) {
+  client_session_t* session = ctx->session;
+  release_fs_request(ctx);
+  session->pending_fs--;
+  if (session->state == SESSION_STATE_ERROR) {
+    finish_session_close(session);
+  } else if (session->put_draining && session->pending_fs == 0) {
+    close_active_file(session);
+    session->put_draining = 0;
+    session->state = SESSION_STATE_AUTHENTICATED;
+    process_session_frames(session);
   }
 }
 
+static void fs_submission_failed(nasfs_fs_ctx_t* ctx, int rc) {
+  client_session_t* session = ctx->session;
+  log_all(LOG_ERROR, "File request submission failed: %s", uv_strerror(rc));
+  release_fs_request(ctx);
+  session_close((uv_handle_t*)&session->handle);
+}
+
+static void on_put_fs_write(uv_fs_t* req) {
+  nasfs_fs_ctx_t* ctx = req->data;
+  client_session_t* session = ctx->session;
+  if (session->state != SESSION_STATE_ERROR &&
+      (req->result < 0 || (size_t)req->result != ctx->buf.len)) {
+    log_all(LOG_ERROR, "PUT: Write failed: %s",
+            req->result < 0 ? uv_strerror((int)req->result) : "short write");
+    session_close((uv_handle_t*)&session->handle);
+  }
+  finish_fs_request(ctx);
+}
+
 static void on_put_fs_open(uv_fs_t* req) {
-  client_session_t* session = (client_session_t*)req->data;
+  nasfs_fs_ctx_t* ctx = req->data;
+  client_session_t* session = ctx->session;
+
+  if (session->state == SESSION_STATE_ERROR) {
+    if (req->result >= 0) session->active_fd = (uv_file)req->result;
+    finish_fs_request(ctx);
+    return;
+  }
+
   if (req->result < 0) {
     log_all(LOG_ERROR, "PUT: Open failed: %s", uv_strerror((int)req->result));
     session_send_frame(session, NASFS_CMD_ERROR, (const uint8_t*)"Open failed",
@@ -561,15 +577,13 @@ static void on_put_fs_open(uv_fs_t* req) {
       int rc = uv_fs_write(session->handle.loop, &write_req, session->active_fd,
                            &buf, 1, 0, NULL);
       uv_fs_req_cleanup(&write_req);
-      if (rc < 0) {
-        log_all(LOG_ERROR, "PUT: Header write failed: %s", uv_strerror(rc));
+      if (rc != (int)sizeof(header)) {
+        log_all(LOG_ERROR, "PUT: Header write failed: wrote %d bytes", rc);
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Header write failed", 19, 1);
         session->state = SESSION_STATE_AUTHENTICATED;
-        uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd,
-                    NULL);
-        session->active_fd = -1;
-        uv_fs_req_cleanup(req);
+        close_active_file(session);
+        finish_fs_request(ctx);
         return;
       }
       session->file_offset = FILE_HEADER_SIZE;
@@ -578,25 +592,28 @@ static void on_put_fs_open(uv_fs_t* req) {
     }
     session_send_frame(session, NASFS_CMD_PUT_ACK, NULL, 0, 1);
   }
-  uv_fs_req_cleanup(req);
+  finish_fs_request(ctx);
 }
 
 static void on_get_fs_read(uv_fs_t* req) {
   nasfs_fs_ctx_t* ctx = (nasfs_fs_ctx_t*)req->data;
   client_session_t* session = ctx->session;
 
+  if (session->state == SESSION_STATE_ERROR) {
+    finish_fs_request(ctx);
+    return;
+  }
+
   if (req->result < 0) {
     log_all(LOG_ERROR, "GET: Read failed: %s", uv_strerror((int)req->result));
     session_send_frame(session, NASFS_CMD_ERROR, (const uint8_t*)"Read failed",
                        11, 1);
+    close_active_file(session);
     session->state = SESSION_STATE_AUTHENTICATED;
   } else if (req->result == 0) {  // EOF
     session_send_frame(session, NASFS_CMD_GET_DONE, NULL, 0, 1);
     session->state = SESSION_STATE_AUTHENTICATED;
-    if (session->active_fd != -1) {
-      uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd, NULL);
-      session->active_fd = -1;
-    }
+    close_active_file(session);
   } else {
     size_t bytes = req->result;
     session->file_offset += bytes;
@@ -613,9 +630,7 @@ static void on_get_fs_read(uv_fs_t* req) {
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Hash calculation failed", 23, 1);
         session_close((uv_handle_t*)&session->handle);
-        if (ctx->buf.base) free(ctx->buf.base);
-        uv_fs_req_cleanup(req);
-        free(ctx);
+        finish_fs_request(ctx);
         return;
       }
       session_send_frame(session, NASFS_CMD_GET_BLOCK_META,
@@ -626,32 +641,48 @@ static void on_get_fs_read(uv_fs_t* req) {
                        bytes, 0);
   }
 
-  if (ctx->buf.base) free(ctx->buf.base);
-  uv_fs_req_cleanup(req);
-  free(ctx);
+  finish_fs_request(ctx);
 }
 
 static void do_get_next_chunk(client_session_t* session) {
   if (session->state != SESSION_STATE_SENDING_FILE || session->active_fd == -1)
     return;
   nasfs_fs_ctx_t* ctx = malloc(sizeof(nasfs_fs_ctx_t));
-  if (!ctx) return;
+  if (!ctx) {
+    session_close((uv_handle_t*)&session->handle);
+    return;
+  }
   size_t chunk_size = IO_CHUNK_SIZE;
   if (session->file_encryption_enabled) {
     chunk_size = IO_CHUNK_SIZE + NASFS_CIPHER_OVERHEAD;
   }
   ctx->buf = uv_buf_init(malloc(chunk_size), chunk_size);
+  if (!ctx->buf.base) {
+    free(ctx);
+    session_close((uv_handle_t*)&session->handle);
+    return;
+  }
   ctx->session = session;
   ctx->req.data = ctx;
-  if (uv_fs_read(session->handle.loop, &ctx->req, session->active_fd, &ctx->buf,
-                 1, session->file_offset, on_get_fs_read) < 0) {
-    free(ctx->buf.base);
-    free(ctx);
+  int rc = uv_fs_read(session->handle.loop, &ctx->req, session->active_fd,
+                      &ctx->buf, 1, session->file_offset, on_get_fs_read);
+  if (rc < 0) {
+    fs_submission_failed(ctx, rc);
+    return;
   }
+  session->pending_fs++;
 }
 
 static void on_get_fs_open(uv_fs_t* req) {
-  client_session_t* session = (client_session_t*)req->data;
+  nasfs_fs_ctx_t* ctx = req->data;
+  client_session_t* session = ctx->session;
+
+  if (session->state == SESSION_STATE_ERROR) {
+    if (req->result >= 0) session->active_fd = (uv_file)req->result;
+    finish_fs_request(ctx);
+    return;
+  }
+
   if (req->result < 0) {
     log_all(LOG_ERROR, "GET: Open failed: %s", uv_strerror((int)req->result));
     session_send_frame(session, NASFS_CMD_ERROR,
@@ -672,10 +703,8 @@ static void on_get_fs_open(uv_fs_t* req) {
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Header read failed", 18, 1);
         session->state = SESSION_STATE_AUTHENTICATED;
-        uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd,
-                    NULL);
-        session->active_fd = -1;
-        uv_fs_req_cleanup(req);
+        close_active_file(session);
+        finish_fs_request(ctx);
         return;
       }
       session->file_offset = FILE_HEADER_SIZE;
@@ -702,7 +731,25 @@ static void on_get_fs_open(uv_fs_t* req) {
     }
     do_get_next_chunk(session);
   }
-  uv_fs_req_cleanup(req);
+  finish_fs_request(ctx);
+}
+
+static void submit_file_open(client_session_t* session, const char* path,
+                             int flags, int mode, uv_fs_cb callback) {
+  nasfs_fs_ctx_t* ctx = calloc(1, sizeof(*ctx));
+  if (!ctx) {
+    session_close((uv_handle_t*)&session->handle);
+    return;
+  }
+  ctx->session = session;
+  ctx->req.data = ctx;
+  int rc =
+      uv_fs_open(session->handle.loop, &ctx->req, path, flags, mode, callback);
+  if (rc < 0) {
+    fs_submission_failed(ctx, rc);
+    return;
+  }
+  session->pending_fs++;
 }
 
 /* --- Main Dispatcher & Network Callbacks --- */
@@ -917,6 +964,11 @@ static void session_dispatch_frame(client_session_t* session,
     }
 
     case NASFS_CMD_AUTH: {
+      if (session->state != SESSION_STATE_AUTHENTICATED) {
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+
       nasfs_auth_payload_t auth = {0};
       if (nasfs_auth_unpack(plain_frame.payload, plain_frame.payload_len,
                             &auth) != 0 ||
@@ -942,6 +994,10 @@ static void session_dispatch_frame(client_session_t* session,
       if (!session->is_authenticated) {
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Authentication required", 23, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+      if (session->state != SESSION_STATE_AUTHENTICATED) {
         session_close((uv_handle_t*)&session->handle);
         break;
       }
@@ -1001,9 +1057,8 @@ static void session_dispatch_frame(client_session_t* session,
                global_config.storage_dir ? global_config.storage_dir : ".",
                sanitize_path(raw));
       session->state = SESSION_STATE_RECEIVING_FILE;
-      session->fs_req.data = session;
-      uv_fs_open(session->handle.loop, &session->fs_req, path,
-                 O_WRONLY | O_CREAT | O_TRUNC, 0644, on_put_fs_open);
+      submit_file_open(session, path, O_WRONLY | O_CREAT | O_TRUNC, 0644,
+                       on_put_fs_open);
       break;
     }
 
@@ -1087,42 +1142,44 @@ static void session_dispatch_frame(client_session_t* session,
           session->server_block_seq++;
         }
 
-        nasfs_fs_ctx_t* ctx = malloc(sizeof(nasfs_fs_ctx_t));
-        if (ctx) {
-          ctx->buf = uv_buf_init(malloc(plain_frame.payload_len),
-                                 plain_frame.payload_len);
-          if (!ctx->buf.base) {
-            free(ctx);
-            session_close((uv_handle_t*)&session->handle);
-            break;
-          }
-          memcpy(ctx->buf.base, plain_frame.payload, plain_frame.payload_len);
-          ctx->req.data = ctx;
-          ctx->session = session;
-          session->pending_writes++;
-          uv_fs_write(session->handle.loop, &ctx->req, session->active_fd,
-                      &ctx->buf, 1, (int64_t)session->file_offset,
-                      on_put_fs_write);
-          session->file_offset += plain_frame.payload_len;
+        nasfs_fs_ctx_t* ctx = malloc(sizeof(*ctx));
+        if (!ctx) {
+          session_close((uv_handle_t*)&session->handle);
+          break;
         }
+        ctx->buf = uv_buf_init(malloc(plain_frame.payload_len),
+                               plain_frame.payload_len);
+        if (!ctx->buf.base) {
+          free(ctx);
+          session_close((uv_handle_t*)&session->handle);
+          break;
+        }
+        memcpy(ctx->buf.base, plain_frame.payload, plain_frame.payload_len);
+        ctx->req.data = ctx;
+        ctx->session = session;
+        int rc = uv_fs_write(session->handle.loop, &ctx->req,
+                             session->active_fd, &ctx->buf, 1,
+                             (int64_t)session->file_offset, on_put_fs_write);
+        if (rc < 0) {
+          fs_submission_failed(ctx, rc);
+          break;
+        }
+        session->pending_fs++;
+        session->file_offset += plain_frame.payload_len;
       }
       break;
     }
 
     case NASFS_CMD_PUT_DONE:
-      if (session->is_authenticated &&
-          session->state == SESSION_STATE_RECEIVING_FILE) {
+      if (session->state == SESSION_STATE_RECEIVING_FILE &&
+          session->active_fd != -1) {
         log_all(LOG_INFO, "Upload complete.");
-        if (session->pending_writes > 0) {
-          /* Async writes still in flight; let the last callback close the fd.
-           */
-          session->close_after_writes = 1;
-        } else if (session->active_fd != -1) {
-          uv_fs_close(session->handle.loop, &(uv_fs_t){}, session->active_fd,
-                      NULL);
-          session->active_fd = -1;
+        if (session->pending_fs != 0) {
+          session->put_draining = 1;
+        } else {
+          close_active_file(session);
+          session->state = SESSION_STATE_AUTHENTICATED;
         }
-        session->state = SESSION_STATE_AUTHENTICATED;
       }
       break;
 
@@ -1130,6 +1187,10 @@ static void session_dispatch_frame(client_session_t* session,
       if (!session->is_authenticated) {
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Authentication required", 23, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+      if (session->state != SESSION_STATE_AUTHENTICATED) {
         session_close((uv_handle_t*)&session->handle);
         break;
       }
@@ -1153,9 +1214,7 @@ static void session_dispatch_frame(client_session_t* session,
                global_config.storage_dir ? global_config.storage_dir : ".",
                sanitize_path(raw));
       session->state = SESSION_STATE_SENDING_FILE;
-      session->fs_req.data = session;
-      uv_fs_open(session->handle.loop, &session->fs_req, path, O_RDONLY, 0,
-                 on_get_fs_open);
+      submit_file_open(session, path, O_RDONLY, 0, on_get_fs_open);
       break;
     }
     default:
@@ -1168,10 +1227,11 @@ static void session_dispatch_frame(client_session_t* session,
 static void on_socket_write_done(uv_write_t* req, int status) {
   nasfs_write_ctx_t* ctx = (nasfs_write_ctx_t*)req;
   client_session_t* session = (client_session_t*)req->handle->data;
-  if (status < 0)
+  if (status < 0) {
     log_all(LOG_ERROR, "Socket write failed: %s", uv_strerror(status));
-  else if (session && session->state == SESSION_STATE_SENDING_FILE &&
-           ctx->type == NASFS_CMD_GET_DATA) {
+    session_close((uv_handle_t*)&session->handle);
+  } else if (session && session->state == SESSION_STATE_SENDING_FILE &&
+             ctx->type == NASFS_CMD_GET_DATA) {
     do_get_next_chunk(session);
   }
   if (ctx->buf.base) free(ctx->buf.base);
@@ -1210,37 +1270,34 @@ static void session_alloc_buffer(uv_handle_t* handle, size_t suggested_size,
   buf->len = session->recv_capacity - session->recv_length;
 }
 
+static void process_session_frames(client_session_t* session) {
+  /* Keep reading for EOF but hold the next command until PUT releases its fd.
+   */
+  while (session->recv_length > 0 && !session->put_draining) {
+    nasfs_frame_t frame;
+    int consumed = protocol_parse_frame(session->recv_buffer,
+                                        session->recv_length, &frame);
+    if (consumed <= 0) {
+      if (consumed < 0) session_close((uv_handle_t*)&session->handle);
+      return;
+    }
+    session_dispatch_frame(session, &frame);
+    if (session->state == SESSION_STATE_ERROR) return;
+    memmove(session->recv_buffer, session->recv_buffer + consumed,
+            session->recv_length - (size_t)consumed);
+    session->recv_length -= (size_t)consumed;
+  }
+}
+
 static void session_on_read(uv_stream_t* stream, ssize_t nread,
                             const uv_buf_t* buf) {
-  client_session_t* session = (client_session_t*)stream->data;
+  client_session_t* session = stream->data;
   (void)buf;
 
-  if (!session) {
-    return;
-  }
-
+  if (session->state == SESSION_STATE_ERROR) return;
   if (nread > 0) {
     session->recv_length += (size_t)nread;
-
-    while (session->recv_length > 0) {
-      nasfs_frame_t frame;
-      int consumed = protocol_parse_frame(session->recv_buffer,
-                                          session->recv_length, &frame);
-      if (consumed > 0) {
-        session_dispatch_frame(session, &frame);
-        if (session->state == SESSION_STATE_ERROR) {
-          return;
-        }
-        memmove(session->recv_buffer, session->recv_buffer + consumed,
-                session->recv_length - (size_t)consumed);
-        session->recv_length -= (size_t)consumed;
-      } else {
-        if (consumed < 0) {
-          session_close((uv_handle_t*)&session->handle);
-        }
-        break;
-      }
-    }
+    process_session_frames(session);
   } else if (nread < 0) {
     if (nread != UV_EOF) {
       log_all(LOG_ERROR, "Read error: %s", uv_strerror((int)nread));
@@ -1265,9 +1322,6 @@ void session_on_new_connection(uv_stream_t* server, int status) {
 
   session->state = SESSION_STATE_NEW;
   session->active_fd = -1;
-  session->pending_writes = 0;
-  session->close_after_writes = 0;
-  session->pending_close = 0;
   session->pake_hello_received = 0;
   memset(session->pake_y, 0, sizeof(session->pake_y));
   memset(session->pake_X, 0, sizeof(session->pake_X));
@@ -1280,7 +1334,7 @@ void session_on_new_connection(uv_stream_t* server, int status) {
 
   session->handle.data = session;
   if (uv_accept(server, (uv_stream_t*)&session->handle) != 0) {
-    uv_close((uv_handle_t*)&session->handle, on_session_handle_closed);
+    session_close((uv_handle_t*)&session->handle);
     return;
   }
 

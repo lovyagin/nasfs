@@ -42,6 +42,16 @@ void on_signal(uv_signal_t* watcher, int signum) {
   uv_stop(watcher->loop);
 }
 
+static void close_server_handle(uv_handle_t* handle, void* arg) {
+  (void)arg;
+  if (uv_is_closing(handle)) return;
+  if (handle->type == UV_TCP && handle != (uv_handle_t*)&server) {
+    session_close(handle);
+  } else {
+    uv_close(handle, NULL);
+  }
+}
+
 /**
  * @brief The main execution loop of the NASFS server.
  *
@@ -88,26 +98,29 @@ int main(int argc, char** argv) {
 
   loop = uv_default_loop();
 
-  uv_signal_init(loop, &sigint_watcher);
-  uv_signal_start(&sigint_watcher, on_signal, SIGINT);
-
-  uv_signal_init(loop, &sigterm_watcher);
-  uv_signal_start(&sigterm_watcher, on_signal, SIGTERM);
-
-  uv_tcp_init(loop, &server);
+  int r = uv_signal_init(loop, &sigint_watcher);
+  if (r == 0) r = uv_signal_start(&sigint_watcher, on_signal, SIGINT);
+  if (r == 0) r = uv_signal_init(loop, &sigterm_watcher);
+  if (r == 0) r = uv_signal_start(&sigterm_watcher, on_signal, SIGTERM);
+  if (r == 0) r = uv_tcp_init(loop, &server);
+  if (r < 0) {
+    log_all(LOG_ERROR, "Event loop setup failed: %s", uv_strerror(r));
+    exit_code = 1;
+    goto close_handles;
+  }
 
   struct sockaddr_in addr;
   const char* bind_addr =
       global_config.bind_address ? global_config.bind_address : "0.0.0.0";
   int port = global_config.port >= 0 ? global_config.port : 8080;
 
-  uv_ip4_addr(bind_addr, port, &addr);
-
-  uv_tcp_bind(&server, (const struct sockaddr*)&addr, 0);
-
   int max_conn =
       global_config.max_connections > 0 ? global_config.max_connections : 128;
-  int r = uv_listen((uv_stream_t*)&server, max_conn, session_on_new_connection);
+  r = uv_ip4_addr(bind_addr, port, &addr);
+  if (r == 0) r = uv_tcp_bind(&server, (const struct sockaddr*)&addr, 0);
+  if (r == 0) {
+    r = uv_listen((uv_stream_t*)&server, max_conn, session_on_new_connection);
+  }
 
   if (r) {
     log_all(LOG_ERROR, "Listen error: %s", uv_strerror(r));
@@ -132,12 +145,13 @@ int main(int argc, char** argv) {
   log_all(LOG_INFO, "NASFS server shutting down cleanly...");
 
 close_handles:
-  uv_close((uv_handle_t*)&sigint_watcher, NULL);
-  uv_close((uv_handle_t*)&sigterm_watcher, NULL);
-  uv_close((uv_handle_t*)&server, NULL);
-
-  uv_run(loop, UV_RUN_NOWAIT);
-  uv_loop_close(loop);
+  uv_walk(loop, close_server_handle, NULL);
+  uv_run(loop, UV_RUN_DEFAULT);
+  r = uv_loop_close(loop);
+  if (r < 0) {
+    log_all(LOG_ERROR, "Event loop close failed: %s", uv_strerror(r));
+    exit_code = 1;
+  }
 
 cleanup:
   free_config(&global_config);
