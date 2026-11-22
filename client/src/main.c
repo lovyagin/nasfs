@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <uv.h>
 
 #include "auth.h"
@@ -81,7 +82,6 @@ typedef struct {
   client_op_t op;
   const char* local_path;
   const char* remote_name;
-  uint64_t plaintext_size;
 } nasfs_batch_op_t;
 static nasfs_batch_op_t batch_queue[NASFS_MAX_BATCH];
 static int batch_count = 0;
@@ -93,6 +93,8 @@ client_op_t current_op = OP_NONE;
 const char* local_filename = NULL;
 const char* remote_filename = NULL;
 uv_file local_fd = -1;
+static char* download_temp_path;
+static int put_ack_pending;
 uint64_t file_offset = 0;
 
 uint8_t* client_recv_buffer = NULL;
@@ -544,12 +546,38 @@ void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
 
 /* Send PUT_REQ for the current local_filename / remote_filename. */
 static void send_put_req(uv_stream_t* stream) {
+  local_fd = open(local_filename, O_RDONLY | O_NONBLOCK);
+  if (local_fd < 0) {
+    fprintf(stderr, "Cannot open PUT source '%s': %s\n", local_filename,
+            strerror(errno));
+    close_connection((uv_handle_t*)stream);
+    return;
+  }
+
+  struct stat st;
+  if (fstat(local_fd, &st) < 0) {
+    fprintf(stderr, "Cannot stat PUT source '%s': %s\n", local_filename,
+            strerror(errno));
+    close_connection((uv_handle_t*)stream);
+    return;
+  }
+  if (!S_ISREG(st.st_mode) || st.st_size < 0) {
+    fprintf(stderr, "PUT source must be a regular file: %s\n", local_filename);
+    close_connection((uv_handle_t*)stream);
+    return;
+  }
+  put_plaintext_size = (uint64_t)st.st_size;
+  put_ack_pending = 1;
+
   size_t fn_len = strlen(remote_filename);
   if (file_encryption_enabled) {
     size_t payload_len =
         1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2 + fn_len + 1;
     uint8_t* req_payload = malloc(payload_len);
-    if (!req_payload) return;
+    if (!req_payload) {
+      close_connection((uv_handle_t*)stream);
+      return;
+    }
     req_payload[0] = 1;
     randombytes_buf(file_salt, crypto_pwhash_SALTBYTES);
     if (crypto_engine_derive_key(NASFS_KDF_HKDF_SHA256, (const char*)master_key,
@@ -574,7 +602,10 @@ static void send_put_req(uv_stream_t* stream) {
   } else {
     size_t payload_len = 1 + fn_len + 1;
     uint8_t* req_payload = malloc(payload_len);
-    if (!req_payload) return;
+    if (!req_payload) {
+      close_connection((uv_handle_t*)stream);
+      return;
+    }
     req_payload[0] = 0;
     memcpy(req_payload + 1, (const uint8_t*)remote_filename, fn_len + 1);
     send_command(stream, NASFS_CMD_PUT_REQ, req_payload, payload_len, 1);
@@ -587,15 +618,18 @@ static void send_get_req(uv_stream_t* stream) {
   size_t fn_len = strlen(remote_filename);
   size_t payload_len = 1 + fn_len + 1;
   uint8_t* req_payload = malloc(payload_len);
-  if (!req_payload) return;
+  if (!req_payload) {
+    close_connection((uv_handle_t*)stream);
+    return;
+  }
   req_payload[0] = file_encryption_enabled ? 1 : 0;
   memcpy(req_payload + 1, (const uint8_t*)remote_filename, fn_len + 1);
   send_command(stream, NASFS_CMD_GET_REQ, req_payload, payload_len, 1);
   free(req_payload);
 }
 
-static void close_local_file(void) {
-  if (local_fd == -1) return;
+static int close_local_file(void) {
+  if (local_fd == -1) return 0;
 
   uv_fs_t req;
   int rc = uv_fs_close(loop, &req, local_fd, NULL);
@@ -605,11 +639,58 @@ static void close_local_file(void) {
     fprintf(stderr, "Local file close failed: %s\n", uv_strerror(rc));
     client_exit_code = 1;
   }
+  return rc;
+}
+
+static int open_download_file(void) {
+  static const char pattern[] = ".nasfs-download.XXXXXX";
+  const char* slash = strrchr(local_filename, '/');
+  size_t prefix_len = slash ? (size_t)(slash - local_filename) + 1 : 0;
+  char* path = malloc(prefix_len + sizeof(pattern));
+  if (!path) return -1;
+
+  memcpy(path, local_filename, prefix_len);
+  memcpy(path + prefix_len, pattern, sizeof(pattern));
+  int fd = mkstemp(path);
+  if (fd < 0) {
+    int saved_errno = errno;
+    free(path);
+    errno = saved_errno;
+    return -1;
+  }
+  local_fd = fd;
+  download_temp_path = path;
+  return 0;
+}
+
+static void discard_download(void) {
+  if (!download_temp_path) return;
+  if (unlink(download_temp_path) < 0 && errno != ENOENT) {
+    fprintf(stderr, "Cannot remove temporary download '%s': %s\n",
+            download_temp_path, strerror(errno));
+  }
+  free(download_temp_path);
+  download_temp_path = NULL;
+}
+
+static int publish_download(void) {
+  if (close_local_file() < 0) return -1;
+  if (rename(download_temp_path, local_filename) < 0) {
+    fprintf(stderr, "Cannot publish download '%s': %s\n", local_filename,
+            strerror(errno));
+    return -1;
+  }
+  free(download_temp_path);
+  download_temp_path = NULL;
+  return 0;
 }
 
 /* Reset per-file transfer state and start the next queued operation. */
 static void start_next_operation(uv_stream_t* stream) {
-  close_local_file();
+  if (close_local_file() < 0) {
+    close_connection((uv_handle_t*)stream);
+    return;
+  }
   file_offset = 0;
   client_block_seq = 0;
   has_pending_block_meta = 0;
@@ -626,7 +707,6 @@ static void start_next_operation(uv_stream_t* stream) {
   current_op = op->op;
   local_filename = op->local_path;
   remote_filename = op->remote_name;
-  put_plaintext_size = op->plaintext_size;
 
   printf("\n[%d/%d] %s %s\n", batch_idx, batch_count,
          current_op == OP_PUT ? "PUT" : "GET",
@@ -644,6 +724,7 @@ static void close_connection(uv_handle_t* handle) {
   if (!client_finished) client_exit_code = 1;
   uv_close(handle, NULL);
   if (!local_read_pending) close_local_file();
+  discard_download();
   printf("\nConnection closed.\n");
 }
 
@@ -728,6 +809,11 @@ void on_local_read(uv_fs_t* req) {
   if (req->result < 0) {
     fprintf(stderr, "\nRead error: %s\n", uv_strerror((int)req->result));
     client_exit_code = 1;
+    close_connection((uv_handle_t*)stream);
+  } else if ((req->result == 0 && file_offset != put_plaintext_size) ||
+             (uint64_t)req->result > put_plaintext_size - file_offset) {
+    fprintf(stderr, "PUT source size changed during upload: %s\n",
+            local_filename);
     close_connection((uv_handle_t*)stream);
   } else if (req->result == 0) {
     printf("\nFinished reading local file. Sending PUT_DONE.\n");
@@ -946,37 +1032,20 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               break;
 
             case NASFS_CMD_AUTH_ACK:
-              if (current_op == OP_PUT) {
-                send_put_req(stream);
-              } else if (current_op == OP_GET) {
-                send_get_req(stream);
-              }
-              break;
-            case NASFS_CMD_PUT_ACK: {
-              if (current_op != OP_PUT || local_fd != -1) {
+              if (current_op != OP_NONE) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
-              uv_fs_t open_req;
-              int fd = uv_fs_open(loop, &open_req, local_filename, O_RDONLY, 0,
-                                  NULL);
-              if (fd < 0) {
-                fprintf(stderr, "Failed to open local file for PUT: %s\n",
-                        uv_strerror(fd));
-                client_exit_code = 1;
-                uv_fs_req_cleanup(&open_req);
-                if (decrypted_payload) free(decrypted_payload);
+              start_next_operation(stream);
+              break;
+            case NASFS_CMD_PUT_ACK:
+              if (current_op != OP_PUT || !put_ack_pending || local_fd == -1) {
                 close_connection((uv_handle_t*)stream);
-                return;
+                break;
               }
-              local_fd = (uv_file)fd;
-              file_offset = 0;
-              client_block_seq = 0;
-              has_pending_block_meta = 0;
-              uv_fs_req_cleanup(&open_req);
+              put_ack_pending = 0;
               do_put_read_chunk(stream);
               break;
-            }
             case NASFS_CMD_GET_ACK: {
               if (current_op != OP_GET || local_fd != -1) {
                 close_connection((uv_handle_t*)stream);
@@ -1019,23 +1088,12 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 }
               }
 
-              uv_fs_t open_req;
-              int fd = uv_fs_open(loop, &open_req, local_filename,
-                                  O_WRONLY | O_CREAT | O_TRUNC, 0644, NULL);
-              if (fd < 0) {
-                fprintf(stderr, "Failed to open local file for GET: %s\n",
-                        uv_strerror(fd));
-                client_exit_code = 1;
-                uv_fs_req_cleanup(&open_req);
-                if (decrypted_payload) free(decrypted_payload);
+              if (open_download_file() < 0) {
+                fprintf(stderr,
+                        "Cannot create temporary download for '%s': %s\n",
+                        local_filename, strerror(errno));
                 close_connection((uv_handle_t*)stream);
-                return;
               }
-              local_fd = (uv_file)fd;
-              file_offset = 0;
-              client_block_seq = 0;
-              has_pending_block_meta = 0;
-              uv_fs_req_cleanup(&open_req);
               break;
             }
             case NASFS_CMD_GET_BLOCK_META: {
@@ -1059,7 +1117,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               uv_buf_t write_buf;
               int rc;
 
-              if (local_fd == -1) {
+              if (current_op != OP_GET || local_fd == -1) {
                 if (decrypted_payload) free(decrypted_payload);
                 close_connection((uv_handle_t*)stream);
                 return;
@@ -1169,22 +1227,27 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 client_block_seq++;
               }
 
+              if (write_len > INT64_MAX - file_offset ||
+                  (file_encryption_enabled &&
+                   write_len > expected_plaintext_size - file_offset)) {
+                fprintf(stderr, "Download exceeds expected file size\n");
+                free(decrypted_buf);
+                close_connection((uv_handle_t*)stream);
+                break;
+              }
               write_buf = uv_buf_init((char*)write_data, write_len);
               rc = uv_fs_write(loop, &write_req, local_fd, &write_buf, 1,
                                file_offset, NULL);
-              if (decrypted_buf) free(decrypted_buf);
-
-              if (rc < 0) {
-                fprintf(stderr, "Failed to write downloaded data: %s\n",
-                        uv_strerror(rc));
-                client_exit_code = 1;
-                uv_fs_req_cleanup(&write_req);
-                if (decrypted_payload) free(decrypted_payload);
-                close_connection((uv_handle_t*)stream);
-                return;
-              }
-              file_offset += write_len;
               uv_fs_req_cleanup(&write_req);
+              free(decrypted_buf);
+
+              if (rc < 0 || (size_t)rc != write_len) {
+                fprintf(stderr, "Failed to write downloaded data: %s\n",
+                        rc < 0 ? uv_strerror(rc) : "short write");
+                close_connection((uv_handle_t*)stream);
+                break;
+              }
+              file_offset += (uint64_t)rc;
               printf("\rDownloaded %llu bytes...",
                      (unsigned long long)file_offset);
               fflush(stdout);
@@ -1195,7 +1258,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
-              if (file_encryption_enabled && expected_plaintext_size > 0 &&
+              if (file_encryption_enabled &&
                   file_offset != expected_plaintext_size) {
                 fprintf(stderr,
                         "\nIntegrity error: expected %llu bytes, got %llu "
@@ -1203,6 +1266,10 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                         (unsigned long long)expected_plaintext_size,
                         (unsigned long long)file_offset);
                 client_exit_code = 1;
+                close_connection((uv_handle_t*)stream);
+                break;
+              }
+              if (has_pending_block_meta || publish_download() < 0) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
@@ -1449,51 +1516,35 @@ int main(int argc, char** argv) {
     /* Single PUT: put <local> [remote] */
     const char* loc = argv[2];
     const char* rem = (argc >= 4) ? argv[3] : get_basename(loc);
-    struct stat st;
-    uint64_t psz = 0;
-    if (stat(loc, &st) == 0) psz = (uint64_t)st.st_size;
-    batch_queue[0] = (nasfs_batch_op_t){OP_PUT, loc, rem, psz};
-    batch_count = 1;
+    batch_queue[batch_count++] = (nasfs_batch_op_t){OP_PUT, loc, rem};
   } else if (strcmp(argv[1], "get") == 0) {
-    /* Single GET: get <remote> [local] */
     const char* rem = argv[2];
     const char* loc = (argc >= 4) ? argv[3] : get_basename(rem);
-    batch_queue[0] = (nasfs_batch_op_t){OP_GET, loc, rem, 0};
-    batch_count = 1;
-  } else if (strcmp(argv[1], "mput") == 0) {
-    /* Batch PUT: mput file1 file2 ... */
-    if (argc < 3) {
-      fprintf(stderr, "mput requires at least one file\n");
+    batch_queue[batch_count++] = (nasfs_batch_op_t){OP_GET, loc, rem};
+  } else if (strcmp(argv[1], "mput") == 0 || strcmp(argv[1], "mget") == 0) {
+    if (argc - 2 > NASFS_MAX_BATCH) {
+      fprintf(stderr, "Batch limit is %d files\n", NASFS_MAX_BATCH);
       return 1;
     }
-    for (int i = 2; i < argc && batch_count < NASFS_MAX_BATCH; i++) {
-      struct stat st;
-      uint64_t psz = 0;
-      if (stat(argv[i], &st) == 0) psz = (uint64_t)st.st_size;
+    int uploading = strcmp(argv[1], "mput") == 0;
+    for (int i = 2; i < argc; i++) {
+      const char* name = get_basename(argv[i]);
+      for (int j = 0; j < batch_count; j++) {
+        const char* dest =
+            uploading ? batch_queue[j].remote_name : batch_queue[j].local_path;
+        if (strcmp(name, dest) == 0) {
+          fprintf(stderr, "Duplicate batch destination: %s\n", name);
+          return 1;
+        }
+      }
       batch_queue[batch_count++] =
-          (nasfs_batch_op_t){OP_PUT, argv[i], get_basename(argv[i]), psz};
-    }
-  } else if (strcmp(argv[1], "mget") == 0) {
-    /* Batch GET: mget remote1 remote2 ... */
-    if (argc < 3) {
-      fprintf(stderr, "mget requires at least one file\n");
-      return 1;
-    }
-    for (int i = 2; i < argc && batch_count < NASFS_MAX_BATCH; i++) {
-      batch_queue[batch_count++] =
-          (nasfs_batch_op_t){OP_GET, get_basename(argv[i]), argv[i], 0};
+          uploading ? (nasfs_batch_op_t){OP_PUT, argv[i], name}
+                    : (nasfs_batch_op_t){OP_GET, name, argv[i]};
     }
   } else {
     fprintf(stderr, "Invalid operation. Use put, get, mput, or mget.\n");
     return 1;
   }
-
-  /* Load first operation into the active globals */
-  current_op = batch_queue[0].op;
-  local_filename = batch_queue[0].local_path;
-  remote_filename = batch_queue[0].remote_name;
-  put_plaintext_size = batch_queue[0].plaintext_size;
-  batch_idx = 1;
 
   loop = uv_default_loop();
   uv_tcp_t socket;

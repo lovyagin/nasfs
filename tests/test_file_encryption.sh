@@ -109,6 +109,8 @@ printf '%b%s%b\n' "$GREEN" "Success: Decrypted file matches the original file ex
 # Test 3: Download and decrypt with an INCORRECT key
 printf '%b%s%b\n' "$YELLOW" "3. Downloading and decrypting with an INCORRECT key (should fail)..." "$NC"
 TEST_OUTPUT_INCORRECT="$TEST_ROOT/decrypted_incorrect.bin"
+printf 'Keep the previous file.\n' > "$TEST_OUTPUT_INCORRECT"
+PREVIOUS_HASH=$(hash_file "$TEST_OUTPUT_INCORRECT")
 
 if env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
     NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
@@ -122,7 +124,11 @@ if env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
 fi
 
 grep -Fq "Decryption failed. Wrong key or corrupted data" "$LOG_DIR/client_get_incorrect.log"
-test ! -s "$TEST_OUTPUT_INCORRECT"
+test "$(hash_file "$TEST_OUTPUT_INCORRECT")" = "$PREVIOUS_HASH"
+if compgen -G "$TEST_ROOT/.nasfs-download.*" > /dev/null; then
+    printf "Temporary download was not removed.\n" >&2
+    exit 1
+fi
 test "$(hash_file "$SERVER_STORED_FILE")" = "$STORED_HASH"
 
 printf '%b%s%b\n' "$GREEN" "Success: Decryption failed as expected when using an incorrect key." "$NC"

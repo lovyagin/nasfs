@@ -231,6 +231,38 @@ if ! grep -Eq "Negotiated KEX: (ML-KEM-512|Kyber512|ML-KEM-768|Kyber768); contro
 fi
 printf "${GREEN}%s${NC}\n" "      Negotiated suite verified in server logs."
 
+expect_client_failure "$LOG_DIR/client_missing_source.log" "Cannot open PUT source" \
+    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
+    put "$TEST_DIR/missing-source.bin" "missing-source.bin"
+test ! -e "$STORAGE_DIR/missing-source.bin"
+
+mkdir "$TEST_DIR/get_destination_directory"
+expect_client_failure "$LOG_DIR/client_publish_failure.log" "Cannot publish download" \
+    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
+    get "$REMOTE_NAME" "$TEST_DIR/get_destination_directory"
+test -d "$TEST_DIR/get_destination_directory"
+if compgen -G "$TEST_DIR/.nasfs-download.*" > /dev/null; then
+    printf "Temporary download was not removed.\n" >&2
+    exit 1
+fi
+
+touch "$TEST_DIR/empty_input.bin"
+run_client "$LOG_DIR/client_empty_put.log" "ML-KEM-512" "password" \
+    "e2e-password" "" "ML-DSA-65" put "$TEST_DIR/empty_input.bin" "empty.bin"
+run_client "$LOG_DIR/client_empty_get.log" "ML-KEM-512" "password" \
+    "e2e-password" "" "ML-DSA-65" get "empty.bin" "$TEST_DIR/empty_output.bin"
+test -f "$TEST_DIR/empty_output.bin"
+test ! -s "$TEST_DIR/empty_output.bin"
+
+expect_client_failure "$LOG_DIR/client_duplicate_destination.log" "Duplicate batch destination" \
+    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mget x/file y/file
+too_many_files=()
+for ((i = 0; i < 513; i++)); do
+    too_many_files+=("file-$i")
+done
+expect_client_failure "$LOG_DIR/client_batch_limit.log" "Batch limit is 512 files" \
+    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mput "${too_many_files[@]}"
+
 printf "${YELLOW}%s${NC}\n" "=============================================="
 printf "${GREEN}%s${NC}\n" "    SUCCESS: All tests passed!               "
 printf "${YELLOW}%s${NC}\n" "=============================================="
