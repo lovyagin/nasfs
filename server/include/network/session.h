@@ -64,6 +64,7 @@ typedef struct {
   char* kex_algorithm;      /**< Negotiated KEX algorithm for this session. */
   char* cipher_algorithm;   /**< Negotiated control-channel cipher for this
                                session. */
+  int protocol_v2;          /**< Set by the v2 hello command. */
   int is_secure;            /**< Flag indicating if the channel is encrypted. */
   int is_authenticated;     /**< Flag indicating successful user auth. */
   crypto_secretstream_xchacha20poly1305_state

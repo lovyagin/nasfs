@@ -64,8 +64,6 @@ if ! env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
   exit 1
 fi
 
-wait_for_server_log_count 'Upload complete.' 1
-
 # Check if file exists in server storage
 SERVER_STORED_FILE="$STORAGE_DIR/encrypted_remote.bin"
 if [ ! -f "$SERVER_STORED_FILE" ]; then

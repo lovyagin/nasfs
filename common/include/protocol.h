@@ -38,6 +38,9 @@ typedef enum {
   NASFS_CMD_SECURE_READY = 0x04, /**< S->C: Server confirms secure channel and
                                     sends its stream header. */
 
+  NASFS_CMD_PQC_HELLO_V2 = 0x05,    /**< C->S: Require protocol v2. */
+  NASFS_CMD_SECURE_READY_V2 = 0x06, /**< S->C: Accept protocol v2. */
+
   /* Control Commands (Payload will be encrypted) */
   NASFS_CMD_AUTH = 0x10,     /**< C->S: Authenticate with credentials. */
   NASFS_CMD_AUTH_ACK = 0x11, /**< S->C: Respond to authentication attempt. */
@@ -56,6 +59,8 @@ typedef enum {
       0x1A, /**< C->S: SPAKE2 client share [u8 ulen][username][X(32)]. */
   NASFS_CMD_PAKE_RESPONSE = 0x1B, /**< S->C: SPAKE2 server share [Y(32)]. */
 
+  NASFS_CMD_PUT_RESULT = 0x1C, /**< S->C: Final v2 PUT status, one byte. */
+
   /* Data Transfer Commands (Unencrypted Payload) */
   NASFS_CMD_PUT_DATA = 0x20, /**< C->S: Data chunk for file upload. */
   NASFS_CMD_GET_DATA = 0x21, /**< S->C: Data chunk for file download. */
@@ -63,6 +68,11 @@ typedef enum {
   /* General Commands */
   NASFS_CMD_ERROR = 0xFF /**< S->C: Error response from the server. */
 } nasfs_cmd_type_t;
+
+typedef enum {
+  NASFS_PUT_PUBLISHED = 0,
+  NASFS_PUT_PUBLICATION_FAILED = 1
+} nasfs_put_status_t;
 
 /**
  * @def NASFS_PROTO_HEADER_SIZE

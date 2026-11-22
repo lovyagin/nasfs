@@ -95,6 +95,7 @@ const char* remote_filename = NULL;
 uv_file local_fd = -1;
 static char* download_temp_path;
 static int put_ack_pending;
+static int put_result_pending;
 uint64_t file_offset = 0;
 
 uint8_t* client_recv_buffer = NULL;
@@ -722,6 +723,11 @@ static void start_next_operation(uv_stream_t* stream) {
 static void close_connection(uv_handle_t* handle) {
   if (uv_is_closing(handle)) return;
   if (!client_finished) client_exit_code = 1;
+  if (put_result_pending) {
+    fprintf(stderr,
+            "PUT outcome unknown for '%s': no valid publication response\n",
+            remote_filename);
+  }
   uv_close(handle, NULL);
   if (!local_read_pending) close_local_file();
   discard_download();
@@ -741,11 +747,6 @@ void on_write(uv_write_t* req, int status) {
     if (local_fd != -1 && ctx->type == NASFS_CMD_PUT_DATA) {
       free(ctx);
       do_put_read_chunk(stream);
-      return;
-    }
-    if (ctx->type == NASFS_CMD_PUT_DONE) {
-      free(ctx);
-      start_next_operation(stream);
       return;
     }
   }
@@ -816,7 +817,8 @@ void on_local_read(uv_fs_t* req) {
             local_filename);
     close_connection((uv_handle_t*)stream);
   } else if (req->result == 0) {
-    printf("\nFinished reading local file. Sending PUT_DONE.\n");
+    printf("\nFinished reading local file. Waiting for publication.\n");
+    put_result_pending = 1;
     send_command(stream, NASFS_CMD_PUT_DONE, NULL, 0, 1);
   } else {
     size_t bytes_read = req->result;
@@ -982,8 +984,11 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               close_connection((uv_handle_t*)stream);
             }
             free(public_key);
-          } else if (frame.type == NASFS_CMD_SECURE_READY) {
-            if (crypto_secretstream_xchacha20poly1305_init_pull(
+          } else if (frame.type == NASFS_CMD_SECURE_READY_V2) {
+            if (!shared_secret ||
+                frame.payload_len !=
+                    crypto_secretstream_xchacha20poly1305_HEADERBYTES ||
+                crypto_secretstream_xchacha20poly1305_init_pull(
                     &recv_crypto_state, frame.payload, shared_secret) != 0) {
               close_connection((uv_handle_t*)stream);
               return;
@@ -997,6 +1002,14 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
             } else {
               send_auth(stream);
             }
+          } else if (frame.type == NASFS_CMD_SECURE_READY) {
+            fprintf(stderr,
+                    "Server does not support required NASFS protocol v2\n");
+            close_connection((uv_handle_t*)stream);
+          } else if (frame.type == NASFS_CMD_ERROR) {
+            fprintf(stderr, "Handshake failed: %.*s\n", (int)frame.payload_len,
+                    (const char*)frame.payload);
+            close_connection((uv_handle_t*)stream);
           }
         } else {
           unsigned long long decrypted_len;
@@ -1045,6 +1058,26 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               }
               put_ack_pending = 0;
               do_put_read_chunk(stream);
+              break;
+            case NASFS_CMD_PUT_RESULT:
+              if (current_op != OP_PUT || !put_result_pending ||
+                  plain_frame.payload_len != 1) {
+                close_connection((uv_handle_t*)stream);
+                break;
+              }
+              if (plain_frame.payload[0] == NASFS_PUT_PUBLISHED) {
+                put_result_pending = 0;
+                printf("Upload published.\n");
+                start_next_operation(stream);
+              } else if (plain_frame.payload[0] ==
+                         NASFS_PUT_PUBLICATION_FAILED) {
+                put_result_pending = 0;
+                fprintf(stderr, "Server could not publish '%s'\n",
+                        remote_filename);
+                close_connection((uv_handle_t*)stream);
+              } else {
+                close_connection((uv_handle_t*)stream);
+              }
               break;
             case NASFS_CMD_GET_ACK: {
               if (current_op != OP_GET || local_fd != -1) {
@@ -1298,6 +1331,10 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
       }
     }
   } else if (nread < 0) {
+    if (!is_secure) {
+      fprintf(stderr,
+              "Connection ended before NASFS protocol v2 was confirmed\n");
+    }
     close_connection((uv_handle_t*)stream);
   }
 }
@@ -1321,7 +1358,7 @@ void on_connect(uv_connect_t* req, int status) {
       return;
     }
 
-    send_command(req->handle, NASFS_CMD_PQC_HELLO, hello_payload,
+    send_command(req->handle, NASFS_CMD_PQC_HELLO_V2, hello_payload,
                  hello_payload_len, 0);
     free(hello_payload);
   }

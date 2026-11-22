@@ -60,9 +60,9 @@ static void session_on_read(uv_stream_t* stream, ssize_t nread,
 static void session_alloc_buffer(uv_handle_t* handle, size_t suggested_size,
                                  uv_buf_t* buf);
 static void on_socket_write_done(uv_write_t* req, int status);
-static void session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
-                               const uint8_t* payload, size_t payload_len,
-                               int encrypt);
+static int session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
+                              const uint8_t* payload, size_t payload_len,
+                              int encrypt);
 static void do_get_next_chunk(client_session_t* session);
 static void process_session_frames(client_session_t* session);
 static void session_dispatch_frame(client_session_t* session,
@@ -471,9 +471,9 @@ void session_close(uv_handle_t* handle) {
 
 /* --- Protocol & Crypto Implementation --- */
 
-static void session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
-                               const uint8_t* payload, size_t payload_len,
-                               int encrypt) {
+static int session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
+                              const uint8_t* payload, size_t payload_len,
+                              int encrypt) {
   uint8_t* payload_to_pack = (uint8_t*)payload;
   size_t payload_to_pack_len = payload_len;
   uint8_t* encrypted_payload = NULL;
@@ -482,7 +482,7 @@ static void session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
     payload_to_pack_len =
         payload_len + crypto_secretstream_xchacha20poly1305_ABYTES;
     encrypted_payload = malloc(payload_to_pack_len);
-    if (!encrypted_payload) return;
+    if (!encrypted_payload) return UV_ENOMEM;
 
     crypto_secretstream_xchacha20poly1305_push(&session->send_crypto_state,
                                                encrypted_payload, NULL, payload,
@@ -494,21 +494,23 @@ static void session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
   uint8_t* frame_data = protocol_pack_frame(type, payload_to_pack,
                                             payload_to_pack_len, &frame_size);
   if (encrypted_payload) free(encrypted_payload);
-  if (!frame_data) return;
+  if (!frame_data) return UV_ENOMEM;
 
   nasfs_write_ctx_t* ctx = malloc(sizeof(nasfs_write_ctx_t));
   if (!ctx) {
     free(frame_data);
-    return;
+    return UV_ENOMEM;
   }
 
   ctx->buf = uv_buf_init((char*)frame_data, frame_size);
   ctx->type = type;
-  if (uv_write(&ctx->req, (uv_stream_t*)&session->handle, &ctx->buf, 1,
-               on_socket_write_done) < 0) {
+  int rc = uv_write(&ctx->req, (uv_stream_t*)&session->handle, &ctx->buf, 1,
+                    on_socket_write_done);
+  if (rc < 0) {
     free(frame_data);
     free(ctx);
   }
+  return rc;
 }
 
 /* --- File I/O Callbacks --- */
@@ -519,7 +521,19 @@ static void release_fs_request(nasfs_fs_ctx_t* ctx) {
 }
 
 static void finish_put(client_session_t* session) {
-  if (publish_upload(session) < 0) {
+  int result = publish_upload(session);
+  if (session->protocol_v2) {
+    uint8_t status =
+        result == 0 ? NASFS_PUT_PUBLISHED : NASFS_PUT_PUBLICATION_FAILED;
+    int rc = session_send_frame(session, NASFS_CMD_PUT_RESULT, &status,
+                                sizeof(status), 1);
+    if (rc < 0) {
+      log_all(LOG_ERROR, "PUT: Could not send publication result: %s",
+              uv_strerror(rc));
+      session_close((uv_handle_t*)&session->handle);
+      return;
+    }
+  } else if (result < 0) {
     session_send_frame(session, NASFS_CMD_ERROR,
                        (const uint8_t*)"Publication failed",
                        sizeof("Publication failed") - 1, 1);
@@ -806,7 +820,9 @@ static void session_dispatch_frame(client_session_t* session,
   if (!session->is_secure) {
     switch (frame->type) {
       case NASFS_CMD_PQC_HELLO:
+      case NASFS_CMD_PQC_HELLO_V2:
         if (session->state != SESSION_STATE_NEW) return;
+        session->protocol_v2 = frame->type == NASFS_CMD_PQC_HELLO_V2;
         {
           char* client_kex_list = NULL;
           char* client_cipher_list = NULL;
@@ -914,7 +930,10 @@ static void session_dispatch_frame(client_session_t* session,
           session->kem = NULL;
           free(session->kem_secret_key);
           session->kem_secret_key = NULL;
-          session_send_frame(session, NASFS_CMD_SECURE_READY, server_header,
+          nasfs_cmd_type_t ready = session->protocol_v2
+                                       ? NASFS_CMD_SECURE_READY_V2
+                                       : NASFS_CMD_SECURE_READY;
+          session_send_frame(session, ready, server_header,
                              sizeof(server_header), 0);
         }
         return;
