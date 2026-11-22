@@ -93,8 +93,11 @@ typedef struct {
   uint8_t file_hash_algo;   /**< nasfs_hash_algo_t for block integrity. */
 
   size_t
-      pending_fs;   /**< File requests whose callbacks still own the session. */
-  int put_draining; /**< PUT_DONE received while writes are outstanding. */
+      pending_fs; /**< File requests whose callbacks still own the session. */
+  char upload_name[NASFS_STORAGE_NAME_MAX + 1];
+  char upload_temp_name[NASFS_UPLOAD_TEMP_SIZE];
+  uint64_t upload_plaintext_bytes;
+  int put_draining;  /**< PUT_DONE received while writes are outstanding. */
   int handle_closed; /**< TCP close callback has run. */
 
   /* PAKE (SPAKE2) auth state — valid only during pake auth handshake. */

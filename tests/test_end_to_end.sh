@@ -169,6 +169,8 @@ if ! run_client "$LOG_DIR/client_put.log" "ML-KEM-512" "password" \
     exit 1
 fi
 
+wait_for_server_log_count 'Upload complete.' 1
+
 # Verify encrypted blob exists on server storage.
 # The stored file is E2EE ciphertext so its hash intentionally differs from
 # the plaintext hash; only verify presence here.
@@ -272,6 +274,41 @@ for ((i = 0; i < 513; i++)); do
 done
 expect_client_failure "$LOG_DIR/client_batch_limit.log" "Batch limit is 512 files" \
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mput "${too_many_files[@]}"
+
+other_input="$TEST_DIR/second_input.bin"
+dd if=/dev/urandom of="$other_input" bs=1M count=2 2>/dev/null
+other_hash=$(hash_file "$other_input")
+completed_before=$(grep -Fc 'Upload complete.' "$LOG_DIR/server.log")
+
+run_client "$LOG_DIR/client_concurrent_first.log" "ML-KEM-512" "password" \
+    "e2e-password" "" "ML-DSA-65" put "$TEST_INPUT" "concurrent.bin" &
+first_upload=$!
+run_client "$LOG_DIR/client_concurrent_second.log" "ML-KEM-512" "password" \
+    "e2e-password" "" "ML-DSA-65" put "$other_input" "concurrent.bin" &
+second_upload=$!
+wait "$first_upload"
+wait "$second_upload"
+wait_for_server_log_count 'Upload complete.' "$((completed_before + 2))"
+
+run_client "$LOG_DIR/client_concurrent_get.log" "ML-KEM-512" "password" \
+    "e2e-password" "" "ML-DSA-65" get "concurrent.bin" "$TEST_DIR/concurrent.bin"
+concurrent_hash=$(hash_file "$TEST_DIR/concurrent.bin")
+test "$concurrent_hash" = "$INPUT_HASH" || test "$concurrent_hash" = "$other_hash"
+
+mkdir "$STORAGE_DIR/upload_destination_directory"
+# Legacy PUT completion is local to the client. Check the server outcome.
+run_client "$LOG_DIR/client_upload_publish_failure.log" "ML-KEM-512" "password" \
+    "e2e-password" "" "ML-DSA-65" put "$TEST_INPUT" "upload_destination_directory" || true
+wait_for_server_log_count 'PUT: Publication failed:' 1
+test -d "$STORAGE_DIR/upload_destination_directory"
+deadline=$((SECONDS + 10))
+while compgen -G "$STORAGE_DIR/.nasfs-upload.*" > /dev/null; do
+    if (( SECONDS >= deadline )); then
+        printf "Temporary upload was not removed.\n" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
 
 printf "${YELLOW}%s${NC}\n" "=============================================="
 printf "${GREEN}%s${NC}\n" "    SUCCESS: All tests passed!               "

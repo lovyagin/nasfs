@@ -51,3 +51,16 @@ start_integration_server() {
     printf 'NASFS server failed to become ready within 10 seconds.\n' >&2
     return 1
 }
+
+wait_for_server_log_count() {
+    local message=$1 expected=$2 deadline=$((SECONDS + 10)) count
+    while (( SECONDS < deadline )); do
+        count=$(grep -Fc "$message" "$LOG_DIR/server.log" || true)
+        if (( count >= expected )); then
+            return
+        fi
+        sleep 0.05
+    done
+    printf "Timed out waiting for server log message: %s\n" "$message" >&2
+    return 1
+}
