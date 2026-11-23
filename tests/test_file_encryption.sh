@@ -260,6 +260,22 @@ xchacha20poly1305 sha256 pbkdf2
 aes256gcm crc32 hkdf
 xsalsa20poly1305 adler32 argon2id
 PROFILES
+# Exercise the full Cartesian product on a nonempty fixture. The GET
+# intentionally omits the cipher and hash settings used for PUT.
+printf 'NASLUKS file profile matrix\n' > "$TEST_ROOT/profile-input.bin"
+for cipher in xsalsa20poly1305 xchacha20poly1305 aes256gcm; do
+    for hash in blake2b sha256 crc32 adler32; do
+        for kdf in argon2id pbkdf2 hkdf; do
+            remote="matrix-$cipher-$hash-$kdf.bin"
+            NASFS_FILE_CIPHER="$cipher" NASFS_FILE_HASH="$hash" NASFS_KDF="$kdf" \
+                transfer put "$TEST_ROOT/profile-input.bin" "$remote" \
+                > "$LOG_DIR/matrix-put.log" 2>&1
+            NASFS_KDF="$kdf" transfer get "$remote" "$TEST_ROOT/profile-output.bin" \
+                > "$LOG_DIR/matrix-get.log" 2>&1
+            cmp "$TEST_ROOT/profile-input.bin" "$TEST_ROOT/profile-output.bin"
+        done
+    done
+done
 for setting in NASFS_FILE_CIPHER NASFS_FILE_HASH NASFS_KDF NASFS_BLOCK_SIZE; do
     if NASFS_AUTH_PASSWORD=super-secret env "$setting=invalid" "$CLIENT_BIN" \
         put "$TEST_INPUT" invalid-profile.bin > "$LOG_DIR/invalid-profile.log" 2>&1; then

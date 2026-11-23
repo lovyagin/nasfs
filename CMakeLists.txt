@@ -173,7 +173,7 @@ add_test(NAME integration_encryption COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/t
 set_tests_properties(
   integration_encryption
   PROPERTIES
-  TIMEOUT 60
+  TIMEOUT 120
   ENVIRONMENT
     "NASFS_SERVER_BIN=$<TARGET_FILE:nasfs_server>;NASFS_CLIENT_BIN=$<TARGET_FILE:nasfs_client>"
 )
