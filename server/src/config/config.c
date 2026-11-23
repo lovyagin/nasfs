@@ -189,6 +189,22 @@ int load_config(const char* filename, server_config_t* config) {
         fclose(file);
         return -1;
       }
+    } else if (strcmp(key, "ServerSigningSeed") == 0 ||
+               strcmp(key, "AuthorPublicKey") == 0) {
+      if (value[0] != '/') {
+        fprintf(stderr, "%s requires an absolute path\n", key);
+        fclose(file);
+        return -1;
+      }
+      char** path = strcmp(key, "ServerSigningSeed") == 0
+                        ? &config->server_signing_seed
+                        : &config->author_public_key;
+      free(*path);
+      *path = strdup(value);
+      if (!*path) {
+        fclose(file);
+        return -1;
+      }
     } else if (strcmp(key, "BlockSize") == 0) {
       int bs = 0;
       if (parse_config_int(value, &bs) != 0 || bs < 4096 || bs > 4194304) {
@@ -246,6 +262,8 @@ void free_config(server_config_t* config) {
   free(config->auth_password);
   free(config->authorized_keys_file);
   free(config->pubkey_auth_algorithms);
+  free(config->server_signing_seed);
+  free(config->author_public_key);
 
   memset(config, 0, sizeof(*config));
 }

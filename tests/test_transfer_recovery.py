@@ -41,7 +41,7 @@ def read_exact(sock, size):
 
 
 def relay(source, target, stop_at, reached, stop, observed, corrupt, occurrence,
-          before_forward):
+          before_forward, slow_frame_seconds, stall_partial):
     try:
         while not stop.is_set():
             prefix = read_exact(source, 4)
@@ -56,6 +56,21 @@ def relay(source, target, stop_at, reached, stop, observed, corrupt, occurrence,
                 occurrence -= 1
             selected = frame[0] == stop_at and occurrence == 0
             if selected:
+                if slow_frame_seconds:
+                    target.sendall(prefix)
+                    for index in range(8):
+                        start = len(frame) * index // 8
+                        end = len(frame) * (index + 1) // 8
+                        target.sendall(frame[start:end])
+                        if index != 7 and stop.wait(slow_frame_seconds / 7):
+                            return
+                    reached.set()
+                    continue
+                if stall_partial:
+                    target.sendall(prefix + frame[:1])
+                    reached.set()
+                    stop.wait()
+                    break
                 if before_forward is not None:
                     before_forward()
                 elif corrupt:
@@ -77,7 +92,8 @@ def relay(source, target, stop_at, reached, stop, observed, corrupt, occurrence,
 def interrupt_transfer(client, args, upstream_port, direction, command, sig,
                        server_pid=None, corrupt=False, occurrence=1, cwd=None,
                        before_forward=None, on_pause=None, forbid=(),
-                       wait_for_remote_close=False, auth_method=None):
+                       wait_for_remote_close=False, auth_method=None,
+                       slow_frame_seconds=0, stall_partial=False):
     observed = []
     reached = threading.Event()
     stop = threading.Event()
@@ -103,6 +119,8 @@ def interrupt_transfer(client, args, upstream_port, direction, command, sig,
                 ) as upstream:
                     for connection in (peer, upstream):
                         connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        if slow_frame_seconds:
+                            connection.settimeout(slow_frame_seconds + 15)
                     for label, source, target in (
                         ("put", peer, upstream),
                         ("get", upstream, peer),
@@ -111,16 +129,17 @@ def interrupt_transfer(client, args, upstream_port, direction, command, sig,
                             target=relay,
                             args=(source, target, command if label == direction else None,
                                   reached, stop, observed if label == "put" else None,
-                                  corrupt, occurrence, before_forward),
+                                  corrupt, occurrence, before_forward,
+                                  slow_frame_seconds, stall_partial),
                         )
                         workers.append(worker)
                         worker.start()
                     try:
-                        if not reached.wait(10):
+                        if not reached.wait(10 + slow_frame_seconds):
                             raise RuntimeError(f"Did not reach command {command:#x}")
                         if on_pause is not None:
                             on_pause()
-                        if corrupt or before_forward is not None or wait_for_remote_close:
+                        if corrupt or before_forward is not None or wait_for_remote_close or slow_frame_seconds:
                             pass
                         elif server_pid is not None:
                             os.kill(server_pid, sig)
@@ -134,6 +153,8 @@ def interrupt_transfer(client, args, upstream_port, direction, command, sig,
                             child.send_signal(sig)
                         _, stderr = child.communicate(timeout=5)
                         expected_status = 1 if server_pid or sig is None else 128 + sig
+                        if slow_frame_seconds:
+                            expected_status = 0
                         if sig == signal.SIGKILL and server_pid is None:
                             expected_status = -signal.SIGKILL
                         assert child.returncode == expected_status, stderr.decode()
@@ -183,6 +204,25 @@ def main():
         assert output.read_bytes() == source.read_bytes()
 
     if mode:
+        if mode == ["partial-put"]:
+            slow_remote = "slow-frame.bin"
+            slow_put = ["put", str(replacement), slow_remote]
+            interrupt_transfer(client, slow_put, upstream_port, "put", PUT_DATA, None,
+                               slow_frame_seconds=3.5)
+            stored = storage / slow_remote
+            before = stored.read_bytes()
+            interrupt_transfer(client, slow_put, upstream_port, "put", PUT_DATA, None,
+                               wait_for_remote_close=True, stall_partial=True)
+            assert stored.read_bytes() == before
+            assert "Session idle timeout." in (root / "logs/server.log").read_text()
+            await_cleanup(storage, ".nasfs-upload.*")
+            return
+        if mode == ["partial-get"]:
+            slow_get = ["get", "slow-frame.bin", str(destination)]
+            interrupt_transfer(client, slow_get, upstream_port, "get", GET_DATA, None,
+                               slow_frame_seconds=32)
+            assert destination.read_bytes() == replacement.read_bytes()
+            return
         if mode[0] in ("stop-during-publication", "publication-without-lock"):
             unlocked = mode == ["publication-without-lock"]
             orphan = storage / (".nasfs-upload." + "0" * 32)

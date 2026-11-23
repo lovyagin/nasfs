@@ -11,8 +11,12 @@ LOG_FILE="@NASFS_LOCALSTATEDIR@/log/nasfs/nasfs-server.log"
 BINARY="@NASFS_BINDIR@/nasfs_server"
 CONFIG="@NASFS_SYSCONFDIR@/nasfs.conf"
 
+needs_sudo() {
+    [ "$(id -u)" -ne 0 ] && [ ! -w "$(dirname "$PID_FILE")" ]
+}
+
 run_with_sudo() {
-    if [ "$(id -u)" -ne 0 ] && [ ! -w "$(dirname "$PID_FILE")" ]; then
+    if needs_sudo; then
         sudo "$@"
     else
         "$@"
@@ -40,8 +44,14 @@ start_server() {
     echo "Starting NASFS server..."
     run_with_sudo mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")" || return 1
     # The positional parameters belong to the inner shell.
-    # shellcheck disable=SC2016
-    run_with_sudo sh -c '"$1" "$2" >>"$3" 2>&1 &' nasfsctl "$BINARY" "$CONFIG" "$LOG_FILE" || return 1
+    if needs_sudo; then
+        # shellcheck disable=SC2016
+        sudo sh -c 'unset NASFS_SERVER_SIGNING_SEED NASFS_AUTHOR_PUBLIC_KEY; "$1" "$2" >>"$3" 2>&1 &' \
+            nasfsctl "$BINARY" "$CONFIG" "$LOG_FILE" || return 1
+    else
+        # shellcheck disable=SC2016
+        sh -c '"$1" "$2" >>"$3" 2>&1 &' nasfsctl "$BINARY" "$CONFIG" "$LOG_FILE" || return 1
+    fi
 
     count=0
     while [ "$count" -lt 20 ]; do

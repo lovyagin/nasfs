@@ -304,6 +304,39 @@ If cleanup cannot remove an orphan, the server logs a warning and continues
 serving readable files. Stop all older NASFS processes sharing the directory
 before upgrading.
 
+### Privileged startup and PUT publication
+
+For `nasfsctl` startup through sudo, provision the two absolute key paths
+in the installed `nasfs.conf`:
+
+```text
+ServerSigningSeed /etc/nasfs/server.seed
+AuthorPublicKey /etc/nasfs/author.pub
+```
+
+The configured paths take precedence over the corresponding environment
+variables. Automatic sudo startup clears those variables. Administrators
+must keep the installed executable, configuration, key files and their
+parent directories under trusted ownership and protected from unprivileged
+writes. Ordinary server startup still accepts the environment variables
+when the paths are absent from the config.
+
+PUT requires a storage directory owned by the server account, with no
+group or other write permission. On macOS it also requires the directory
+to have no extended ACL. NASFS supports replacement on local macOS
+filesystems and on Linux ext2/3/4, XFS, Btrfs, tmpfs, OverlayFS and F2FS.
+It serializes its publishers with `.nasfs-publish.lock` from the destination checks through
+the atomic rename. Replacement requires a regular file owned by the
+server account with owner write permission and effective write access.
+On macOS, a target with an extended ACL is protected from replacement as
+well. Stop all server instances before modifying storage or its permissions
+with external tools, and keep the lock file in place. On other
+filesystems, including NFS, PUT can atomically create a new name using a
+hard link and fails if that name already exists.
+
+The client and server count each successful socket read toward the idle
+timeout, including reads that contain only part of a frame.
+
 ## Client usage
 
 Upload:

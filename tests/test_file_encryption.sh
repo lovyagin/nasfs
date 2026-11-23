@@ -632,6 +632,26 @@ crash_server_during_put crash-after
 cmp "$TEST_ROOT/replacement.bin" "$TEST_ROOT/crash-recovery.bin"
 transfer put "$TEST_INPUT" encrypted_remote.bin
 
+# A single frame spans the idle interval but keeps making progress.
+kill -TERM "$SERVER_PID"
+wait "$SERVER_PID"
+SERVER_PID=
+rm "$LOG_DIR/server.log"
+cp "$TEST_ROOT/server-restarted.conf" "$TEST_ROOT/partial-frame.conf"
+printf 'ClientTimeout 2\n' >> "$TEST_ROOT/partial-frame.conf"
+start_integration_server "$TEST_ROOT/partial-frame.conf"
+NASFS_KEX_ALGORITHMS=ML-KEM-512 NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=super-secret \
+    python3 "$ROOT_DIR/tests/test_transfer_recovery.py" "$CLIENT_BIN" "$TEST_ROOT" \
+        "$STORAGE_DIR" "$TEST_INPUT" "$SERVER_PID" partial-put
+kill -TERM "$SERVER_PID"
+wait "$SERVER_PID"
+SERVER_PID=
+rm "$LOG_DIR/server.log"
+start_integration_server "$TEST_ROOT/server-restarted.conf"
+NASFS_KEX_ALGORITHMS=ML-KEM-512 NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=super-secret \
+    python3 "$ROOT_DIR/tests/test_transfer_recovery.py" "$CLIENT_BIN" "$TEST_ROOT" \
+        "$STORAGE_DIR" "$TEST_INPUT" "$SERVER_PID" partial-get
+
 # Change the actual server key on the same address and port.
 original_port=$NASFS_SERVER_PORT
 kill "$SERVER_PID"
@@ -719,7 +739,7 @@ if not any(name in env for name in ("NASFS_TEST_DELAY_WRITES",
                                     "NASFS_TEST_BLOCK_WRITES", "NASFS_TEST_OPEN_GATE",
                                     "NASFS_TEST_READ_GATE", "NASFS_TEST_RENAME_GATE",
                                     "NASFS_TEST_OPEN_IO", "NASFS_TEST_OPEN_SUBMISSION_ERROR",
-                                    "NASFS_TEST_READONLY_ORPHAN")):
+                                    "NASFS_TEST_READONLY_ORPHAN", "NASFS_TEST_DIRECTORY_NFS")):
     env.update(NASFS_TEST_READ_FAILURE="encrypted_remote.bin",
                NASFS_TEST_CLOSE_FAILURE=".nasfs-upload.")
 os.execve(server, [server, *sys.argv[1:]], env)
@@ -909,16 +929,14 @@ PYTHON
     wait "$SERVER_PID"
     SERVER_PID=
     rm "$LOG_DIR/server.log"
-    for lock_mode in normal exclusive all nfs; do
+    for lock_mode in normal exclusive all; do
         scenario=stop-during-publication
         rm -f "$TEST_ROOT/release-rename"
-        nfs=
-        if [[ $lock_mode == nfs ]]; then nfs=1; fi
-        if [[ $lock_mode == all || -n $nfs ]]; then
+        if [[ $lock_mode == all ]]; then
             scenario=publication-without-lock
             touch "$STORAGE_DIR/.nasfs-upload.00000000000000000000000000000000"
         fi
-        NASFS_TEST_DIRECTORY_LOCK_ERROR="$lock_mode" NASFS_TEST_DIRECTORY_NFS="$nfs" \
+        NASFS_TEST_DIRECTORY_LOCK_ERROR="$lock_mode" \
             NASFS_TEST_RENAME_GATE="$TEST_ROOT/release-rename" SERVER_BIN="$TEST_ROOT/fault-server" \
             start_integration_server "$TEST_ROOT/server-restarted.conf"
         cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
@@ -931,6 +949,22 @@ PYTHON
         test ! -e "$LOG_DIR/server.pid"
         rm "$LOG_DIR/server.log"
     done
+    NASFS_TEST_DIRECTORY_NFS=1 SERVER_BIN="$TEST_ROOT/fault-server" \
+        start_integration_server "$TEST_ROOT/server-restarted.conf"
+    cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
+    if transfer put "$TEST_INPUT" encrypted_remote.bin >"$LOG_DIR/nfs-replace.log" 2>&1; then
+        exit 1
+    fi
+    grep -Fq 'Server could not publish' "$LOG_DIR/nfs-replace.log"
+    transfer get encrypted_remote.bin "$TEST_ROOT/nfs-preserved.bin"
+    cmp "$TEST_ROOT/replacement.bin" "$TEST_ROOT/nfs-preserved.bin"
+    transfer put "$TEST_INPUT" nfs-created.bin
+    transfer get nfs-created.bin "$TEST_ROOT/nfs-created.bin"
+    cmp "$TEST_INPUT" "$TEST_ROOT/nfs-created.bin"
+    kill -TERM "$SERVER_PID"
+    wait "$SERVER_PID"
+    SERVER_PID=
+    rm "$LOG_DIR/server.log"
     start_integration_server "$TEST_ROOT/server-restarted.conf"
     cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
     transfer get encrypted_remote.bin "$TEST_ROOT/rename-stop-recovered.bin"

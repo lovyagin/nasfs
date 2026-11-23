@@ -268,6 +268,12 @@ trap 'ctl stop >/dev/null 2>&1 || true; cleanup_integration' EXIT
 if ctl status; then exit 1; fi
 ctl start
 ctl status
+ctl stop
+printf 'ServerSigningSeed %s\nAuthorPublicKey %s\n' \
+    "$NASFS_SERVER_SIGNING_SEED" "$NASFS_AUTHOR_PUBLIC_KEY" >> "$control_root/etc/nasfs/nasfs.conf"
+env -u NASFS_SERVER_SIGNING_SEED -u NASFS_AUTHOR_PUBLIC_KEY \
+    sh "$control_root/bin/nasfsctl" start
+ctl status
 ctl restart
 ctl status
 ctl stop

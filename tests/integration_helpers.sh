@@ -30,7 +30,7 @@ setup_integration() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
     export HOME="$TEST_ROOT/home"
-    mkdir -p "$STORAGE_DIR" "$LOG_DIR" "$HOME"
+    (umask 077; mkdir -p "$STORAGE_DIR" "$LOG_DIR" "$HOME")
     export NASFS_SERVER_SIGNING_SEED="$TEST_ROOT/server.seed"
     export NASFS_AUTHOR_SIGNING_SEED="$TEST_ROOT/author.seed"
     export NASFS_AUTHOR_PUBLIC_KEY="$TEST_ROOT/author.pub"

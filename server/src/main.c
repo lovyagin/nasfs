@@ -75,17 +75,21 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (session_load_identity(getenv("NASFS_SERVER_SIGNING_SEED"),
-                            getenv("NASFS_AUTHOR_PUBLIC_KEY")) < 0) {
-    fprintf(stderr,
-            "Expected NASFS_SERVER_SIGNING_SEED and NASFS_AUTHOR_PUBLIC_KEY "
-            "files\n");
-    return 1;
-  }
-
   memset(&global_config, 0, sizeof(global_config));
   if (load_config(config_file, &global_config) != 0) {
     fprintf(stderr, "Failed to load config file '%s'.\n", config_file);
+    free_config(&global_config);
+    return 1;
+  }
+
+  const char* signing_seed = global_config.server_signing_seed;
+  const char* author_key = global_config.author_public_key;
+  if (!signing_seed) signing_seed = getenv("NASFS_SERVER_SIGNING_SEED");
+  if (!author_key) author_key = getenv("NASFS_AUTHOR_PUBLIC_KEY");
+  if (session_load_identity(signing_seed, author_key) < 0) {
+    fprintf(stderr,
+            "Expected ServerSigningSeed and AuthorPublicKey or "
+            "NASFS_SERVER_SIGNING_SEED and NASFS_AUTHOR_PUBLIC_KEY files\n");
     free_config(&global_config);
     return 1;
   }

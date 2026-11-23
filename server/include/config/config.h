@@ -34,6 +34,8 @@ typedef struct {
   char* auth_password;     /**< Shared password for password authentication */
   char* authorized_keys_file;   /**< Path to PQ public keys allowed for login */
   char* pubkey_auth_algorithms; /**< Allowed PQ signature algorithms */
+  char* server_signing_seed;    /**< Server Ed25519 seed path */
+  char* author_public_key;      /**< Trusted file author key path */
   int block_size; /**< I/O block size in bytes for file transfers */
 } server_config_t;
 

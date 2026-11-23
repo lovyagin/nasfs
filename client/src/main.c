@@ -1172,13 +1172,13 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   (void)buf;
 
   if (nread > 0) {
+    last_activity = uv_now(stream->loop);
     client_recv_length += nread;
     while (client_recv_length > 0 && !uv_is_closing((uv_handle_t*)stream)) {
       nasfs_frame_t frame;
       int consumed =
           protocol_parse_frame(client_recv_buffer, client_recv_length, &frame);
       if (consumed > 0) {
-        last_activity = uv_now(stream->loop);
         if (!is_secure) {
           if (frame.type == NASFS_CMD_PQC_PUBLIC_KEY) {
             OQS_KEM* kem;

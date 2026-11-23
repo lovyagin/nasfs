@@ -27,3 +27,7 @@ AuthMethods password,publickey,password+publickey
 AuthPassword nasfs
 AuthorizedKeysFile @NASFS_SYSCONFDIR@/authorized_keys
 PubKeyAuthAlgorithms ML-DSA-65,ML-DSA-44
+
+# Absolute paths for service-managed key files.
+# ServerSigningSeed @NASFS_SYSCONFDIR@/server.seed
+# AuthorPublicKey @NASFS_SYSCONFDIR@/author.pub

@@ -296,6 +296,19 @@ run_client "$LOG_DIR/client_concurrent_get.log" "ML-KEM-512" "password" \
 concurrent_hash=$(hash_file "$TEST_DIR/concurrent.bin")
 test "$concurrent_hash" = "$INPUT_HASH" || test "$concurrent_hash" = "$other_hash"
 
+cp "$STORAGE_DIR/concurrent.bin" "$TEST_DIR/previous-container"
+chmod 400 "$STORAGE_DIR/concurrent.bin"
+expect_client_failure "$LOG_DIR/client_protected_target.log" "Server could not publish" \
+    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
+    put "$other_input" concurrent.bin
+cmp "$TEST_DIR/previous-container" "$STORAGE_DIR/concurrent.bin"
+chmod 600 "$STORAGE_DIR/concurrent.bin"
+run_client "$LOG_DIR/client_replace.log" "ML-KEM-512" "password" \
+    "e2e-password" "" "ML-DSA-65" put "$other_input" concurrent.bin
+run_client "$LOG_DIR/client_replaced_get.log" "ML-KEM-512" "password" \
+    "e2e-password" "" "ML-DSA-65" get concurrent.bin "$TEST_DIR/replaced.bin"
+cmp "$other_input" "$TEST_DIR/replaced.bin"
+
 mkdir "$STORAGE_DIR/upload_destination_directory"
 expect_client_failure "$LOG_DIR/client_upload_publish_failure.log" "Server could not publish" \
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \

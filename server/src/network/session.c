@@ -1648,7 +1648,6 @@ static void process_session_frames(client_session_t* session) {
       if (consumed < 0) session_close((uv_handle_t*)&session->handle);
       return;
     }
-    session->last_activity = uv_now(session->handle.loop);
     session_dispatch_frame(session, &frame);
     if (session->state == SESSION_STATE_ERROR) return;
     memmove(session->recv_buffer, session->recv_buffer + consumed,
@@ -1668,6 +1667,7 @@ static void session_on_read(uv_stream_t* stream, ssize_t nread,
 
   if (session->state == SESSION_STATE_ERROR) return;
   if (nread > 0) {
+    session->last_activity = uv_now(stream->loop);
     session->recv_length += (size_t)nread;
     process_session_frames(session);
   } else if (nread < 0) {
