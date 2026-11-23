@@ -5,10 +5,11 @@
 #include <stdint.h>
 
 #define NASFS_STORAGE_NAME_MAX 255
-#define NASFS_UPLOAD_TEMP_SIZE 48
+#define NASFS_UPLOAD_TEMP_SIZE 64
 
 typedef struct {
   int root_fd;
+  int uploads_locked;
 } nasfs_storage_t;
 
 /* Returns 0 on success or a negative libuv error on failure. */

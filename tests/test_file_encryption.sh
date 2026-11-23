@@ -247,35 +247,67 @@ assert new_private.read_text().splitlines()[2] == new_public.read_text().split()
 PYTHON
 fi
 
-# Every file algorithm and KDF runs through the real CLI.
-while read -r cipher hash kdf; do
-    remote="profile-$hash.bin"
-    NASFS_FILE_CIPHER="$cipher" NASFS_FILE_HASH="$hash" NASFS_KDF="$kdf" \
-        transfer put "$TEST_INPUT" "$remote"
-    NASFS_KDF="$kdf" transfer get "$remote" "$TEST_ROOT/$remote"
-    cmp "$TEST_INPUT" "$TEST_ROOT/$remote"
-done <<'PROFILES'
-xsalsa20poly1305 blake2b argon2id
-xchacha20poly1305 sha256 pbkdf2
-aes256gcm crc32 hkdf
-xsalsa20poly1305 adler32 argon2id
-PROFILES
-# Exercise the full Cartesian product on a nonempty fixture. The GET
-# intentionally omits the cipher and hash settings used for PUT.
+# New writes exercise all cipher/hash combinations with Argon2id.
 printf 'NASLUKS file profile matrix\n' > "$TEST_ROOT/profile-input.bin"
 for cipher in xsalsa20poly1305 xchacha20poly1305 aes256gcm; do
     for hash in blake2b sha256 crc32 adler32; do
-        for kdf in argon2id pbkdf2 hkdf; do
-            remote="matrix-$cipher-$hash-$kdf.bin"
-            NASFS_FILE_CIPHER="$cipher" NASFS_FILE_HASH="$hash" NASFS_KDF="$kdf" \
-                transfer put "$TEST_ROOT/profile-input.bin" "$remote" \
-                > "$LOG_DIR/matrix-put.log" 2>&1
-            NASFS_KDF="$kdf" transfer get "$remote" "$TEST_ROOT/profile-output.bin" \
-                > "$LOG_DIR/matrix-get.log" 2>&1
-            cmp "$TEST_ROOT/profile-input.bin" "$TEST_ROOT/profile-output.bin"
-        done
+        remote="matrix-$cipher-$hash.bin"
+        NASFS_FILE_CIPHER="$cipher" NASFS_FILE_HASH="$hash" NASFS_KDF=argon2id \
+            transfer put "$TEST_ROOT/profile-input.bin" "$remote" \
+            > "$LOG_DIR/matrix-put.log" 2>&1
+        transfer get "$remote" "$TEST_ROOT/profile-output.bin" \
+            > "$LOG_DIR/matrix-get.log" 2>&1
+        cmp "$TEST_ROOT/profile-input.bin" "$TEST_ROOT/profile-output.bin"
     done
 done
+
+# Signed NASLUKS objects produced by 80a63a5 with the original password KDFs.
+fixture_dir="$ROOT_DIR/tests/fixtures"
+compat_home="$TEST_ROOT/nasluks-compat-home"
+cp -R "$HOME" "$compat_home"
+compat_author="$TEST_ROOT/nasluks-compat-author.pub"
+python3 - "$fixture_dir" "$compat_home" "$compat_author" "$STORAGE_DIR" <<'PYTHON'
+import base64
+from pathlib import Path
+import sys
+
+fixtures, home, author, storage = map(Path, sys.argv[1:])
+for name, output in (
+    ("master-salt", home / ".nasfs/master.salt"),
+    ("author", author),
+    ("hkdf", storage / "hkdf.bin"),
+    ("pbkdf2", storage / "pbkdf2.bin"),
+):
+    output.write_bytes(base64.b64decode((fixtures / f"nasluks-{name}.b64").read_bytes()))
+    output.chmod(0o600)
+PYTHON
+printf 'NASLUKS compatibility with 80a63a5\n' > "$TEST_ROOT/compat-expected"
+for kdf in hkdf pbkdf2; do
+    HOME="$compat_home" NASFS_AUTHOR_PUBLIC_KEY="$compat_author" NASFS_KDF="$kdf" \
+        transfer get "$kdf.bin" "$TEST_ROOT/compat-output"
+    cmp "$TEST_ROOT/compat-expected" "$TEST_ROOT/compat-output"
+done
+if HOME="$compat_home" NASFS_AUTHOR_PUBLIC_KEY="$compat_author" NASFS_KDF=argon2id \
+    transfer get pbkdf2.bin "$TEST_ROOT/compat-output" > "$LOG_DIR/wrong-kdf.log" 2>&1; then
+    exit 1
+fi
+grep -Fq 'Cannot open NASLUKS owner slot' "$LOG_DIR/wrong-kdf.log"
+cmp "$TEST_ROOT/compat-expected" "$TEST_ROOT/compat-output"
+
+for kdf in hkdf hkdf-sha256 pbkdf2 pbkdf2-sha256; do
+    for command in put mput; do
+        args=("$TEST_INPUT")
+        if [[ $command == put ]]; then args+=(rejected-kdf.bin); fi
+        if HOME="$blocked_home" NASFS_KDF="$kdf" \
+            transfer "$command" "${args[@]}" > "$LOG_DIR/rejected-kdf.log" 2>&1; then
+            exit 1
+        fi
+        grep -Fq 'NASFS_KDF must be argon2id' "$LOG_DIR/rejected-kdf.log"
+        if grep -Fq 'Connecting to' "$LOG_DIR/rejected-kdf.log"; then exit 1; fi
+    done
+done
+test ! -e "$STORAGE_DIR/rejected-kdf.bin"
+
 for setting in NASFS_FILE_CIPHER NASFS_FILE_HASH NASFS_KDF NASFS_BLOCK_SIZE; do
     if NASFS_AUTH_PASSWORD=super-secret env "$setting=invalid" "$CLIENT_BIN" \
         put "$TEST_INPUT" invalid-profile.bin > "$LOG_DIR/invalid-profile.log" 2>&1; then
@@ -284,13 +316,6 @@ for setting in NASFS_FILE_CIPHER NASFS_FILE_HASH NASFS_KDF NASFS_BLOCK_SIZE; do
     grep -Fq "Invalid $setting" "$LOG_DIR/invalid-profile.log"
     test ! -e "$STORAGE_DIR/invalid-profile.bin"
 done
-if NASFS_KDF=argon2id transfer get profile-sha256.bin "$TEST_ROOT/profile-sha256.bin" \
-    > "$LOG_DIR/wrong-kdf.log" 2>&1; then
-    exit 1
-fi
-grep -Fq 'Cannot open NASLUKS owner slot' "$LOG_DIR/wrong-kdf.log"
-cmp "$TEST_INPUT" "$TEST_ROOT/profile-sha256.bin"
-
 # Test 1: Upload with encryption enabled
 printf '%b%s%b\n' "$YELLOW" "1. Uploading file with encryption enabled..." "$NC"
 export NASFS_ENCRYPTION_KEY="my-secret-encryption-password-123!"
@@ -504,7 +529,7 @@ import sys
 
 storage, root = map(Path, sys.argv[1:])
 original = (storage / "encrypted_remote.bin").read_bytes()
-other = (storage / "profile-blake2b.bin").read_bytes()
+other = (storage / "concurrent-a.bin").read_bytes()
 
 def records(container):
     assert container[24] & 0xe0 == 0xe0
@@ -594,16 +619,14 @@ crash_server_during_put() {
 
 crash_server_during_put crash-before
 cmp "$TEST_INPUT" "$TEST_ROOT/crash-recovery.bin"
-# Orphaned staging files are excluded from the public object namespace.
-orphan=$(find "$STORAGE_DIR" -maxdepth 1 -name '.nasfs-upload.*' -print)
-test -f "$orphan"
-if transfer get "$(basename "$orphan")" "$TEST_ROOT/unpublished.bin" \
+# The crash test checks for staging before restart. Recovery removes it.
+test -z "$(find "$STORAGE_DIR" -maxdepth 1 -name '.nasfs-upload.*' -print)"
+if transfer get .nasfs-upload.reserved "$TEST_ROOT/unpublished.bin" \
     > "$LOG_DIR/orphan_get.log" 2>&1; then
     exit 1
 fi
 grep -Fq 'Invalid file name' "$LOG_DIR/orphan_get.log"
 test ! -e "$TEST_ROOT/unpublished.bin"
-rm "$orphan"
 
 crash_server_during_put crash-after
 cmp "$TEST_ROOT/replacement.bin" "$TEST_ROOT/crash-recovery.bin"
@@ -666,13 +689,13 @@ before=$(hash_file "$SERVER_STORED_FILE")
 if transfer put "$TEST_INPUT" encrypted_remote.bin > "$LOG_DIR/server_short_write.log" 2>&1; then
     exit 1
 fi
-grep -Fq 'short write' "$LOG_DIR/server.log"
-test "$(hash_file "$SERVER_STORED_FILE")" = "$before"
 deadline=$((SECONDS + 5))
 while compgen -G "$STORAGE_DIR/.nasfs-upload.*" >/dev/null; do
     test "$SECONDS" -lt "$deadline"
     sleep 0.02
 done
+grep -Fq 'short write' "$LOG_DIR/server.log"
+test "$(hash_file "$SERVER_STORED_FILE")" = "$before"
 
 if [[ $(uname -s) == Linux ]]; then
     kill -TERM "$SERVER_PID"
@@ -694,7 +717,8 @@ preload = f"{asan[1]}:{hook}" if asan else str(hook)
 env = dict(os.environ, LD_PRELOAD=preload)
 if not any(name in env for name in ("NASFS_TEST_DELAY_WRITES",
                                     "NASFS_TEST_BLOCK_WRITES", "NASFS_TEST_OPEN_GATE",
-                                    "NASFS_TEST_READ_GATE", "NASFS_TEST_RENAME_GATE")):
+                                    "NASFS_TEST_READ_GATE", "NASFS_TEST_RENAME_GATE",
+                                    "NASFS_TEST_OPEN_IO", "NASFS_TEST_OPEN_SUBMISSION_ERROR")):
     env.update(NASFS_TEST_READ_FAILURE="encrypted_remote.bin",
                NASFS_TEST_CLOSE_FAILURE=".nasfs-upload.")
 os.execve(server, [server, *sys.argv[1:]], env)
@@ -784,18 +808,83 @@ PYTHON
     test -z "$(find "$STORAGE_DIR" -maxdepth 1 -name '.nasfs-upload.*' -print)"
     test "$(hash_file "$SERVER_STORED_FILE")" = "$before"
 
-    rm "$LOG_DIR/server.log"
-    UV_USE_IO_URING=0 NASFS_TEST_BLOCK_READS=encrypted_remote.bin \
-        NASFS_TEST_READ_GATE="$TEST_ROOT/release-read" \
-        SERVER_BIN="$TEST_ROOT/fault-server" start_integration_server "$TEST_ROOT/server-restarted.conf"
+    for read_phase in read prefix; do
+        rm "$LOG_DIR/server.log" "$TEST_ROOT/release-read" 2>/dev/null || true
+        if [[ $read_phase == prefix ]]; then
+            export NASFS_TEST_BLOCK_PREFIX=1
+        fi
+        UV_USE_IO_URING=0 NASFS_TEST_BLOCK_READS=encrypted_remote.bin \
+            NASFS_TEST_READ_GATE="$TEST_ROOT/release-read" \
+            SERVER_BIN="$TEST_ROOT/fault-server" start_integration_server "$TEST_ROOT/server-restarted.conf"
+        cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
+        NASFS_KEX_ALGORITHMS=ML-KEM-512 NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=super-secret \
+            python3 "$ROOT_DIR/tests/test_transfer_recovery.py" "$CLIENT_BIN" "$TEST_ROOT" \
+            "$STORAGE_DIR" "$TEST_INPUT" "$SERVER_PID" "stop-during-$read_phase"
+        wait "$SERVER_PID"
+        SERVER_PID=
+        test ! -e "$LOG_DIR/server.pid"
+        rm "$LOG_DIR/server.log"
+        unset NASFS_TEST_BLOCK_PREFIX
+    done
+    for phase in put-header get-header get-slot; do
+        target=encrypted_remote.bin
+        if [[ $phase == put-header ]]; then target=.nasfs-upload.; fi
+        NASFS_TEST_OPEN_IO="$phase" NASFS_TEST_OPEN_IO_OBJECT="$target" \
+            SERVER_BIN="$TEST_ROOT/fault-server" start_integration_server "$TEST_ROOT/server-restarted.conf"
+        cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
+        if { if [[ $phase == put-header ]]; then
+                 transfer put "$TEST_INPUT" encrypted_remote.bin
+             else
+                 transfer get encrypted_remote.bin "$TEST_ROOT/keep.bin"
+             fi; } > "$LOG_DIR/short-$phase.log" 2>&1; then
+            exit 1
+        fi
+        if [[ $phase != get-slot ]]; then
+            grep -Fq 'Header ' "$LOG_DIR/short-$phase.log"
+        fi
+        cmp "$TEST_ROOT/expected-keep" "$TEST_ROOT/keep.bin"
+        kill -TERM "$SERVER_PID"
+        wait "$SERVER_PID"
+        SERVER_PID=
+        rm "$LOG_DIR/server.log"
+        test "$(hash_file "$SERVER_STORED_FILE")" = "$before"
+        test -z "$(find "$STORAGE_DIR" -maxdepth 1 -name '.nasfs-upload.*' -print)"
+    done
+
+    NASFS_TEST_OPEN_SUBMISSION_ERROR=1 SERVER_BIN="$TEST_ROOT/fault-server" \
+        start_integration_server "$TEST_ROOT/server-restarted.conf"
     cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
-    NASFS_KEX_ALGORITHMS=ML-KEM-512 NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=super-secret \
-        python3 "$ROOT_DIR/tests/test_transfer_recovery.py" "$CLIENT_BIN" "$TEST_ROOT" \
-        "$STORAGE_DIR" "$TEST_INPUT" "$SERVER_PID" stop-during-read
+    if transfer put "$TEST_INPUT" encrypted_remote.bin > "$LOG_DIR/submit-open.log" 2>&1 ||
+        transfer get encrypted_remote.bin "$TEST_ROOT/keep.bin" >> "$LOG_DIR/submit-open.log" 2>&1; then
+        exit 1
+    fi
+    test "$(grep -Fc 'Open request submission failed' "$LOG_DIR/server.log")" -eq 2
+    cmp "$TEST_ROOT/expected-keep" "$TEST_ROOT/keep.bin"
+    kill -TERM "$SERVER_PID"
     wait "$SERVER_PID"
     SERVER_PID=
-    test ! -e "$LOG_DIR/server.pid"
     rm "$LOG_DIR/server.log"
+
+    for scenario in stop-during-put-header stop-during-get-header stop-during-get-slot disconnect-put-header; do
+        phase=${scenario##stop-during-}
+        phase=${phase##disconnect-}
+        target=encrypted_remote.bin
+        if [[ $phase == put-header ]]; then target=.nasfs-upload.; fi
+        rm -f "$TEST_ROOT/release-open-io"
+        NASFS_TEST_OPEN_IO="$phase" NASFS_TEST_OPEN_IO_OBJECT="$target" \
+            NASFS_TEST_OPEN_IO_GATE="$TEST_ROOT/release-open-io" \
+            SERVER_BIN="$TEST_ROOT/fault-server" start_integration_server "$TEST_ROOT/server-restarted.conf"
+        cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
+        NASFS_KEX_ALGORITHMS=ML-KEM-512 NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=super-secret \
+            python3 "$ROOT_DIR/tests/test_transfer_recovery.py" "$CLIENT_BIN" "$TEST_ROOT" \
+            "$STORAGE_DIR" "$TEST_INPUT" "$SERVER_PID" "$scenario"
+        if [[ $scenario == disconnect-* ]]; then kill -TERM "$SERVER_PID"; fi
+        wait "$SERVER_PID"
+        SERVER_PID=
+        test ! -e "$LOG_DIR/server.pid"
+        test -z "$(find "$STORAGE_DIR" -maxdepth 1 -name '.nasfs-upload.*' -print)"
+        rm "$LOG_DIR/server.log"
+    done
     start_integration_server "$TEST_ROOT/server-restarted.conf"
     cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
     transfer get encrypted_remote.bin "$TEST_ROOT/read-stop-recovered.bin"
@@ -805,16 +894,28 @@ PYTHON
     wait "$SERVER_PID"
     SERVER_PID=
     rm "$LOG_DIR/server.log"
-    NASFS_TEST_RENAME_GATE="$TEST_ROOT/release-rename" SERVER_BIN="$TEST_ROOT/fault-server" \
-        start_integration_server "$TEST_ROOT/server-restarted.conf"
-    cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
-    NASFS_KEX_ALGORITHMS=ML-KEM-512 NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=super-secret \
-        python3 "$ROOT_DIR/tests/test_transfer_recovery.py" "$CLIENT_BIN" "$TEST_ROOT" \
-        "$STORAGE_DIR" "$TEST_INPUT" "$SERVER_PID" stop-during-publication
-    wait "$SERVER_PID"
-    SERVER_PID=
-    test ! -e "$LOG_DIR/server.pid"
-    rm "$LOG_DIR/server.log"
+    for lock_mode in normal exclusive all nfs; do
+        scenario=stop-during-publication
+        rm -f "$TEST_ROOT/release-rename"
+        nfs=
+        if [[ $lock_mode == nfs ]]; then nfs=1; fi
+        if [[ $lock_mode == all || -n $nfs ]]; then
+            scenario=publication-without-lock
+            touch "$STORAGE_DIR/.nasfs-upload.00000000000000000000000000000000"
+        fi
+        NASFS_TEST_DIRECTORY_LOCK_ERROR="$lock_mode" NASFS_TEST_DIRECTORY_NFS="$nfs" \
+            NASFS_TEST_RENAME_GATE="$TEST_ROOT/release-rename" SERVER_BIN="$TEST_ROOT/fault-server" \
+            start_integration_server "$TEST_ROOT/server-restarted.conf"
+        cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
+        NASFS_RECOVERY_PEER_SERVER="$SERVER_BIN" NASFS_KEX_ALGORITHMS=ML-KEM-512 \
+            NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=super-secret \
+            python3 "$ROOT_DIR/tests/test_transfer_recovery.py" "$CLIENT_BIN" "$TEST_ROOT" \
+            "$STORAGE_DIR" "$TEST_INPUT" "$SERVER_PID" "$scenario"
+        wait "$SERVER_PID"
+        SERVER_PID=
+        test ! -e "$LOG_DIR/server.pid"
+        rm "$LOG_DIR/server.log"
+    done
     start_integration_server "$TEST_ROOT/server-restarted.conf"
     cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
     transfer get encrypted_remote.bin "$TEST_ROOT/rename-stop-recovered.bin"

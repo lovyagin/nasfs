@@ -65,7 +65,7 @@ static void close_server_handle(uv_handle_t* handle, void* arg) {
  * @return Exit status code.
  */
 int main(int argc, char** argv) {
-  const char* config_file = (argc > 1) ? argv[1] : "config/nasfs.conf";
+  const char* config_file = (argc > 1) ? argv[1] : "nasfs.conf";
   int exit_code = 0;
 
   signal(SIGPIPE, SIG_IGN);

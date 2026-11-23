@@ -6,28 +6,104 @@
 #include "config.h"
 #endif
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sodium.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <uv.h>
 
 #include "storage.h"
 
+#if defined(__linux__)
+#include <linux/magic.h>
+#include <sys/vfs.h>
+#elif defined(__APPLE__)
+#include <sys/mount.h>
+#endif
+
+static const char upload_prefix[] = ".nasfs-upload.";
+static const char unlocked_upload_prefix[] = ".nasfs-upload.unlocked.";
+
+static int sweep_uploads(int root) {
+  int scan = openat(root, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (scan < 0) return uv_translate_sys_error(errno);
+  DIR* entries = fdopendir(scan);
+  if (!entries) {
+    int rc = uv_translate_sys_error(errno);
+    close(scan);
+    return rc;
+  }
+
+  int rc = 0;
+  for (;;) {
+    errno = 0;
+    struct dirent* entry = readdir(entries);
+    if (!entry) {
+      if (errno) rc = uv_translate_sys_error(errno);
+      break;
+    }
+    const char* name = entry->d_name;
+    if (strncmp(name, upload_prefix, sizeof(upload_prefix) - 1) != 0) continue;
+    const char* suffix = name + sizeof(upload_prefix) - 1;
+    if (strlen(suffix) != 32 || strspn(suffix, "0123456789abcdef") != 32)
+      continue;
+
+    struct stat st;
+    if (fstatat(root, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+      if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1)
+        continue;
+      if (unlinkat(root, name, 0) == 0) continue;
+    }
+    if (errno != ENOENT) {
+      rc = uv_translate_sys_error(errno);
+      break;
+    }
+  }
+  closedir(entries);
+  return rc;
+}
+
+static int can_coordinate_uploads(int root) {
+#if defined(__linux__)
+  struct statfs fs;
+  return fstatfs(root, &fs) == 0 && fs.f_type != NFS_SUPER_MAGIC;
+#elif defined(__APPLE__)
+  struct statfs fs;
+  return fstatfs(root, &fs) == 0 && strcmp(fs.f_fstypename, "nfs") != 0;
+#else
+  (void)root;
+  return 1;
+#endif
+}
+
 int nasfs_storage_init(nasfs_storage_t* storage, const char* directory) {
   storage->root_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  return storage->root_fd < 0 ? uv_translate_sys_error(errno) : 0;
+  if (storage->root_fd < 0) return uv_translate_sys_error(errno);
+
+  storage->uploads_locked = 0;
+  // NFS can use client-local locks or share storage with local writers.
+  if (!can_coordinate_uploads(storage->root_fd)) return 0;
+
+  // A directory opened read-only may only support shared locks.
+  // Only sweep under an exclusive lock, and only use sweepable names while
+  // holding a shared lock for the lifetime of all uploads.
+  int rc = 0;
+  if (flock(storage->root_fd, LOCK_EX | LOCK_NB) == 0)
+    rc = sweep_uploads(storage->root_fd);
+  storage->uploads_locked = rc == 0 && flock(storage->root_fd, LOCK_SH) == 0;
+  if (rc < 0) nasfs_storage_close(storage);
+  return rc;
 }
 
 void nasfs_storage_close(nasfs_storage_t* storage) {
   if (storage->root_fd >= 0) close(storage->root_fd);
   storage->root_fd = -1;
 }
-
-static const char upload_prefix[] = ".nasfs-upload.";
 
 static int is_flat_name(const uint8_t* name, size_t length) {
   return length != 0 && length <= NASFS_STORAGE_NAME_MAX &&
@@ -72,13 +148,15 @@ int nasfs_storage_open_object(const nasfs_storage_t* storage,
 int nasfs_storage_begin_upload(const nasfs_storage_t* storage,
                                char temp_name[NASFS_UPLOAD_TEMP_SIZE]) {
   char candidate[NASFS_UPLOAD_TEMP_SIZE];
-  memcpy(candidate, upload_prefix, sizeof(upload_prefix) - 1);
+  const char* prefix =
+      storage->uploads_locked ? upload_prefix : unlocked_upload_prefix;
+  size_t prefix_len = strlen(prefix);
+  memcpy(candidate, prefix, prefix_len);
   for (int attempt = 0; attempt < 8; attempt++) {
     unsigned char random_id[16];
     randombytes_buf(random_id, sizeof(random_id));
-    sodium_bin2hex(candidate + sizeof(upload_prefix) - 1,
-                   sizeof(candidate) - (sizeof(upload_prefix) - 1), random_id,
-                   sizeof(random_id));
+    sodium_bin2hex(candidate + prefix_len, sizeof(candidate) - prefix_len,
+                   random_id, sizeof(random_id));
     int fd = openat(storage->root_fd, candidate,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd >= 0) {

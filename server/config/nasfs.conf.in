@@ -8,15 +8,15 @@ MaxConn 5 # Maximum number of concurrent connections allowed
 ClientTimeout 60 # Client timeout in seconds
 
 # Logging settings
-LogFile /usr/local/var/log/nasfs/nasfs-server.log # Log file path
+LogFile @NASFS_LOCALSTATEDIR@/log/nasfs/nasfs-server.log # Log file path
 LogLevel Debug # (Debug, Info, Warning, Error)
 
 # Daemon settings
 DaemonMode Yes
-PidFile /usr/local/var/run/nasfs/nasfs-server.pid
+PidFile @NASFS_LOCALSTATEDIR@/run/nasfs/nasfs-server.pid
 
 # File serving settings
-StorageDir /usr/local/share/nasfs/storage # Directory for serving files
+StorageDir @NASFS_DATADIR@/nasfs/storage # Directory for serving files
 
 # Secure channel negotiation
 KexAlgorithms ML-KEM-512,Kyber512,ML-KEM-768,Kyber768
@@ -25,5 +25,5 @@ CipherAlgorithms xchacha20poly1305
 # Authentication
 AuthMethods password,publickey,password+publickey
 AuthPassword nasfs
-AuthorizedKeysFile /usr/local/etc/nasfs/authorized_keys
+AuthorizedKeysFile @NASFS_SYSCONFDIR@/authorized_keys
 PubKeyAuthAlgorithms ML-DSA-65,ML-DSA-44

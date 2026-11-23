@@ -1,12 +1,20 @@
 bin_PROGRAMS = nasfs_server
 
+noinst_HEADERS = \
+    include/config/config.h \
+    include/logging/log.h \
+    include/network/session.h \
+    include/storage.h \
+    include/utils/daemon.h \
+    include/utils/pid_file.h \
+    include/utils/signal_handler.h
+
 nasfs_server_SOURCES = \
     src/main.c \
     src/config/config.c \
     src/logging/log.c \
     src/network/session.c \
     src/storage.c \
-    include/storage.h \
     src/utils/daemon.c \
     src/utils/pid_file.c \
     src/utils/signal_handler.c

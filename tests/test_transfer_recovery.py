@@ -176,8 +176,16 @@ def main():
     put = ["put", str(replacement), remote]
     get = ["get", remote, str(destination)]
 
+    def verify_second_connection():
+        output = root / "parallel-get.bin"
+        subprocess.run([client, "get", "concurrent-a.bin", str(output)],
+                       check=True, capture_output=True, timeout=5)
+        assert output.read_bytes() == source.read_bytes()
+
     if mode:
-        if mode == ["stop-during-publication"]:
+        if mode[0] in ("stop-during-publication", "publication-without-lock"):
+            unlocked = mode == ["publication-without-lock"]
+            orphan = storage / (".nasfs-upload." + "0" * 32)
             server_pid = int(server_pid)
             output_log = root / "logs/server_stdout.log"
             gate = root / "release-rename"
@@ -190,7 +198,40 @@ def main():
                         assert time.monotonic() < deadline, output_log.read_text()
                         time.sleep(0.01)
                     assert (storage / remote).read_bytes() == previous
-                    assert len(list(storage.glob(".nasfs-upload.*"))) == 1
+                    uploads = set(storage.glob(".nasfs-upload.*"))
+                    if unlocked:
+                        assert orphan in uploads
+                        uploads.remove(orphan)
+                    assert len(uploads) == 1, uploads
+                    active = uploads.pop()
+                    assert active.name.startswith(".nasfs-upload.unlocked.") == unlocked
+                    verify_second_connection()
+                    # A second server starting on this directory must leave
+                    # the first server's in-flight staging file intact.
+                    peer_log = root / "logs/peer.log"
+                    peer_log.unlink(missing_ok=True)
+                    peer_config = root / "peer.conf"
+                    config = (root / "server-restarted.conf").read_text()
+                    config = config.replace(str(root / "logs/server.log"), str(peer_log))
+                    config = config.replace(str(root / "logs/server.pid"),
+                                            str(root / "logs/peer.pid"))
+                    peer_config.write_text(config)
+                    server = os.environ["NASFS_RECOVERY_PEER_SERVER"]
+                    with subprocess.Popen([server, peer_config],
+                                          stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL) as peer:
+                        try:
+                            deadline = time.monotonic() + 5
+                            while not peer_log.exists() or "listening on" not in peer_log.read_text():
+                                assert peer.poll() is None
+                                assert time.monotonic() < deadline
+                                time.sleep(0.01)
+                            assert set(storage.glob(".nasfs-upload.*")) == {active}
+                        finally:
+                            if peer.poll() is None:
+                                peer.terminate()
+                            peer.wait(timeout=5)
+                    assert peer.returncode == 0, peer_log.read_text()
                     os.kill(server_pid, signal.SIGTERM)
                     gate.touch()
                     stdout, stderr = child.communicate(timeout=5)
@@ -203,8 +244,8 @@ def main():
                     gate.touch()
                     if child.poll() is None:
                         child.kill()
-            assert (storage / remote).read_bytes() != previous
             await_cleanup(storage, ".nasfs-upload.*")
+            assert (storage / remote).read_bytes() != previous
             return
         if mode == ["cancel-slow-mput"]:
             items = [root / f"slow-put-{index}.bin" for index in range(3)]
@@ -261,12 +302,23 @@ def main():
                 assert (output / name).read_bytes() == b"Previous destination"
             await_cleanup(output, ".nasfs-download.*")
             return
-        if mode in (["stop-during-open"], ["stop-during-read"]):
-            reading = mode == ["stop-during-read"]
+        stop_prefix = "stop-during-"
+        opening_io = mode[0][len(stop_prefix):] if mode[0].startswith(stop_prefix) else ""
+        header_phases = ("put-header", "get-header", "get-slot")
+        if mode == ["disconnect-put-header"] or opening_io in (
+            "open", "read", "prefix", *header_phases
+        ):
+            disconnecting = mode == ["disconnect-put-header"]
+            if disconnecting:
+                opening_io = "put-header"
+            reading = opening_io not in ("open", "put-header")
             server_pid = int(server_pid)
             output_log = root / "logs/server_stdout.log"
             gate = root / ("release-read" if reading else "release-open")
             marker = "blocked record read" if reading else "blocked upload open"
+            if opening_io in header_phases:
+                gate = root / "release-open-io"
+                marker = f"blocked {opening_io}"
             if reading:
                 destination.write_bytes(b"Previous destination")
             with subprocess.Popen([client, *(get if reading else put)], stdout=subprocess.DEVNULL,
@@ -277,16 +329,24 @@ def main():
                         assert child.poll() is None
                         assert time.monotonic() < deadline, output_log.read_text()
                         time.sleep(0.01)
-                    os.kill(server_pid, signal.SIGTERM)
-                    _, stderr = child.communicate(timeout=5)
-                    assert child.returncode == 1, stderr
-                    assert b"PUT outcome unknown" not in stderr, stderr
-                    assert "shutting down cleanly" in (root / "logs/server.log").read_text()
-                    os.kill(server_pid, 0)
+                    if opening_io == "prefix" or opening_io in header_phases:
+                        verify_second_connection()
+                    if disconnecting:
+                        child.kill()
+                        child.wait(timeout=5)
+                    else:
+                        os.kill(server_pid, signal.SIGTERM)
+                        _, stderr = child.communicate(timeout=5)
+                        assert child.returncode == 1, stderr
+                        assert b"PUT outcome unknown" not in stderr, stderr
+                        assert "shutting down cleanly" in (root / "logs/server.log").read_text()
+                        os.kill(server_pid, 0)
                 finally:
                     gate.touch()
                     if child.poll() is None:
                         child.kill()
+            if disconnecting:
+                await_cleanup(storage, ".nasfs-upload.*")
             assert (storage / remote).read_bytes() == previous
             if reading:
                 assert destination.read_bytes() == b"Previous destination"

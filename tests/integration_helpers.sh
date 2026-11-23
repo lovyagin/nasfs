@@ -47,7 +47,12 @@ setup_integration() {
 
 start_integration_server() {
     local config=$1 deadline=$((SECONDS + 10)) port=
-    "$SERVER_BIN" "$config" > "$LOG_DIR/server_stdout.log" 2>&1 &
+    shift
+    if [[ -n $config ]]; then
+        "$@" "$SERVER_BIN" "$config" > "$LOG_DIR/server_stdout.log" 2>&1 &
+    else
+        "$@" "$SERVER_BIN" > "$LOG_DIR/server_stdout.log" 2>&1 &
+    fi
     SERVER_PID=$!
 
     while (( SECONDS < deadline )) && kill -0 "$SERVER_PID" 2>/dev/null; do

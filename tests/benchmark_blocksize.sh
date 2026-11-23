@@ -142,7 +142,7 @@ run_nasfs_put() {
     NASFS_ENCRYPTION_KEY="benchkey" \
     NASFS_FILE_CIPHER="$cipher" \
     NASFS_FILE_HASH="blake2b" \
-    NASFS_KDF="hkdf" \
+    NASFS_KDF="argon2id" \
     NASFS_BLOCK_SIZE="$block_size" \
     NASFS_SERVER_IP="127.0.0.1" \
     NASFS_SERVER_PORT="$SERVER_PORT" \
@@ -164,7 +164,7 @@ run_nasfs_get() {
     NASFS_ENCRYPTION_KEY="benchkey" \
     NASFS_FILE_CIPHER="$cipher" \
     NASFS_FILE_HASH="blake2b" \
-    NASFS_KDF="hkdf" \
+    NASFS_KDF="argon2id" \
     NASFS_BLOCK_SIZE="$block_size" \
     NASFS_SERVER_IP="127.0.0.1" \
     NASFS_SERVER_PORT="$SERVER_PORT" \

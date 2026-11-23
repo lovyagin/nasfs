@@ -43,6 +43,10 @@ pkg_check_modules(OPENSSL REQUIRED openssl)
 set(NASFS_BINDIR "${CMAKE_INSTALL_FULL_BINDIR}")
 set(NASFS_SYSCONFDIR "${CMAKE_INSTALL_FULL_SYSCONFDIR}/nasfs")
 set(NASFS_LOCALSTATEDIR "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}")
+set(NASFS_DATADIR "${CMAKE_INSTALL_FULL_DATADIR}")
+
+configure_file(server/config/nasfs.conf.in ${CMAKE_CURRENT_BINARY_DIR}/nasfs.conf
+               @ONLY)
 
 configure_file(utils/nasfsctl.in ${CMAKE_CURRENT_BINARY_DIR}/nasfsctl @ONLY)
 configure_file(systemd/nasfs.service.in ${CMAKE_CURRENT_BINARY_DIR}/nasfs.service
@@ -195,7 +199,7 @@ install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/nasfsctl
   DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-install(FILES server/config/nasfs.conf
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/nasfs.conf
   DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/nasfs
 )
 
@@ -207,3 +211,5 @@ endif()
 
 install(DIRECTORY DESTINATION ${CMAKE_INSTALL_LOCALSTATEDIR}/run/nasfs)
 install(DIRECTORY DESTINATION ${CMAKE_INSTALL_LOCALSTATEDIR}/log/nasfs)
+
+install(DIRECTORY DESTINATION ${CMAKE_INSTALL_DATADIR}/nasfs/storage)

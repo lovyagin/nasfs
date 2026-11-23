@@ -123,7 +123,7 @@ nasfs_env() {
     NASFS_ENCRYPTION_KEY="iops-bench-key" \
     NASFS_FILE_CIPHER="xchacha20poly1305" \
     NASFS_FILE_HASH="blake2b" \
-    NASFS_KDF="hkdf" \
+    NASFS_KDF="argon2id" \
     NASFS_BLOCK_SIZE="65536" \
     NASFS_SERVER_IP="127.0.0.1" \
     NASFS_SERVER_PORT="$SERVER_PORT" \

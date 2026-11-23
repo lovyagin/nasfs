@@ -298,7 +298,6 @@ uint64_t expected_plaintext_size = 0; /* expected size announced in GET_ACK */
 /* Modular algorithm selection */
 nasfs_cipher_algo_t file_cipher_algo = NASFS_CIPHER_XSALSA20_POLY1305;
 nasfs_hash_algo_t file_hash_algo = NASFS_HASH_BLAKE2B;
-nasfs_kdf_algo_t master_kdf_algo = NASFS_KDF_ARGON2ID;
 
 #define SERVER_PORT 8080
 #define SERVER_IP "127.0.0.1"
@@ -1840,7 +1839,11 @@ int main(int argc, char** argv) {
   }
   file_cipher_algo = (nasfs_cipher_algo_t)selected_cipher;
   file_hash_algo = (nasfs_hash_algo_t)selected_hash;
-  master_kdf_algo = (nasfs_kdf_algo_t)selected_kdf;
+  int is_upload = strcmp(argv[1], "put") == 0 || strcmp(argv[1], "mput") == 0;
+  if (is_upload && selected_kdf != NASFS_KDF_ARGON2ID) {
+    fprintf(stderr, "NASFS_KDF must be argon2id for PUT and mput\n");
+    return 1;
+  }
   if (env_block_size && env_block_size[0] != '\0') {
     char* end;
     long bs = strtol(env_block_size, &end, 10);
@@ -1863,17 +1866,15 @@ int main(int argc, char** argv) {
 
   file_encryption_enabled = 1;
   uint8_t master_salt[crypto_pwhash_SALTBYTES];
-  int allow_salt_creation =
-      strcmp(argv[1], "put") == 0 || strcmp(argv[1], "mput") == 0;
-  if (load_master_salt(master_salt, allow_salt_creation) < 0) {
+  if (load_master_salt(master_salt, is_upload) < 0) {
     fprintf(stderr, "Cannot load or save ~/.nasfs/master.salt: %s\n",
             strerror(errno));
     return 1;
   }
 
-  if (crypto_engine_derive_key(master_kdf_algo, env_encryption_key,
-                               strlen(env_encryption_key), master_salt,
-                               crypto_pwhash_SALTBYTES, master_key,
+  if (crypto_engine_derive_key((nasfs_kdf_algo_t)selected_kdf,
+                               env_encryption_key, strlen(env_encryption_key),
+                               master_salt, crypto_pwhash_SALTBYTES, master_key,
                                sizeof(master_key)) != 0) {
     fprintf(stderr, "Failed to derive master key\n");
     return 1;

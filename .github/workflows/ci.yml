@@ -79,6 +79,8 @@ jobs:
           test -f "$PWD/install-root/usr/local/bin/nasfs_client"
           test -f "$PWD/install-root/usr/local/bin/nasfsctl"
           test -f "$PWD/install-root/usr/local/etc/nasfs/nasfs.conf"
+          test -d "$PWD/install-root/usr/local/share/nasfs/storage"
+          test ! -e "$PWD/install-root/usr/local/lib/systemd/system/nasfs.service"
 
   cmake:
     runs-on: ubuntu-24.04
@@ -119,6 +121,7 @@ jobs:
           test -f "$PWD/install-root/bin/nasfs_client"
           test -f "$PWD/install-root/bin/nasfsctl"
           test -f "$PWD/install-root/etc/nasfs/nasfs.conf"
+          test -d "$PWD/install-root/share/nasfs/storage"
           test -f "$PWD/install-root/lib/systemd/system/nasfs.service"
 
   sanitizers:

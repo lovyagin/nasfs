@@ -185,7 +185,12 @@ PYTHON
 fi
 
 rm -f "$LOG_DIR/server.log"
-start_integration_server "$TEST_ROOT/server.conf"
+server_path="$(cd "$(dirname "$SERVER_BIN")" && pwd)/$(basename "$SERVER_BIN")"
+cp "$TEST_ROOT/server.conf" "$TEST_ROOT/nasfs.conf"
+test_cwd=$PWD
+cd "$TEST_ROOT"
+SERVER_BIN="$server_path" start_integration_server ""
+cd "$test_cwd"
 python3 - "$NASFS_SERVER_PORT" "$LOG_DIR/server.log" <<'PYTHON'
 import socket
 import sys
@@ -225,7 +230,8 @@ start_integration_server "$TEST_ROOT/restart.conf"
 test "$NASFS_SERVER_PORT" = "$port"
 
 # A second instance cannot take ownership of a live PID file.
-if "$SERVER_BIN" "$TEST_ROOT/server.conf" > "$LOG_DIR/second.log" 2>&1; then
+printf 'Port invalid\n' > "$TEST_ROOT/nasfs.conf"
+if (cd "$TEST_ROOT" && "$server_path" "$TEST_ROOT/server.conf") > "$LOG_DIR/second.log" 2>&1; then
     exit 1
 fi
 grep -Fq 'Failed to create PID file' "$LOG_DIR/second.log"
@@ -249,7 +255,6 @@ SERVER_PID=
 control_root="$TEST_ROOT/control"
 mkdir -p "$control_root/bin" "$control_root/etc/nasfs" \
     "$control_root/var/run/nasfs" "$control_root/var/log/nasfs"
-server_path="$(cd "$(dirname "$SERVER_BIN")" && pwd)/$(basename "$SERVER_BIN")"
 ln -s "$server_path" "$control_root/bin/nasfs_server"
 sed -e "s|@NASFS_BINDIR@|$control_root/bin|g" \
     -e "s|@NASFS_SYSCONFDIR@|$control_root/etc/nasfs|g" \

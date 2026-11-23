@@ -412,35 +412,14 @@ static void discard_upload(client_session_t* session) {
   session->upload_temp_name[0] = '\0';
 }
 
-static int publish_upload(client_session_t* session) {
-  session->put_draining = 0;
-  uint8_t trailer[sizeof(uint32_t) + NASFS_MANIFEST_SIZE] = {0};
-  memcpy(trailer + sizeof(uint32_t), session->upload_manifest,
-         NASFS_MANIFEST_SIZE);
-  uv_fs_t request;
-  uv_buf_t buf = uv_buf_init((char*)trailer, sizeof(trailer));
-  int written = uv_fs_write(session->handle.loop, &request, session->active_fd,
-                            &buf, 1, (int64_t)session->file_offset, NULL);
-  uv_fs_req_cleanup(&request);
-  int rc = close_active_file(session);
-  if (rc == 0 && written != (int)sizeof(trailer)) rc = UV_EIO;
-  if (rc == 0) {
-    rc = nasfs_storage_publish_upload(
-        session->storage, session->upload_temp_name, session->upload_name);
-  }
-  if (rc < 0) {
-    log_all(LOG_ERROR, "PUT: Publication failed: %s", uv_strerror(rc));
-    discard_upload(session);
-  } else {
-    session->upload_temp_name[0] = '\0';
-    log_all(LOG_INFO, "Upload complete.");
-  }
-  return rc;
-}
+static void finish_put(client_session_t* session);
 
 static void finish_session_close(client_session_t* session) {
   if (session->pending_fs != 0) return;
-  if (session->put_draining) publish_upload(session);
+  if (session->put_draining) {
+    finish_put(session);
+    return;
+  }
   close_active_file(session);
   discard_upload(session);
   if (session->handle_closed) session_free(session);
@@ -534,19 +513,93 @@ static void release_fs_request(nasfs_fs_ctx_t* ctx) {
   free(ctx);
 }
 
-static void finish_put(client_session_t* session) {
-  int result = publish_upload(session);
-  uint8_t status =
-      result == 0 ? NASFS_PUT_PUBLISHED : NASFS_PUT_PUBLICATION_FAILED;
-  int rc = session_send_frame(session, NASFS_CMD_PUT_RESULT, &status,
-                              sizeof(status), 1);
-  if (rc < 0) {
-    log_all(LOG_ERROR, "PUT: Could not send publication result: %s",
-            uv_strerror(rc));
-    session_close((uv_handle_t*)&session->handle);
+static void complete_publication(client_session_t* session, int result) {
+  session->put_draining = 0;
+  if (result < 0) {
+    log_all(LOG_ERROR, "PUT: Publication failed: %s", uv_strerror(result));
+    close_active_file(session);
+    discard_upload(session);
+  } else {
+    session->upload_temp_name[0] = '\0';
+    log_all(LOG_INFO, "Upload complete.");
+  }
+
+  if (session->state == SESSION_STATE_ERROR) {
+    finish_session_close(session);
     return;
   }
+  uint8_t status =
+      result == 0 ? NASFS_PUT_PUBLISHED : NASFS_PUT_PUBLICATION_FAILED;
   session->state = SESSION_STATE_AUTHENTICATED;
+  session_send_frame(session, NASFS_CMD_PUT_RESULT, &status, sizeof(status), 1);
+}
+
+typedef struct {
+  uv_work_t req;
+  client_session_t* session;
+  uv_file fd;
+  int result;
+  int close_result;
+} nasfs_publish_ctx_t;
+
+static void publish_upload(uv_work_t* req) {
+  nasfs_publish_ctx_t* ctx = req->data;
+  // These upload fields stay immutable until on_upload_published().
+  const client_session_t* session = ctx->session;
+  uint8_t trailer[sizeof(uint32_t) + NASFS_MANIFEST_SIZE] = {0};
+  memcpy(trailer + sizeof(uint32_t), session->upload_manifest,
+         NASFS_MANIFEST_SIZE);
+  uv_fs_t request;
+  uv_buf_t buf = uv_buf_init((char*)trailer, sizeof(trailer));
+  int written = uv_fs_write(NULL, &request, ctx->fd, &buf, 1,
+                            (int64_t)session->file_offset, NULL);
+  uv_fs_req_cleanup(&request);
+  ctx->close_result = uv_fs_close(NULL, &request, ctx->fd, NULL);
+  uv_fs_req_cleanup(&request);
+  int rc = ctx->close_result;
+  if (rc == 0 && written != (int)sizeof(trailer)) rc = UV_EIO;
+  if (rc == 0) {
+    rc = nasfs_storage_publish_upload(
+        session->storage, session->upload_temp_name, session->upload_name);
+  }
+  ctx->result = rc;
+}
+
+static void on_upload_published(uv_work_t* req, int status) {
+  nasfs_publish_ctx_t* ctx = req->data;
+  client_session_t* session = ctx->session;
+  int result = status < 0 ? status : ctx->result;
+  if (status < 0) {
+    session->active_fd = ctx->fd;
+  } else if (ctx->close_result < 0) {
+    log_all(LOG_ERROR, "File close failed: %s", uv_strerror(ctx->close_result));
+  }
+  free(ctx);
+  session->pending_fs--;
+  int closing = session->state == SESSION_STATE_ERROR;
+  complete_publication(session, result);
+  if (!closing && session->state != SESSION_STATE_ERROR)
+    process_session_frames(session);
+}
+
+static void finish_put(client_session_t* session) {
+  nasfs_publish_ctx_t* ctx = malloc(sizeof(*ctx));
+  if (!ctx) {
+    complete_publication(session, UV_ENOMEM);
+    return;
+  }
+  ctx->session = session;
+  ctx->fd = session->active_fd;
+  ctx->req.data = ctx;
+  int rc = uv_queue_work(session->handle.loop, &ctx->req, publish_upload,
+                         on_upload_published);
+  if (rc < 0) {
+    free(ctx);
+    complete_publication(session, rc);
+    return;
+  }
+  session->active_fd = -1;
+  session->pending_fs++;
 }
 
 static void finish_file_request(client_session_t* session) {
@@ -598,7 +651,8 @@ static void on_put_fs_write(uv_fs_t* req) {
   finish_fs_request(ctx);
 }
 
-static void on_put_fs_open(client_session_t* session, int result) {
+static void on_put_fs_open(client_session_t* session, int result,
+                           int header_result) {
   if (result < 0) {
     log_all(LOG_ERROR, "PUT: Open failed: %s", uv_strerror((int)result));
     session->state = SESSION_STATE_AUTHENTICATED;
@@ -607,25 +661,10 @@ static void on_put_fs_open(client_session_t* session, int result) {
   } else {
     session->active_fd = (uv_file)result;
     if (session->file_encryption_enabled) {
-      /* Write file header: [8 size][16 salt][1 cipher_algo][1 hash_algo] */
-      uint8_t header[FILE_HEADER_SIZE + NASFS_OWNER_SLOT_V1_SIZE];
-      memcpy(header, &session->expected_plaintext_size, sizeof(uint64_t));
-      memcpy(header + sizeof(uint64_t), session->file_salt,
-             crypto_pwhash_SALTBYTES);
-      header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES] =
-          session->file_cipher_algo | FILE_HEADER_RECORD_LENGTHS |
-          FILE_HEADER_MANIFEST | FILE_HEADER_OWNER_SLOT_V1;
-      header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 1] =
-          session->file_hash_algo;
-      memcpy(header + FILE_HEADER_SIZE, session->owner_slot,
-             sizeof(session->owner_slot));
-      uv_fs_t write_req;
-      uv_buf_t buf = uv_buf_init((char*)header, sizeof(header));
-      int rc = uv_fs_write(session->handle.loop, &write_req, session->active_fd,
-                           &buf, 1, 0, NULL);
-      uv_fs_req_cleanup(&write_req);
-      if (rc != (int)sizeof(header)) {
-        log_all(LOG_ERROR, "PUT: Header write failed: wrote %d bytes", rc);
+      const size_t header_size = FILE_HEADER_SIZE + NASFS_OWNER_SLOT_V1_SIZE;
+      if (header_result != (int)header_size) {
+        log_all(LOG_ERROR, "PUT: Header write failed: wrote %d bytes",
+                header_result);
         session->state = SESSION_STATE_AUTHENTICATED;
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Header write failed", 19, 1);
@@ -633,7 +672,7 @@ static void on_put_fs_open(client_session_t* session, int result) {
         discard_upload(session);
         return;
       }
-      session->file_offset = sizeof(header);
+      session->file_offset = header_size;
       protocol_manifest_init(&session->manifest, session->upload_name,
                              session->expected_plaintext_size,
                              session->file_salt, session->file_cipher_algo,
@@ -703,64 +742,79 @@ static void on_get_fs_read(uv_fs_t* req) {
   finish_fs_request(ctx);
 }
 
+static void submit_get_read(client_session_t* session, size_t length,
+                            uv_fs_cb callback);
+
+static void on_get_manifest(uv_fs_t* req) {
+  nasfs_fs_ctx_t* ctx = req->data;
+  client_session_t* session = ctx->session;
+  if (session->state != SESSION_STATE_ERROR) {
+    if (req->result == NASFS_MANIFEST_SIZE) {
+      session->state = SESSION_STATE_AUTHENTICATED;
+      session_send_frame(session, NASFS_CMD_GET_DONE, (uint8_t*)ctx->buf.base,
+                         NASFS_MANIFEST_SIZE, 1);
+      close_active_file(session);
+    } else {
+      session_close((uv_handle_t*)&session->handle);
+    }
+  }
+  finish_fs_request(ctx);
+}
+
+static void on_get_record_length(uv_fs_t* req) {
+  nasfs_fs_ctx_t* ctx = req->data;
+  client_session_t* session = ctx->session;
+  uint32_t wire_length;
+  if (session->state == SESSION_STATE_ERROR) {
+    finish_fs_request(ctx);
+    return;
+  }
+  if (req->result == 0 && !session->has_manifest) {
+    session->state = SESSION_STATE_AUTHENTICATED;
+    session_send_frame(session, NASFS_CMD_GET_DONE, NULL, 0, 1);
+    close_active_file(session);
+  } else if (req->result != (int)sizeof(wire_length)) {
+    session_close((uv_handle_t*)&session->handle);
+  } else {
+    memcpy(&wire_length, ctx->buf.base, sizeof(wire_length));
+    size_t length = ntohl(wire_length);
+    if (length == 0 && session->has_manifest &&
+        session->file_offset <=
+            INT64_MAX - sizeof(wire_length) - (NASFS_MANIFEST_SIZE + 1)) {
+      session->file_offset += sizeof(wire_length);
+      submit_get_read(session, NASFS_MANIFEST_SIZE + 1, on_get_manifest);
+    } else if (length > NASFS_CIPHER_OVERHEAD && length <= MAX_RECORD_SIZE &&
+               session->file_offset <=
+                   INT64_MAX - sizeof(wire_length) - length) {
+      session->file_offset += sizeof(wire_length);
+      submit_get_read(session, length, on_get_fs_read);
+    } else {
+      session_close((uv_handle_t*)&session->handle);
+    }
+  }
+  finish_fs_request(ctx);
+}
+
 static void do_get_next_chunk(client_session_t* session) {
   if (session->state != SESSION_STATE_SENDING_FILE || session->active_fd == -1)
     return;
-  size_t chunk_size = IO_CHUNK_SIZE;
   if (session->has_record_lengths) {
-    uint32_t record_length;
-    uv_fs_t req;
-    uv_buf_t prefix = uv_buf_init((char*)&record_length, sizeof(record_length));
-    int rc = uv_fs_read(session->handle.loop, &req, session->active_fd, &prefix,
-                        1, (int64_t)session->file_offset, NULL);
-    uv_fs_req_cleanup(&req);
-    if (rc == 0 && !session->has_manifest) {
-      session->state = SESSION_STATE_AUTHENTICATED;
-      session_send_frame(session, NASFS_CMD_GET_DONE, NULL, 0, 1);
-      close_active_file(session);
-      return;
-    }
-    if (rc != (int)sizeof(record_length)) {
-      session_close((uv_handle_t*)&session->handle);
-      return;
-    }
-    if (record_length == 0 && session->has_manifest) {
-      uint8_t trailer[NASFS_MANIFEST_SIZE + 1];
-      uv_buf_t tail = uv_buf_init((char*)trailer, sizeof(trailer));
-      if (session->file_offset >
-          INT64_MAX - sizeof(record_length) - sizeof(trailer)) {
-        session_close((uv_handle_t*)&session->handle);
-        return;
-      }
-      rc = uv_fs_read(session->handle.loop, &req, session->active_fd, &tail, 1,
-                      (int64_t)(session->file_offset + sizeof(record_length)),
-                      NULL);
-      uv_fs_req_cleanup(&req);
-      if (rc != NASFS_MANIFEST_SIZE) {
-        session_close((uv_handle_t*)&session->handle);
-        return;
-      }
-      session->state = SESSION_STATE_AUTHENTICATED;
-      session_send_frame(session, NASFS_CMD_GET_DONE, trailer, rc, 1);
-      close_active_file(session);
-      return;
-    }
-    chunk_size = ntohl(record_length);
-    if (chunk_size <= NASFS_CIPHER_OVERHEAD || chunk_size > MAX_RECORD_SIZE ||
-        session->file_offset > INT64_MAX - sizeof(record_length) - chunk_size) {
-      session_close((uv_handle_t*)&session->handle);
-      return;
-    }
-    session->file_offset += sizeof(record_length);
-  } else if (session->file_encryption_enabled) {
-    chunk_size += NASFS_CIPHER_OVERHEAD;
+    submit_get_read(session, sizeof(uint32_t), on_get_record_length);
+  } else {
+    size_t length = IO_CHUNK_SIZE;
+    if (session->file_encryption_enabled) length += NASFS_CIPHER_OVERHEAD;
+    submit_get_read(session, length, on_get_fs_read);
   }
+}
+
+static void submit_get_read(client_session_t* session, size_t length,
+                            uv_fs_cb callback) {
   nasfs_fs_ctx_t* ctx = malloc(sizeof(*ctx));
   if (!ctx) {
     session_close((uv_handle_t*)&session->handle);
     return;
   }
-  ctx->buf = uv_buf_init(malloc(chunk_size), chunk_size);
+  ctx->buf = uv_buf_init(malloc(length), length);
   if (!ctx->buf.base) {
     free(ctx);
     session_close((uv_handle_t*)&session->handle);
@@ -769,7 +823,7 @@ static void do_get_next_chunk(client_session_t* session) {
   ctx->session = session;
   ctx->req.data = ctx;
   int rc = uv_fs_read(session->handle.loop, &ctx->req, session->active_fd,
-                      &ctx->buf, 1, session->file_offset, on_get_fs_read);
+                      &ctx->buf, 1, session->file_offset, callback);
   if (rc < 0) {
     fs_submission_failed(ctx, rc);
     return;
@@ -777,7 +831,9 @@ static void do_get_next_chunk(client_session_t* session) {
   session->pending_fs++;
 }
 
-static void on_get_fs_open(client_session_t* session, int result) {
+static void on_get_fs_open(client_session_t* session, int result,
+                           const uint8_t* file_header, int header_result,
+                           int slot_result) {
   if (result < 0) {
     log_all(LOG_ERROR, "GET: Open failed: %s", uv_strerror((int)result));
     session->state = SESSION_STATE_AUTHENTICATED;
@@ -788,15 +844,9 @@ static void on_get_fs_open(client_session_t* session, int result) {
     session->has_record_lengths = 0;
     session->has_manifest = 0;
     if (session->file_encryption_enabled) {
-      /* Read file header: [8 size][16 salt][1 cipher_algo][1 hash_algo] */
-      uint8_t file_header[FILE_HEADER_SIZE];
-      uv_fs_t read_req;
-      uv_buf_t buf = uv_buf_init((char*)file_header, sizeof(file_header));
-      int rc = uv_fs_read(session->handle.loop, &read_req, session->active_fd,
-                          &buf, 1, 0, NULL);
-      uv_fs_req_cleanup(&read_req);
-      if (rc < (int)sizeof(file_header)) {
-        log_all(LOG_ERROR, "GET: Header read failed: read %d bytes", rc);
+      if (header_result != FILE_HEADER_SIZE) {
+        log_all(LOG_ERROR, "GET: Header read failed: read %d bytes",
+                header_result);
         session->state = SESSION_STATE_AUTHENTICATED;
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Header read failed", 18, 1);
@@ -832,15 +882,12 @@ static void on_get_fs_open(client_session_t* session, int result) {
       uint8_t ack_payload[FILE_HEADER_SIZE + NASFS_OWNER_SLOT_V1_SIZE];
       size_t ack_size = FILE_HEADER_SIZE;
       if (has_slot) {
-        uv_buf_t slot = uv_buf_init((char*)ack_payload + FILE_HEADER_SIZE,
-                                    NASFS_OWNER_SLOT_V1_SIZE);
-        rc = uv_fs_read(session->handle.loop, &read_req, session->active_fd,
-                        &slot, 1, FILE_HEADER_SIZE, NULL);
-        uv_fs_req_cleanup(&read_req);
-        if (rc != NASFS_OWNER_SLOT_V1_SIZE) {
+        if (slot_result != NASFS_OWNER_SLOT_V1_SIZE) {
           session_close((uv_handle_t*)&session->handle);
           return;
         }
+        memcpy(ack_payload + FILE_HEADER_SIZE, file_header + FILE_HEADER_SIZE,
+               NASFS_OWNER_SLOT_V1_SIZE);
         ack_size += NASFS_OWNER_SLOT_V1_SIZE;
         session->file_offset = ack_size;
       }
@@ -868,6 +915,9 @@ typedef struct {
   char temp_name[NASFS_UPLOAD_TEMP_SIZE];
   int uploading;
   int result;
+  int header_result;
+  int slot_result;
+  uint8_t header[FILE_HEADER_SIZE + NASFS_OWNER_SLOT_V1_SIZE];
 } nasfs_open_ctx_t;
 
 static void open_storage_object(uv_work_t* req) {
@@ -876,6 +926,30 @@ static void open_storage_object(uv_work_t* req) {
       ctx->uploading
           ? nasfs_storage_begin_upload(ctx->session->storage, ctx->temp_name)
           : nasfs_storage_open_object(ctx->session->storage, ctx->name);
+  if (ctx->result < 0 || !ctx->session->file_encryption_enabled) return;
+
+  uv_fs_t request;
+  if (ctx->uploading) {
+    uv_buf_t buf = uv_buf_init((char*)ctx->header, sizeof(ctx->header));
+    ctx->header_result =
+        uv_fs_write(NULL, &request, ctx->result, &buf, 1, 0, NULL);
+    uv_fs_req_cleanup(&request);
+    return;
+  }
+
+  uv_buf_t buf = uv_buf_init((char*)ctx->header, FILE_HEADER_SIZE);
+  ctx->header_result =
+      uv_fs_read(NULL, &request, ctx->result, &buf, 1, 0, NULL);
+  uv_fs_req_cleanup(&request);
+  if (ctx->header_result == FILE_HEADER_SIZE &&
+      (ctx->header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES] &
+       FILE_HEADER_OWNER_SLOT_V1)) {
+    buf = uv_buf_init((char*)ctx->header + FILE_HEADER_SIZE,
+                      NASFS_OWNER_SLOT_V1_SIZE);
+    ctx->slot_result = uv_fs_read(NULL, &request, ctx->result, &buf, 1,
+                                  FILE_HEADER_SIZE, NULL);
+    uv_fs_req_cleanup(&request);
+  }
 }
 
 static void on_storage_opened(uv_work_t* req, int status) {
@@ -891,9 +965,10 @@ static void on_storage_opened(uv_work_t* req, int status) {
   if (session->state == SESSION_STATE_ERROR) {
     if (result >= 0) session->active_fd = result;
   } else if (ctx->uploading) {
-    on_put_fs_open(session, result);
+    on_put_fs_open(session, result, ctx->header_result);
   } else {
-    on_get_fs_open(session, result);
+    on_get_fs_open(session, result, ctx->header, ctx->header_result,
+                   ctx->slot_result);
   }
   free(ctx);
   finish_file_request(session);
@@ -901,7 +976,7 @@ static void on_storage_opened(uv_work_t* req, int status) {
 
 static void submit_file_open(client_session_t* session, const uint8_t* name,
                              size_t length, int uploading) {
-  nasfs_open_ctx_t* ctx = malloc(sizeof(*ctx));
+  nasfs_open_ctx_t* ctx = calloc(1, sizeof(*ctx));
   if (!ctx) {
     session_close((uv_handle_t*)&session->handle);
     return;
@@ -918,6 +993,19 @@ static void submit_file_open(client_session_t* session, const uint8_t* name,
   }
   ctx->session = session;
   ctx->uploading = uploading;
+  if (uploading && session->file_encryption_enabled) {
+    uint8_t* header = ctx->header;
+    memcpy(header, &session->expected_plaintext_size, sizeof(uint64_t));
+    memcpy(header + sizeof(uint64_t), session->file_salt,
+           crypto_pwhash_SALTBYTES);
+    header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES] =
+        session->file_cipher_algo | FILE_HEADER_RECORD_LENGTHS |
+        FILE_HEADER_MANIFEST | FILE_HEADER_OWNER_SLOT_V1;
+    header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 1] =
+        session->file_hash_algo;
+    memcpy(header + FILE_HEADER_SIZE, session->owner_slot,
+           sizeof(session->owner_slot));
+  }
   ctx->req.data = ctx;
   int rc = uv_queue_work(session->handle.loop, &ctx->req, open_storage_object,
                          on_storage_opened);

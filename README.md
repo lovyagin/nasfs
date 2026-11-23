@@ -132,6 +132,13 @@ The default server config is installed as:
 /usr/local/etc/nasfs/nasfs.conf
 ```
 
+Without arguments, `nasfs_server` reads `nasfs.conf` in the working
+directory. Run it from the CMake or Autotools build root, or from the
+installed config directory. For a build-tree run, prepare the directories
+in the generated config or point them at an existing test workspace. To
+start the server from elsewhere, pass the config path explicitly. An
+explicit path takes precedence.
+
 Important options:
 - `ListenAddr`
 - `Port`
@@ -257,13 +264,43 @@ The script uses:
 
 ### systemd
 
-If installed with systemd support:
+Both installers create the default storage directory under `<datadir>/nasfs/storage`.
+If you change `StorageDir`, create the replacement directory and grant the
+server account access before starting NASFS.
+
+The unit embeds installation paths from the build configuration. For a
+custom prefix, set it when configuring CMake or Autotools.
+
+If installed with systemd support, run `sudo systemctl edit nasfs` and add
+a service drop-in with the paths to your raw Ed25519 key files:
+
+```ini
+[Service]
+Environment=NASFS_SERVER_SIGNING_SEED=/etc/nasfs/server.seed
+Environment=NASFS_AUTHOR_PUBLIC_KEY=/etc/nasfs/author.pub
+```
+
+Keep the signing seed readable only by the service account. Configure
+`StorageDir` and authentication in the installed `nasfs.conf`. For this unit,
+keep `DaemonMode Yes` and match the config's `PidFile` to the unit's `PIDFile`.
+The key paths above are examples.
 
 ```sh
+sudo systemctl daemon-reload
 sudo systemctl enable nasfs
 sudo systemctl start nasfs
 sudo systemctl status nasfs
 ```
+
+At startup, NASFS removes abandoned staging files when it can lock the
+storage directory exclusively. If another NASFS process is using the same
+directory, cleanup waits for a later startup with no other NASFS process
+running. On NFS mounts detected by Linux or macOS, and where exclusive
+locking is unavailable, startup cleanup is skipped. On detected NFS
+mounts, or if shared locking fails, the server uses `.nasfs-upload.unlocked.*` staging
+names that are excluded from automatic cleanup. Remove abandoned files
+with that prefix only after stopping all servers using the directory.
+Stop all older NASFS processes sharing the directory before upgrading.
 
 ## Client usage
 
@@ -286,10 +323,15 @@ NASFS_ENCRYPTION_KEY="super-secret-key" nasfs_client put ./local.bin encrypted_r
 NASFS_ENCRYPTION_KEY="super-secret-key" nasfs_client get encrypted_remote.bin ./local_decrypted.bin
 ```
 
-Keep a backup of `~/.nasfs/master.salt` and record the `NASFS_KDF` used
-to upload your files. The first upload creates the salt. Downloads require
-the original salt, KDF, and file encryption password. The client stops
-before connecting when it cannot load or save the salt.
+Keep a backup of `~/.nasfs/master.salt`. The first upload creates the salt.
+`put` and `mput` derive the master key from the file encryption password
+with Argon2id. Leave `NASFS_KDF` unset or set it to `argon2id`. Other
+selections fail before the client connects.
+
+For an existing file, use the original password, salt, and KDF. If an older
+client uploaded the file with `NASFS_KDF=hkdf` or `NASFS_KDF=pbkdf2`, set the
+same value for `get` or `mget`. This also applies to older NASLUKS owner
+slots. The client stops before connecting when it cannot load or save the salt.
 
 For a container written before record lengths were stored, start the server
 with `BlockSize` set to the original upload's `NASFS_BLOCK_SIZE` and use
@@ -378,8 +420,14 @@ The integration tests require Python 3.8 or later.
 On Linux with a running systemd user manager, run the optional service test:
 
 ```sh
-NASFS_SERVER_BIN="$PWD/build/nasfs_server" NASFS_CLIENT_BIN="$PWD/build/nasfs_client" \
-    tests/test_systemd.sh
+prefix=$(mktemp -d)
+cmake -S . -B build-systemd -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib \
+    -DCMAKE_INSTALL_SYSCONFDIR=etc -DCMAKE_INSTALL_LOCALSTATEDIR=var \
+    -DNASFS_INSTALL_SYSTEMD=ON
+cmake --build build-systemd
+cmake --install build-systemd
+NASFS_TEST_INSTALL_PREFIX="$prefix" tests/test_systemd.sh
 ```
 
 Autotools:
@@ -411,6 +459,15 @@ The integration tests validate:
 - client-side key derivation (Argon2id)
 - encrypted chunk processing and block substitution protection
 - zero-knowledge encrypted upload/download integrity
+
+## End-to-end benchmark
+
+Run `tests/benchmark_e2e.sh` with Bash 4 or later and the CMake binaries in
+`build/`, or set `NASFS_SERVER_BIN` and `NASFS_CLIENT_BIN`. The script creates
+temporary server and author keys, pins its server key, and compares downloaded
+bytes with the input. Each NASFS timing includes Argon2id master-key
+derivation, connection setup, authentication, and transfer. The optional SFTP
+comparison requires a trusted SSH host key and working batch authentication.
 
 ## Linting and CI
 

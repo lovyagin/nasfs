@@ -1,5 +1,12 @@
 noinst_LIBRARIES = libnasfs_common.a
 
+noinst_HEADERS = \
+    include/auth.h \
+    include/crypto_engine.h \
+    include/handshake.h \
+    include/pake.h \
+    include/protocol.h
+
 libnasfs_common_a_SOURCES = \
     src/protocol.c \
     src/handshake.c \

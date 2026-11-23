@@ -5,14 +5,18 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 #include <uv.h>
@@ -45,6 +49,60 @@ static int matches_file(uv_file fd, const char* setting) {
   return name && strncmp(name + 1, expected, strlen(expected)) == 0;
 }
 
+int fstatfs(int fd, struct statfs* fs) {
+  typedef int (*statfs_fn)(int, struct statfs*);
+  statfs_fn actual = (statfs_fn)dlsym(RTLD_NEXT, "fstatfs");
+  if (!actual) abort();
+  int result = actual(fd, fs);
+  struct stat st;
+  const char* nfs = getenv("NASFS_TEST_DIRECTORY_NFS");
+  if (result == 0 && nfs && *nfs && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
+    fs->f_type = NFS_SUPER_MAGIC;
+  return result;
+}
+
+int flock(int fd, int operation) {
+  typedef int (*flock_fn)(int, int);
+  flock_fn actual = (flock_fn)dlsym(RTLD_NEXT, "flock");
+  if (!actual) abort();
+  const char* mode = getenv("NASFS_TEST_DIRECTORY_LOCK_ERROR");
+  struct stat st;
+  if (mode && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+    if (strcmp(mode, "all") == 0) {
+      errno = ENOTSUP;
+      return -1;
+    }
+    if (strcmp(mode, "exclusive") == 0 && (operation & LOCK_EX) != 0) {
+      errno = EBADF;
+      return -1;
+    }
+  }
+  return actual(fd, operation);
+}
+
+int uv_queue_work(uv_loop_t* loop, uv_work_t* request, uv_work_cb work,
+                  uv_after_work_cb done) {
+  typedef int (*queue_fn)(uv_loop_t*, uv_work_t*, uv_work_cb, uv_after_work_cb);
+  queue_fn actual = (queue_fn)dlsym(RTLD_NEXT, "uv_queue_work");
+  if (!actual) abort();
+  if (getenv("NASFS_TEST_OPEN_SUBMISSION_ERROR")) return UV_EBUSY;
+  return actual(loop, request, work, done);
+}
+
+static uv_buf_t opening_io(uv_buf_t buffer, const char* phase) {
+  const char* selected = getenv("NASFS_TEST_OPEN_IO");
+  if (!selected || strcmp(selected, phase) != 0) return buffer;
+  const char* gate = getenv("NASFS_TEST_OPEN_IO_GATE");
+  if (gate) {
+    fprintf(stderr, "Test fixture blocked %s\n", phase);
+    const struct timespec pause = {.tv_nsec = 10000000};
+    while (access(gate, F_OK) != 0) nanosleep(&pause, NULL);
+  } else {
+    buffer.len--;
+  }
+  return buffer;
+}
+
 int uv_fs_read(uv_loop_t* loop, uv_fs_t* request, uv_file fd,
                const uv_buf_t buffers[], unsigned count, int64_t offset,
                uv_fs_cb callback) {
@@ -52,6 +110,12 @@ int uv_fs_read(uv_loop_t* loop, uv_fs_t* request, uv_file fd,
                          unsigned, int64_t, uv_fs_cb);
   read_fn actual = (read_fn)dlsym(RTLD_NEXT, "uv_fs_read");
   if (!actual) abort();
+  if (!callback && count == 1 &&
+      matches_file(fd, "NASFS_TEST_OPEN_IO_OBJECT")) {
+    const char* phase = offset == 0 ? "get-header" : "get-slot";
+    uv_buf_t buffer = opening_io(buffers[0], phase);
+    return actual(loop, request, fd, &buffer, count, offset, callback);
+  }
   if (matches_file(fd, "NASFS_TEST_READ_FAILURE")) fd = -1;
   return actual(loop, request, fd, buffers, count, offset, callback);
 }
@@ -103,6 +167,11 @@ int uv_fs_write(uv_loop_t* loop, uv_fs_t* request, uv_file fd,
                           unsigned, int64_t, uv_fs_cb);
   write_fn actual = (write_fn)dlsym(RTLD_NEXT, "uv_fs_write");
   if (!actual) abort();
+  if (!callback && offset == 0 && count == 1 &&
+      matches_file(fd, "NASFS_TEST_OPEN_IO_OBJECT")) {
+    uv_buf_t buffer = opening_io(buffers[0], "put-header");
+    return actual(loop, request, fd, &buffer, count, offset, callback);
+  }
   if (!callback || !matches_file(fd, "NASFS_TEST_DELAY_WRITES"))
     return actual(loop, request, fd, buffers, count, offset, callback);
 
@@ -217,8 +286,9 @@ int openat(int directory, const char* path, int flags, ...) {
 
 static void block_record_read(int fd, size_t length) {
   const char* gate = getenv("NASFS_TEST_READ_GATE");
-  if (length > 4096 && gate && matches_file(fd, "NASFS_TEST_BLOCK_READS") &&
-      access(gate, F_OK) != 0) {
+  const char* prefix = getenv("NASFS_TEST_BLOCK_PREFIX");
+  if ((prefix ? length == sizeof(uint32_t) : length > 4096) && gate &&
+      matches_file(fd, "NASFS_TEST_BLOCK_READS") && access(gate, F_OK) != 0) {
     fprintf(stderr, "Test fixture blocked record read\n");
     const struct timespec pause = {.tv_nsec = 10000000};
     while (access(gate, F_OK) != 0) nanosleep(&pause, NULL);
