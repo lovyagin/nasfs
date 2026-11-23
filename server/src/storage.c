@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <uv.h>
 
+#include "logging/log.h"
 #include "storage.h"
 
 #if defined(__linux__)
@@ -59,10 +60,7 @@ static int sweep_uploads(int root) {
         continue;
       if (unlinkat(root, name, 0) == 0) continue;
     }
-    if (errno != ENOENT) {
-      rc = uv_translate_sys_error(errno);
-      break;
-    }
+    if (errno != ENOENT && rc == 0) rc = uv_translate_sys_error(errno);
   }
   closedir(entries);
   return rc;
@@ -92,12 +90,14 @@ int nasfs_storage_init(nasfs_storage_t* storage, const char* directory) {
   // A directory opened read-only may only support shared locks.
   // Only sweep under an exclusive lock, and only use sweepable names while
   // holding a shared lock for the lifetime of all uploads.
-  int rc = 0;
-  if (flock(storage->root_fd, LOCK_EX | LOCK_NB) == 0)
-    rc = sweep_uploads(storage->root_fd);
-  storage->uploads_locked = rc == 0 && flock(storage->root_fd, LOCK_SH) == 0;
-  if (rc < 0) nasfs_storage_close(storage);
-  return rc;
+  if (flock(storage->root_fd, LOCK_EX | LOCK_NB) == 0) {
+    int rc = sweep_uploads(storage->root_fd);
+    if (rc < 0)
+      log_all(LOG_WARNING, "Could not complete orphan cleanup in '%s': %s",
+              directory, uv_strerror(rc));
+  }
+  storage->uploads_locked = flock(storage->root_fd, LOCK_SH) == 0;
+  return 0;
 }
 
 void nasfs_storage_close(nasfs_storage_t* storage) {

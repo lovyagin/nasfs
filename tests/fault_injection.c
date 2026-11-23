@@ -36,6 +36,15 @@ int linkat(int olddir, const char* oldpath, int newdir, const char* newpath,
   return result;
 }
 
+int unlinkat(int directory, const char* path, int flags) {
+  const char* denied = getenv("NASFS_TEST_READONLY_ORPHAN");
+  if (denied && strcmp(path, denied) == 0) {
+    errno = EROFS;
+    return -1;
+  }
+  return (int)syscall(SYS_unlinkat, directory, path, flags);
+}
+
 static int matches_file(uv_file fd, const char* setting) {
   const char* expected = getenv(setting);
   if (!expected || !*expected) return 0;

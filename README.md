@@ -300,7 +300,9 @@ locking is unavailable, startup cleanup is skipped. On detected NFS
 mounts, or if shared locking fails, the server uses `.nasfs-upload.unlocked.*` staging
 names that are excluded from automatic cleanup. Remove abandoned files
 with that prefix only after stopping all servers using the directory.
-Stop all older NASFS processes sharing the directory before upgrading.
+If cleanup cannot remove an orphan, the server logs a warning and continues
+serving readable files. Stop all older NASFS processes sharing the directory
+before upgrading.
 
 ## Client usage
 

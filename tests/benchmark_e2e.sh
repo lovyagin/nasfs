@@ -139,12 +139,13 @@ FILE_ORDER=("4 KB" "64 KB" "1 MB" "10 MB" "100 MB")
 CIPHERS=("xsalsa20poly1305" "xchacha20poly1305" "aes256gcm")
 
 # ── Start server ───────────────────────────────────────────────────────────────
-server_prefix=()
-if [[ $THROTTLE -eq 1 ]]; then server_prefix=(nice -n 19); fi
-HOME="$TEST_ROOT/home" start_integration_server "$BENCH_DIR/bench_server.conf" "${server_prefix[@]}"
-
 MODE_LABEL="normal"
-[[ $THROTTLE -eq 1 ]] && MODE_LABEL="throttled (nice -n 19)"
+if [[ $THROTTLE -eq 1 ]]; then
+    MODE_LABEL="throttled (nice -n 19)"
+    HOME="$TEST_ROOT/home" start_integration_server "$BENCH_DIR/bench_server.conf" nice -n 19
+else
+    HOME="$TEST_ROOT/home" start_integration_server "$BENCH_DIR/bench_server.conf"
+fi
 
 printf "\n${Y}══════════════════════════════════════════════════════════════════${NC}\n"
 printf "${Y}   NASFS End-to-End Transfer Benchmark${NC}\n"

@@ -718,12 +718,27 @@ env = dict(os.environ, LD_PRELOAD=preload)
 if not any(name in env for name in ("NASFS_TEST_DELAY_WRITES",
                                     "NASFS_TEST_BLOCK_WRITES", "NASFS_TEST_OPEN_GATE",
                                     "NASFS_TEST_READ_GATE", "NASFS_TEST_RENAME_GATE",
-                                    "NASFS_TEST_OPEN_IO", "NASFS_TEST_OPEN_SUBMISSION_ERROR")):
+                                    "NASFS_TEST_OPEN_IO", "NASFS_TEST_OPEN_SUBMISSION_ERROR",
+                                    "NASFS_TEST_READONLY_ORPHAN")):
     env.update(NASFS_TEST_READ_FAILURE="encrypted_remote.bin",
                NASFS_TEST_CLOSE_FAILURE=".nasfs-upload.")
 os.execve(server, [server, *sys.argv[1:]], env)
 PYTHON
     chmod +x "$TEST_ROOT/fault-server"
+    readonly_orphan=.nasfs-upload.00000000000000000000000000000000
+    printf 'abandoned staging file\n' > "$STORAGE_DIR/$readonly_orphan"
+    NASFS_TEST_READONLY_ORPHAN="$readonly_orphan" SERVER_BIN="$TEST_ROOT/fault-server" \
+        start_integration_server "$TEST_ROOT/server-restarted.conf"
+    cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
+    transfer get encrypted_remote.bin "$TEST_ROOT/readonly-get.bin"
+    cmp "$TEST_INPUT" "$TEST_ROOT/readonly-get.bin"
+    grep -Fq 'Could not complete orphan cleanup' "$LOG_DIR/server.log"
+    grep -Fxq 'abandoned staging file' "$STORAGE_DIR/$readonly_orphan"
+    kill -TERM "$SERVER_PID"
+    wait "$SERVER_PID"
+    SERVER_PID=
+    rm "$LOG_DIR/server.log"
+
     SERVER_BIN="$TEST_ROOT/fault-server" start_integration_server "$TEST_ROOT/server-restarted.conf"
     cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
     if transfer get encrypted_remote.bin "$TEST_ROOT/keep.bin" > "$LOG_DIR/server_read.log" 2>&1; then
