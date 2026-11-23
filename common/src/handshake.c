@@ -3,11 +3,25 @@
  * @brief Helpers for NASFS secure-channel negotiation payloads.
  */
 
-#include "handshake.h"
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 
 #include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sodium.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "handshake.h"
 
 /**
  * @brief Duplicates a byte sequence as a NUL-terminated string.
@@ -19,6 +33,7 @@
 static char* nasfs_dup_string_field(const uint8_t* src, size_t len) {
   char* out;
 
+  if (len == 0 || memchr(src, 0, len)) return NULL;
   out = malloc(len + 1);
   if (!out) {
     return NULL;
@@ -225,5 +240,130 @@ int nasfs_handshake_unpack_server_selection(const uint8_t* payload,
   *cipher_name_out = cipher_name;
   *public_key_out = public_key;
   *public_key_len_out = public_key_len;
+  return 0;
+}
+
+void nasfs_handshake_hash(uint8_t out[32], const uint8_t* data, size_t size) {
+  crypto_generichash(out, 32, data, size, NULL, 0);
+}
+
+void nasfs_handshake_transcript(uint8_t out[32], const uint8_t hello[32],
+                                const uint8_t* selection, size_t size) {
+  const uint8_t domain[] = "NASFS/1 server selection: client HELLO, server key";
+  uint8_t fields[64];
+  memcpy(fields, hello, 32);
+  nasfs_handshake_hash(fields + 32, selection, size);
+  crypto_generichash_state hash;
+  crypto_generichash_init(&hash, NULL, 0, 32);
+  crypto_generichash_update(&hash, domain, sizeof(domain));
+  crypto_generichash_update(&hash, fields, sizeof(fields));
+  crypto_generichash_final(&hash, out, 32);
+}
+
+int nasfs_handshake_key(uint8_t out[32], const uint8_t* secret,
+                        size_t secret_len, const uint8_t transcript[32],
+                        uint8_t purpose) {
+  uint8_t context[33];
+  memcpy(context, transcript, 32);
+  context[32] = purpose;
+  return crypto_generichash(out, 32, context, sizeof(context), secret,
+                            secret_len);
+}
+
+int nasfs_handshake_finished(uint8_t out[32], const uint8_t key[32],
+                             const uint8_t ciphertext_frame[32],
+                             const uint8_t* ready_header, size_t size) {
+  uint8_t fields[64];
+  memcpy(fields, ciphertext_frame, 32);
+  nasfs_handshake_hash(fields + 32, ready_header, size);
+  return crypto_generichash(out, 32, fields, sizeof(fields), key, 32);
+}
+
+int nasfs_handshake_read_key(const char* path, uint8_t out[32], int secret) {
+  if (!path || !*path) return -1;
+  int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  if (fd < 0) return -1;
+  struct stat st;
+  uint8_t bytes[33];
+  size_t used = 0;
+  int result = -1;
+  if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == geteuid() &&
+      (st.st_mode & 022u) == 0 && (!secret || (st.st_mode & 077u) == 0)) {
+    while (used < sizeof(bytes)) {
+      ssize_t count = read(fd, bytes + used, sizeof(bytes) - used);
+      if (count < 0 && errno == EINTR) continue;
+      if (count <= 0) {
+        if (count == 0 && used == 32) result = 0;
+        break;
+      }
+      used += (size_t)count;
+    }
+  }
+  if (close(fd) < 0) result = -1;
+  if (result == 0) memcpy(out, bytes, 32);
+  sodium_memzero(bytes, sizeof(bytes));
+  return result;
+}
+
+/**
+ * @brief Checks whether a comma-separated list contains a given token.
+ *
+ * @param csv_list Comma-separated list to search.
+ * @param candidate Candidate token to match.
+ * @return 1 if the token exists in the list, otherwise 0.
+ */
+int nasfs_handshake_offer_contains(const char* csv_list,
+                                   const char* candidate) {
+  const char* cursor;
+  size_t candidate_len;
+
+  if (!csv_list || !candidate) {
+    return 0;
+  }
+
+  candidate_len = strlen(candidate);
+  cursor = csv_list;
+
+  while (*cursor != '\0') {
+    const char* start = cursor;
+    const char* end;
+
+    while (*start != '\0' && isspace((unsigned char)*start)) {
+      start++;
+    }
+
+    end = start;
+    while (*end != '\0' && *end != ',') {
+      end++;
+    }
+
+    while (end > start && isspace((unsigned char)end[-1])) {
+      end--;
+    }
+
+    if ((size_t)(end - start) == candidate_len &&
+        strncmp(start, candidate, candidate_len) == 0) {
+      return 1;
+    }
+
+    cursor = (*end == ',') ? end + 1 : end;
+  }
+
+  return 0;
+}
+
+uint8_t nasfs_handshake_profile(const char* kex) {
+  static const struct {
+    const char* name;
+    uint8_t id;
+  } profiles[] = {
+      {"ML-KEM-512", 1},
+      {"ML-KEM-768", 2},
+      {"Kyber512", 3},
+      {"Kyber768", 4},
+  };
+  for (size_t i = 0; i < sizeof(profiles) / sizeof(profiles[0]); i++) {
+    if (strcmp(kex, profiles[i].name) == 0) return profiles[i].id;
+  }
   return 0;
 }

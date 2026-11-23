@@ -123,7 +123,7 @@ if env NASFS_KEX_ALGORITHMS="ML-KEM-512" \
     exit 1
 fi
 
-grep -Fq "Decryption failed. Wrong key or corrupted data" "$LOG_DIR/client_get_incorrect.log"
+grep -Fq "Cannot open NASLUKS owner slot" "$LOG_DIR/client_get_incorrect.log"
 test "$(hash_file "$TEST_OUTPUT_INCORRECT")" = "$PREVIOUS_HASH"
 if compgen -G "$TEST_ROOT/.nasfs-download.*" > /dev/null; then
     printf "Temporary download was not removed.\n" >&2

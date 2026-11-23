@@ -82,7 +82,7 @@ int nasfs_storage_begin_upload(const nasfs_storage_t* storage,
     int fd = openat(storage->root_fd, candidate,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd >= 0) {
-      strcpy(temp_name, candidate);
+      snprintf(temp_name, NASFS_UPLOAD_TEMP_SIZE, "%s", candidate);
       return fd;
     }
     if (errno != EEXIST) return uv_translate_sys_error(errno);

@@ -31,6 +31,7 @@
 typedef enum {
   SESSION_STATE_NEW = 0,        /**< Newly connected, connection established. */
   SESSION_STATE_HANDSHAKE,      /**< PQC key exchange in progress. */
+  SESSION_STATE_AUTHENTICATING, /**< Transport established, awaiting AUTH. */
   SESSION_STATE_AUTHENTICATED,  /**< Authenticated, waiting for commands. */
   SESSION_STATE_RECEIVING_FILE, /**< Currently receiving file data (PUT). */
   SESSION_STATE_SENDING_FILE,   /**< Currently sending file data (GET). */
@@ -42,8 +43,9 @@ typedef enum {
  * @brief Context and state for an active client connection.
  */
 typedef struct {
-  uv_tcp_t handle;       /**< libuv TCP handle for the connection. */
-  session_state_t state; /**< Current state of the session. */
+  uv_tcp_t handle;        /**< libuv TCP handle for the connection. */
+  uint64_t last_activity; /**< libuv monotonic clock in milliseconds. */
+  session_state_t state;  /**< Current state of the session. */
   const nasfs_storage_t* storage;
 
   /* Receive Buffer */
@@ -52,10 +54,17 @@ typedef struct {
   size_t recv_capacity; /**< Total allocated capacity of the receive buffer. */
 
   /* File Transfer State */
-  uv_file active_fd;    /**< File descriptor for active transfers (PUT/GET). */
-  uint64_t file_offset; /**< Current offset in the active file. */
+  uv_file active_fd; /**< File descriptor for active transfers (PUT/GET). */
+  int has_record_lengths; /**< Container carries ciphertext record lengths. */
+  uint64_t file_offset;   /**< Current offset in the active file. */
 
   /* Crypto State */
+  uint8_t handshake_transcript[32];
+  uint8_t auth_context[32];
+  crypto_generichash_state manifest;
+  uint8_t upload_manifest[32 + crypto_sign_BYTES];
+  int has_manifest;
+  uint8_t owner_slot[NASFS_OWNER_SLOT_V1_SIZE];
   OQS_KEM* kem;            /**< OQS Key Encapsulation Mechanism instance. */
   uint8_t* kem_secret_key; /**< The server's secret key for this session. */
   uint8_t*
@@ -64,9 +73,7 @@ typedef struct {
   char* kex_algorithm;      /**< Negotiated KEX algorithm for this session. */
   char* cipher_algorithm;   /**< Negotiated control-channel cipher for this
                                session. */
-  int protocol_v2;          /**< Set by the v2 hello command. */
   int is_secure;            /**< Flag indicating if the channel is encrypted. */
-  int is_authenticated;     /**< Flag indicating successful user auth. */
   crypto_secretstream_xchacha20poly1305_state
       send_crypto_state; /**< Server->client control channel state. */
   crypto_secretstream_xchacha20poly1305_state
@@ -99,6 +106,7 @@ typedef struct {
   char upload_temp_name[NASFS_UPLOAD_TEMP_SIZE];
   uint64_t upload_plaintext_bytes;
   int put_draining;  /**< PUT_DONE received while writes are outstanding. */
+  int read_paused;   /**< Receive stopped at the pending filesystem limit. */
   int handle_closed; /**< TCP close callback has run. */
 
   /* PAKE (SPAKE2) auth state — valid only during pake auth handshake. */
@@ -123,5 +131,9 @@ void session_on_new_connection(uv_stream_t* server, int status);
  * @param handle The libuv handle representing the client connection.
  */
 void session_close(uv_handle_t* handle);
+
+/** Close idle connections while walking the server loop. */
+int session_load_identity(const char* seed_path, const char* author_path);
+void session_expire_idle(uv_handle_t* handle, void* listener);
 
 #endif /* NASFS_SESSION_H */

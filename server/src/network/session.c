@@ -16,6 +16,7 @@
 #include "config.h"
 #endif
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <oqs/oqs.h>
@@ -34,11 +35,32 @@
 
 #define INITIAL_RECV_BUFFER_SIZE 16384
 #define MAX_RECV_BUFFER_SIZE (64 * 1024 * 1024)
+#define MAX_PENDING_PUT_WRITES 4
+
+static uint8_t server_signing_key[crypto_sign_SECRETKEYBYTES];
+
+static uint8_t trusted_author[crypto_sign_PUBLICKEYBYTES];
+
+int session_load_identity(const char* seed_path, const char* author_path) {
+  if (nasfs_handshake_read_key(author_path, trusted_author, 0) < 0) return -1;
+  uint8_t seed[crypto_sign_SEEDBYTES];
+  uint8_t public_key[crypto_sign_PUBLICKEYBYTES];
+  if (nasfs_handshake_read_key(seed_path, seed, 1) < 0) return -1;
+  int result = crypto_sign_seed_keypair(public_key, server_signing_key, seed);
+  sodium_memzero(seed, sizeof(seed));
+  return result;
+}
+
+static size_t live_sessions;
 #define IO_CHUNK_SIZE ((size_t)global_config.block_size)
-/* On-disk file header for encrypted files:
- * [8 bytes LE plaintext_size][16 bytes salt][1 byte cipher_algo][1 byte
- * hash_algo] */
-#define FILE_HEADER_SIZE (sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 2)
+/* Encrypted file header: [8 bytes native-endian size][16 bytes salt]
+ * [cipher plus record-length flag][hash]. Marked files store a big-endian
+ * uint32_t ciphertext length before each record. */
+#define FILE_HEADER_SIZE NASFS_FILE_METADATA_SIZE
+#define FILE_HEADER_RECORD_LENGTHS 0x80u
+#define FILE_HEADER_MANIFEST 0x40u
+#define FILE_HEADER_OWNER_SLOT_V1 0x20u
+#define MAX_RECORD_SIZE (4194304 + NASFS_CIPHER_OVERHEAD)
 #define NASFS_CIPHER_OVERHEAD \
   16 /* MAC tag bytes — true for all supported ciphers */
 /* --- Context Structs for Async Operations --- */
@@ -65,10 +87,12 @@ static int session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
                               int encrypt);
 static void do_get_next_chunk(client_session_t* session);
 static void process_session_frames(client_session_t* session);
+static void session_alloc_buffer(uv_handle_t* handle, size_t suggested_size,
+                                 uv_buf_t* buf);
+static void session_on_read(uv_stream_t* stream, ssize_t nread,
+                            const uv_buf_t* buf);
 static void session_dispatch_frame(client_session_t* session,
                                    nasfs_frame_t* frame);
-static int csv_list_contains(const char* csv_list, const char* candidate);
-
 static int method_requires_password(const char* method) {
   return strcmp(method, NASFS_AUTH_METHOD_PASSWORD) == 0 ||
          strcmp(method, NASFS_AUTH_METHOD_PASSWORD_PUBLICKEY) == 0;
@@ -137,8 +161,8 @@ static int verify_publickey_auth(client_session_t* session,
   int ok = 0;
 
   if (!auth->sig_algorithm || !auth->public_key || !auth->signature ||
-      !csv_list_contains(global_config.pubkey_auth_algorithms,
-                         auth->sig_algorithm) ||
+      !nasfs_handshake_offer_contains(global_config.pubkey_auth_algorithms,
+                                      auth->sig_algorithm) ||
       !OQS_SIG_alg_is_enabled(auth->sig_algorithm) ||
       !authorized_key_matches(global_config.authorized_keys_file,
                               auth->sig_algorithm, auth->public_key,
@@ -154,9 +178,9 @@ static int verify_publickey_auth(client_session_t* session,
     return 0;
   }
 
-  message = nasfs_auth_build_message(auth->method, auth->username,
-                                     session->shared_secret,
-                                     session->shared_secret_len, &message_len);
+  message = nasfs_auth_build_message(
+      auth->method, auth->username, session->auth_context,
+      sizeof(session->auth_context), &message_len);
   if (message) {
     ok = OQS_SIG_verify(sig, message, message_len, auth->signature,
                         auth->signature_len, auth->public_key) == OQS_SUCCESS;
@@ -174,7 +198,8 @@ static pthread_mutex_t server_auth_lock = PTHREAD_MUTEX_INITIALIZER;
 static int verify_auth_payload(client_session_t* session,
                                const nasfs_auth_payload_t* auth) {
   if (!auth || !auth->method || !auth->username ||
-      !csv_list_contains(global_config.auth_methods, auth->method)) {
+      !nasfs_handshake_offer_contains(global_config.auth_methods,
+                                      auth->method)) {
     return 0;
   }
 
@@ -206,8 +231,7 @@ static int verify_auth_payload(client_session_t* session,
     // key=server_auth_password_hash)
     uint8_t expected_proof[32];
     if (crypto_generichash(expected_proof, sizeof(expected_proof),
-                           (const uint8_t*)session->shared_secret,
-                           session->shared_secret_len,
+                           session->auth_context, sizeof(session->auth_context),
                            server_auth_password_hash,
                            sizeof(server_auth_password_hash)) != 0) {
       return 0;
@@ -266,52 +290,6 @@ static int verify_auth_payload(client_session_t* session,
 }
 
 /**
- * @brief Checks whether a comma-separated list contains a given token.
- *
- * @param csv_list Comma-separated list to search.
- * @param candidate Candidate token to match.
- * @return 1 if the token exists in the list, otherwise 0.
- */
-static int csv_list_contains(const char* csv_list, const char* candidate) {
-  const char* cursor;
-  size_t candidate_len;
-
-  if (!csv_list || !candidate) {
-    return 0;
-  }
-
-  candidate_len = strlen(candidate);
-  cursor = csv_list;
-
-  while (*cursor != '\0') {
-    const char* start = cursor;
-    const char* end;
-
-    while (*start != '\0' && isspace((unsigned char)*start)) {
-      start++;
-    }
-
-    end = start;
-    while (*end != '\0' && *end != ',') {
-      end++;
-    }
-
-    while (end > start && isspace((unsigned char)end[-1])) {
-      end--;
-    }
-
-    if ((size_t)(end - start) == candidate_len &&
-        strncmp(start, candidate, candidate_len) == 0) {
-      return 1;
-    }
-
-    cursor = (*end == ',') ? end + 1 : end;
-  }
-
-  return 0;
-}
-
-/**
  * @brief Selects the first mutually supported and enabled KEX algorithm.
  *
  * The client preference order wins, while the server configuration constrains
@@ -358,7 +336,8 @@ static char* select_kex_algorithm(const char* client_kex_list,
       memcpy(candidate, start, len);
       candidate[len] = '\0';
 
-      if (csv_list_contains(server_kex_list, candidate) &&
+      if (nasfs_handshake_offer_contains(server_kex_list, candidate) &&
+          nasfs_handshake_profile(candidate) != 0 &&
           OQS_KEM_alg_is_enabled(candidate)) {
         return candidate;
       }
@@ -380,10 +359,10 @@ static char* select_kex_algorithm(const char* client_kex_list,
  */
 static char* select_cipher_algorithm(const char* client_cipher_list,
                                      const char* server_cipher_list) {
-  if (csv_list_contains(client_cipher_list,
-                        NASFS_CONTROL_CIPHER_XCHACHA20POLY1305) &&
-      csv_list_contains(server_cipher_list,
-                        NASFS_CONTROL_CIPHER_XCHACHA20POLY1305)) {
+  if (nasfs_handshake_offer_contains(client_cipher_list,
+                                     NASFS_CONTROL_CIPHER_XCHACHA20POLY1305) &&
+      nasfs_handshake_offer_contains(server_cipher_list,
+                                     NASFS_CONTROL_CIPHER_XCHACHA20POLY1305)) {
     return strdup(NASFS_CONTROL_CIPHER_XCHACHA20POLY1305);
   }
 
@@ -395,12 +374,17 @@ static char* select_cipher_algorithm(const char* client_cipher_list,
 static void session_free(client_session_t* session) {
   if (!session) return;
   if (session->recv_buffer) free(session->recv_buffer);
+  if (session->kem_secret_key) {
+    sodium_memzero(session->kem_secret_key, session->kem->length_secret_key);
+    free(session->kem_secret_key);
+  }
   if (session->kem) OQS_KEM_free(session->kem);
-  if (session->kem_secret_key) free(session->kem_secret_key);
+  sodium_memzero(session->auth_context, sizeof(session->auth_context));
   if (session->shared_secret) sodium_free(session->shared_secret);
   if (session->kex_algorithm) free(session->kex_algorithm);
   if (session->cipher_algorithm) free(session->cipher_algorithm);
   free(session);
+  live_sessions--;
   log_all(LOG_DEBUG, "Session resources deallocated.");
 }
 
@@ -430,7 +414,16 @@ static void discard_upload(client_session_t* session) {
 
 static int publish_upload(client_session_t* session) {
   session->put_draining = 0;
+  uint8_t trailer[sizeof(uint32_t) + NASFS_MANIFEST_SIZE] = {0};
+  memcpy(trailer + sizeof(uint32_t), session->upload_manifest,
+         NASFS_MANIFEST_SIZE);
+  uv_fs_t request;
+  uv_buf_t buf = uv_buf_init((char*)trailer, sizeof(trailer));
+  int written = uv_fs_write(session->handle.loop, &request, session->active_fd,
+                            &buf, 1, (int64_t)session->file_offset, NULL);
+  uv_fs_req_cleanup(&request);
   int rc = close_active_file(session);
+  if (rc == 0 && written != (int)sizeof(trailer)) rc = UV_EIO;
   if (rc == 0) {
     rc = nasfs_storage_publish_upload(
         session->storage, session->upload_temp_name, session->upload_name);
@@ -469,11 +462,24 @@ void session_close(uv_handle_t* handle) {
   finish_session_close(session);
 }
 
+void session_expire_idle(uv_handle_t* handle, void* listener) {
+  if (handle->type != UV_TCP || handle == listener || uv_is_closing(handle))
+    return;
+  client_session_t* session = handle->data;
+  if (uv_now(handle->loop) - session->last_activity >=
+      (uint64_t)global_config.client_timeout * 1000u) {
+    log_all(LOG_WARNING, "Session idle timeout.");
+    session_close(handle);
+  }
+}
+
 /* --- Protocol & Crypto Implementation --- */
 
 static int session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
                               const uint8_t* payload, size_t payload_len,
                               int encrypt) {
+  if (session->state == SESSION_STATE_ERROR) return UV_ECANCELED;
+  int rc = UV_ENOMEM;
   uint8_t* payload_to_pack = (uint8_t*)payload;
   size_t payload_to_pack_len = payload_len;
   uint8_t* encrypted_payload = NULL;
@@ -482,11 +488,17 @@ static int session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
     payload_to_pack_len =
         payload_len + crypto_secretstream_xchacha20poly1305_ABYTES;
     encrypted_payload = malloc(payload_to_pack_len);
-    if (!encrypted_payload) return UV_ENOMEM;
+    if (!encrypted_payload) goto fail;
 
-    crypto_secretstream_xchacha20poly1305_push(&session->send_crypto_state,
-                                               encrypted_payload, NULL, payload,
-                                               payload_len, NULL, 0, 0);
+    uint8_t command = (uint8_t)type;
+    if (crypto_secretstream_xchacha20poly1305_push(
+            &session->send_crypto_state, encrypted_payload, NULL, payload,
+            payload_len, &command, sizeof(command),
+            crypto_secretstream_xchacha20poly1305_TAG_MESSAGE) != 0) {
+      free(encrypted_payload);
+      rc = UV_EPROTO;
+      goto fail;
+    }
     payload_to_pack = encrypted_payload;
   }
 
@@ -494,22 +506,24 @@ static int session_send_frame(client_session_t* session, nasfs_cmd_type_t type,
   uint8_t* frame_data = protocol_pack_frame(type, payload_to_pack,
                                             payload_to_pack_len, &frame_size);
   if (encrypted_payload) free(encrypted_payload);
-  if (!frame_data) return UV_ENOMEM;
+  if (!frame_data) goto fail;
 
   nasfs_write_ctx_t* ctx = malloc(sizeof(nasfs_write_ctx_t));
   if (!ctx) {
     free(frame_data);
-    return UV_ENOMEM;
+    goto fail;
   }
 
   ctx->buf = uv_buf_init((char*)frame_data, frame_size);
   ctx->type = type;
-  int rc = uv_write(&ctx->req, (uv_stream_t*)&session->handle, &ctx->buf, 1,
-                    on_socket_write_done);
-  if (rc < 0) {
-    free(frame_data);
-    free(ctx);
-  }
+  rc = uv_write(&ctx->req, (uv_stream_t*)&session->handle, &ctx->buf, 1,
+                on_socket_write_done);
+  if (rc == 0) return 0;
+  free(frame_data);
+  free(ctx);
+fail:
+  log_all(LOG_ERROR, "Frame submission failed: %s", uv_strerror(rc));
+  session_close((uv_handle_t*)&session->handle);
   return rc;
 }
 
@@ -522,21 +536,13 @@ static void release_fs_request(nasfs_fs_ctx_t* ctx) {
 
 static void finish_put(client_session_t* session) {
   int result = publish_upload(session);
-  if (session->protocol_v2) {
-    uint8_t status =
-        result == 0 ? NASFS_PUT_PUBLISHED : NASFS_PUT_PUBLICATION_FAILED;
-    int rc = session_send_frame(session, NASFS_CMD_PUT_RESULT, &status,
-                                sizeof(status), 1);
-    if (rc < 0) {
-      log_all(LOG_ERROR, "PUT: Could not send publication result: %s",
-              uv_strerror(rc));
-      session_close((uv_handle_t*)&session->handle);
-      return;
-    }
-  } else if (result < 0) {
-    session_send_frame(session, NASFS_CMD_ERROR,
-                       (const uint8_t*)"Publication failed",
-                       sizeof("Publication failed") - 1, 1);
+  uint8_t status =
+      result == 0 ? NASFS_PUT_PUBLISHED : NASFS_PUT_PUBLICATION_FAILED;
+  int rc = session_send_frame(session, NASFS_CMD_PUT_RESULT, &status,
+                              sizeof(status), 1);
+  if (rc < 0) {
+    log_all(LOG_ERROR, "PUT: Could not send publication result: %s",
+            uv_strerror(rc));
     session_close((uv_handle_t*)&session->handle);
     return;
   }
@@ -547,9 +553,23 @@ static void finish_file_request(client_session_t* session) {
   session->pending_fs--;
   if (session->state == SESSION_STATE_ERROR) {
     finish_session_close(session);
-  } else if (session->put_draining && session->pending_fs == 0) {
+    return;
+  }
+  if (session->put_draining && session->pending_fs == 0) {
     finish_put(session);
-    if (session->state != SESSION_STATE_ERROR) process_session_frames(session);
+    if (session->state == SESSION_STATE_ERROR) return;
+    process_session_frames(session);
+  }
+  if (session->read_paused && session->state != SESSION_STATE_ERROR) {
+    process_session_frames(session);
+    if (session->state != SESSION_STATE_ERROR &&
+        session->pending_fs < MAX_PENDING_PUT_WRITES) {
+      session->read_paused = 0;
+      if (uv_read_start((uv_stream_t*)&session->handle, session_alloc_buffer,
+                        session_on_read) < 0) {
+        session_close((uv_handle_t*)&session->handle);
+      }
+    }
   }
 }
 
@@ -581,21 +601,24 @@ static void on_put_fs_write(uv_fs_t* req) {
 static void on_put_fs_open(client_session_t* session, int result) {
   if (result < 0) {
     log_all(LOG_ERROR, "PUT: Open failed: %s", uv_strerror((int)result));
+    session->state = SESSION_STATE_AUTHENTICATED;
     session_send_frame(session, NASFS_CMD_ERROR, (const uint8_t*)"Open failed",
                        11, 1);
-    session->state = SESSION_STATE_AUTHENTICATED;
   } else {
     session->active_fd = (uv_file)result;
     if (session->file_encryption_enabled) {
       /* Write file header: [8 size][16 salt][1 cipher_algo][1 hash_algo] */
-      uint8_t header[FILE_HEADER_SIZE];
+      uint8_t header[FILE_HEADER_SIZE + NASFS_OWNER_SLOT_V1_SIZE];
       memcpy(header, &session->expected_plaintext_size, sizeof(uint64_t));
       memcpy(header + sizeof(uint64_t), session->file_salt,
              crypto_pwhash_SALTBYTES);
       header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES] =
-          session->file_cipher_algo;
+          session->file_cipher_algo | FILE_HEADER_RECORD_LENGTHS |
+          FILE_HEADER_MANIFEST | FILE_HEADER_OWNER_SLOT_V1;
       header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 1] =
           session->file_hash_algo;
+      memcpy(header + FILE_HEADER_SIZE, session->owner_slot,
+             sizeof(session->owner_slot));
       uv_fs_t write_req;
       uv_buf_t buf = uv_buf_init((char*)header, sizeof(header));
       int rc = uv_fs_write(session->handle.loop, &write_req, session->active_fd,
@@ -603,14 +626,20 @@ static void on_put_fs_open(client_session_t* session, int result) {
       uv_fs_req_cleanup(&write_req);
       if (rc != (int)sizeof(header)) {
         log_all(LOG_ERROR, "PUT: Header write failed: wrote %d bytes", rc);
+        session->state = SESSION_STATE_AUTHENTICATED;
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Header write failed", 19, 1);
-        session->state = SESSION_STATE_AUTHENTICATED;
         close_active_file(session);
         discard_upload(session);
         return;
       }
-      session->file_offset = FILE_HEADER_SIZE;
+      session->file_offset = sizeof(header);
+      protocol_manifest_init(&session->manifest, session->upload_name,
+                             session->expected_plaintext_size,
+                             session->file_salt, session->file_cipher_algo,
+                             session->file_hash_algo);
+      protocol_manifest_owner_slot(&session->manifest, session->owner_slot,
+                                   sizeof(session->owner_slot));
     } else {
       session->file_offset = 0;
     }
@@ -629,13 +658,18 @@ static void on_get_fs_read(uv_fs_t* req) {
 
   if (req->result < 0) {
     log_all(LOG_ERROR, "GET: Read failed: %s", uv_strerror((int)req->result));
+    session->state = SESSION_STATE_AUTHENTICATED;
     session_send_frame(session, NASFS_CMD_ERROR, (const uint8_t*)"Read failed",
                        11, 1);
     close_active_file(session);
-    session->state = SESSION_STATE_AUTHENTICATED;
+
+  } else if (session->has_record_lengths &&
+             (size_t)req->result != ctx->buf.len) {
+    log_all(LOG_ERROR, "GET: Truncated encrypted record.");
+    session_close((uv_handle_t*)&session->handle);
   } else if (req->result == 0) {  // EOF
-    session_send_frame(session, NASFS_CMD_GET_DONE, NULL, 0, 1);
     session->state = SESSION_STATE_AUTHENTICATED;
+    session_send_frame(session, NASFS_CMD_GET_DONE, NULL, 0, 1);
     close_active_file(session);
   } else {
     size_t bytes = req->result;
@@ -656,8 +690,10 @@ static void on_get_fs_read(uv_fs_t* req) {
         finish_fs_request(ctx);
         return;
       }
-      session_send_frame(session, NASFS_CMD_GET_BLOCK_META,
-                         (const uint8_t*)&meta, sizeof(meta), 1);
+      uint8_t encoded_meta[NASFS_BLOCK_META_SIZE];
+      protocol_encode_block_meta(encoded_meta, &meta);
+      session_send_frame(session, NASFS_CMD_GET_BLOCK_META, encoded_meta,
+                         sizeof(encoded_meta), 1);
       session->server_block_seq++;
     }
     session_send_frame(session, NASFS_CMD_GET_DATA, (uint8_t*)ctx->buf.base,
@@ -670,14 +706,59 @@ static void on_get_fs_read(uv_fs_t* req) {
 static void do_get_next_chunk(client_session_t* session) {
   if (session->state != SESSION_STATE_SENDING_FILE || session->active_fd == -1)
     return;
-  nasfs_fs_ctx_t* ctx = malloc(sizeof(nasfs_fs_ctx_t));
+  size_t chunk_size = IO_CHUNK_SIZE;
+  if (session->has_record_lengths) {
+    uint32_t record_length;
+    uv_fs_t req;
+    uv_buf_t prefix = uv_buf_init((char*)&record_length, sizeof(record_length));
+    int rc = uv_fs_read(session->handle.loop, &req, session->active_fd, &prefix,
+                        1, (int64_t)session->file_offset, NULL);
+    uv_fs_req_cleanup(&req);
+    if (rc == 0 && !session->has_manifest) {
+      session->state = SESSION_STATE_AUTHENTICATED;
+      session_send_frame(session, NASFS_CMD_GET_DONE, NULL, 0, 1);
+      close_active_file(session);
+      return;
+    }
+    if (rc != (int)sizeof(record_length)) {
+      session_close((uv_handle_t*)&session->handle);
+      return;
+    }
+    if (record_length == 0 && session->has_manifest) {
+      uint8_t trailer[NASFS_MANIFEST_SIZE + 1];
+      uv_buf_t tail = uv_buf_init((char*)trailer, sizeof(trailer));
+      if (session->file_offset >
+          INT64_MAX - sizeof(record_length) - sizeof(trailer)) {
+        session_close((uv_handle_t*)&session->handle);
+        return;
+      }
+      rc = uv_fs_read(session->handle.loop, &req, session->active_fd, &tail, 1,
+                      (int64_t)(session->file_offset + sizeof(record_length)),
+                      NULL);
+      uv_fs_req_cleanup(&req);
+      if (rc != NASFS_MANIFEST_SIZE) {
+        session_close((uv_handle_t*)&session->handle);
+        return;
+      }
+      session->state = SESSION_STATE_AUTHENTICATED;
+      session_send_frame(session, NASFS_CMD_GET_DONE, trailer, rc, 1);
+      close_active_file(session);
+      return;
+    }
+    chunk_size = ntohl(record_length);
+    if (chunk_size <= NASFS_CIPHER_OVERHEAD || chunk_size > MAX_RECORD_SIZE ||
+        session->file_offset > INT64_MAX - sizeof(record_length) - chunk_size) {
+      session_close((uv_handle_t*)&session->handle);
+      return;
+    }
+    session->file_offset += sizeof(record_length);
+  } else if (session->file_encryption_enabled) {
+    chunk_size += NASFS_CIPHER_OVERHEAD;
+  }
+  nasfs_fs_ctx_t* ctx = malloc(sizeof(*ctx));
   if (!ctx) {
     session_close((uv_handle_t*)&session->handle);
     return;
-  }
-  size_t chunk_size = IO_CHUNK_SIZE;
-  if (session->file_encryption_enabled) {
-    chunk_size = IO_CHUNK_SIZE + NASFS_CIPHER_OVERHEAD;
   }
   ctx->buf = uv_buf_init(malloc(chunk_size), chunk_size);
   if (!ctx->buf.base) {
@@ -699,11 +780,13 @@ static void do_get_next_chunk(client_session_t* session) {
 static void on_get_fs_open(client_session_t* session, int result) {
   if (result < 0) {
     log_all(LOG_ERROR, "GET: Open failed: %s", uv_strerror((int)result));
+    session->state = SESSION_STATE_AUTHENTICATED;
     session_send_frame(session, NASFS_CMD_ERROR,
                        (const uint8_t*)"File not found", 14, 1);
-    session->state = SESSION_STATE_AUTHENTICATED;
   } else {
     session->active_fd = (uv_file)result;
+    session->has_record_lengths = 0;
+    session->has_manifest = 0;
     if (session->file_encryption_enabled) {
       /* Read file header: [8 size][16 salt][1 cipher_algo][1 hash_algo] */
       uint8_t file_header[FILE_HEADER_SIZE];
@@ -714,20 +797,53 @@ static void on_get_fs_open(client_session_t* session, int result) {
       uv_fs_req_cleanup(&read_req);
       if (rc < (int)sizeof(file_header)) {
         log_all(LOG_ERROR, "GET: Header read failed: read %d bytes", rc);
+        session->state = SESSION_STATE_AUTHENTICATED;
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Header read failed", 18, 1);
-        session->state = SESSION_STATE_AUTHENTICATED;
+
         close_active_file(session);
         return;
       }
       session->file_offset = FILE_HEADER_SIZE;
-      session->file_cipher_algo =
+      uint8_t disk_cipher =
           file_header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES];
+      session->has_record_lengths =
+          (disk_cipher & FILE_HEADER_RECORD_LENGTHS) != 0;
+      session->has_manifest = (disk_cipher & FILE_HEADER_MANIFEST) != 0;
+      int has_slot = (disk_cipher & FILE_HEADER_OWNER_SLOT_V1) != 0;
+      session->file_cipher_algo =
+          disk_cipher & ~(FILE_HEADER_RECORD_LENGTHS | FILE_HEADER_MANIFEST |
+                          FILE_HEADER_OWNER_SLOT_V1);
+      if ((session->has_manifest && !session->has_record_lengths) ||
+          (has_slot && !session->has_manifest)) {
+        session_close((uv_handle_t*)&session->handle);
+        return;
+      }
       session->file_hash_algo =
           file_header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 1];
+      if (session->file_cipher_algo > NASFS_CIPHER_AES_256_GCM ||
+          session->file_hash_algo > NASFS_HASH_CRC32) {
+        log_all(LOG_ERROR, "GET: Invalid container algorithms.");
+        session_close((uv_handle_t*)&session->handle);
+        return;
+      }
 
       /* GET_ACK: [16 salt][8 size][1 cipher_algo][1 hash_algo] */
-      uint8_t ack_payload[FILE_HEADER_SIZE];
+      uint8_t ack_payload[FILE_HEADER_SIZE + NASFS_OWNER_SLOT_V1_SIZE];
+      size_t ack_size = FILE_HEADER_SIZE;
+      if (has_slot) {
+        uv_buf_t slot = uv_buf_init((char*)ack_payload + FILE_HEADER_SIZE,
+                                    NASFS_OWNER_SLOT_V1_SIZE);
+        rc = uv_fs_read(session->handle.loop, &read_req, session->active_fd,
+                        &slot, 1, FILE_HEADER_SIZE, NULL);
+        uv_fs_req_cleanup(&read_req);
+        if (rc != NASFS_OWNER_SLOT_V1_SIZE) {
+          session_close((uv_handle_t*)&session->handle);
+          return;
+        }
+        ack_size += NASFS_OWNER_SLOT_V1_SIZE;
+        session->file_offset = ack_size;
+      }
       memcpy(ack_payload, file_header + sizeof(uint64_t),
              crypto_pwhash_SALTBYTES);
       memcpy(ack_payload + crypto_pwhash_SALTBYTES, file_header,
@@ -736,8 +852,7 @@ static void on_get_fs_open(client_session_t* session, int result) {
           session->file_cipher_algo;
       ack_payload[crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 1] =
           session->file_hash_algo;
-      session_send_frame(session, NASFS_CMD_GET_ACK, ack_payload,
-                         sizeof(ack_payload), 1);
+      session_send_frame(session, NASFS_CMD_GET_ACK, ack_payload, ack_size, 1);
     } else {
       session->file_offset = 0;
       session_send_frame(session, NASFS_CMD_GET_ACK, NULL, 0, 1);
@@ -768,8 +883,10 @@ static void on_storage_opened(uv_work_t* req, int status) {
   client_session_t* session = ctx->session;
   int result = status < 0 ? status : ctx->result;
   if (ctx->uploading && result >= 0) {
-    strcpy(session->upload_name, ctx->name);
-    strcpy(session->upload_temp_name, ctx->temp_name);
+    snprintf(session->upload_name, sizeof(session->upload_name), "%s",
+             ctx->name);
+    snprintf(session->upload_temp_name, sizeof(session->upload_temp_name), "%s",
+             ctx->temp_name);
   }
   if (session->state == SESSION_STATE_ERROR) {
     if (result >= 0) session->active_fd = result;
@@ -792,10 +909,11 @@ static void submit_file_open(client_session_t* session, const uint8_t* name,
   if (nasfs_storage_parse_name(name, length, ctx->name) < 0) {
     free(ctx);
     log_all(LOG_WARNING, "Rejected invalid storage object name.");
+    session->state = SESSION_STATE_AUTHENTICATED;
     session_send_frame(session, NASFS_CMD_ERROR,
                        (const uint8_t*)"Invalid file name",
                        sizeof("Invalid file name") - 1, 1);
-    session->state = SESSION_STATE_AUTHENTICATED;
+
     return;
   }
   ctx->session = session;
@@ -819,10 +937,11 @@ static void session_dispatch_frame(client_session_t* session,
   /* Handle unencrypted handshake commands */
   if (!session->is_secure) {
     switch (frame->type) {
-      case NASFS_CMD_PQC_HELLO:
-      case NASFS_CMD_PQC_HELLO_V2:
-        if (session->state != SESSION_STATE_NEW) return;
-        session->protocol_v2 = frame->type == NASFS_CMD_PQC_HELLO_V2;
+      case NASFS_CMD_HELLO:
+        if (session->state != SESSION_STATE_NEW) {
+          session_close((uv_handle_t*)&session->handle);
+          return;
+        }
         {
           char* client_kex_list = NULL;
           char* client_cipher_list = NULL;
@@ -830,8 +949,10 @@ static void session_dispatch_frame(client_session_t* session,
           uint8_t* selection_payload = NULL;
           size_t selection_payload_len = 0;
 
-          if (nasfs_handshake_unpack_client_hello(
-                  frame->payload, frame->payload_len, &client_kex_list,
+          if (frame->payload_len <= NASFS_HANDSHAKE_NONCE ||
+              nasfs_handshake_unpack_client_hello(
+                  frame->payload + NASFS_HANDSHAKE_NONCE,
+                  frame->payload_len - NASFS_HANDSHAKE_NONCE, &client_kex_list,
                   &client_cipher_list) != 0) {
             session_close((uv_handle_t*)&session->handle);
             return;
@@ -879,18 +1000,44 @@ static void session_dispatch_frame(client_session_t* session,
             return;
           }
 
+          uint8_t* signed_selection = realloc(
+              selection_payload, selection_payload_len + 1 + crypto_sign_BYTES);
+          if (!signed_selection) {
+            free(selection_payload);
+            session_close((uv_handle_t*)&session->handle);
+            return;
+          }
+          selection_payload = signed_selection;
+          selection_payload[selection_payload_len++] =
+              nasfs_handshake_profile(session->kex_algorithm);
+          uint8_t hello_hash[32];
+          nasfs_handshake_hash(hello_hash, frame->payload, frame->payload_len);
+          nasfs_handshake_transcript(session->handshake_transcript, hello_hash,
+                                     selection_payload, selection_payload_len);
+          if (crypto_sign_detached(selection_payload + selection_payload_len,
+                                   NULL, session->handshake_transcript, 32,
+                                   server_signing_key) != 0) {
+            free(selection_payload);
+            session_close((uv_handle_t*)&session->handle);
+            return;
+          }
+          selection_payload_len += crypto_sign_BYTES;
+
+          session->state = SESSION_STATE_HANDSHAKE;
           session_send_frame(session, NASFS_CMD_PQC_PUBLIC_KEY,
                              selection_payload, selection_payload_len, 0);
           free(selection_payload);
           log_all(LOG_INFO, "Negotiated KEX: %s; control cipher: %s",
                   session->kex_algorithm, session->cipher_algorithm);
-          session->state = SESSION_STATE_HANDSHAKE;
         }
         return;
 
       case NASFS_CMD_PQC_CIPHERTEXT:
-        if (session->state != SESSION_STATE_HANDSHAKE) return;
-        if (frame->payload_len <
+        if (session->state != SESSION_STATE_HANDSHAKE) {
+          session_close((uv_handle_t*)&session->handle);
+          return;
+        }
+        if (frame->payload_len !=
             session->kem->length_ciphertext +
                 crypto_secretstream_xchacha20poly1305_HEADERBYTES) {
           session_close((uv_handle_t*)&session->handle);
@@ -910,31 +1057,50 @@ static void session_dispatch_frame(client_session_t* session,
         {
           const uint8_t* client_header =
               frame->payload + session->kem->length_ciphertext;
-          uint8_t
-              server_header[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
-
-          if (crypto_secretstream_xchacha20poly1305_init_pull(
-                  &session->recv_crypto_state, client_header,
-                  session->shared_secret) != 0 ||
+          uint8_t ready[crypto_secretstream_xchacha20poly1305_HEADERBYTES + 32];
+          uint8_t key[32], ciphertext_hash[32];
+          nasfs_handshake_hash(ciphertext_hash, frame->payload,
+                               frame->payload_len);
+          int rc =
+              nasfs_handshake_key(
+                  key, session->shared_secret, session->shared_secret_len,
+                  session->handshake_transcript, NASFS_KEY_CLIENT_CONTROL) ||
+              crypto_secretstream_xchacha20poly1305_init_pull(
+                  &session->recv_crypto_state, client_header, key) ||
+              nasfs_handshake_key(
+                  key, session->shared_secret, session->shared_secret_len,
+                  session->handshake_transcript, NASFS_KEY_SERVER_CONTROL) ||
               crypto_secretstream_xchacha20poly1305_init_push(
-                  &session->send_crypto_state, server_header,
-                  session->shared_secret) != 0) {
+                  &session->send_crypto_state, ready, key) ||
+              nasfs_handshake_key(
+                  key, session->shared_secret, session->shared_secret_len,
+                  session->handshake_transcript, NASFS_KEY_SERVER_FINISHED) ||
+              nasfs_handshake_finished(
+                  ready + crypto_secretstream_xchacha20poly1305_HEADERBYTES,
+                  key, ciphertext_hash, ready,
+                  crypto_secretstream_xchacha20poly1305_HEADERBYTES) ||
+              nasfs_handshake_key(session->auth_context, session->shared_secret,
+                                  session->shared_secret_len,
+                                  session->handshake_transcript,
+                                  NASFS_KEY_CLIENT_AUTH);
+          sodium_memzero(key, sizeof(key));
+          if (rc != 0) {
             session_close((uv_handle_t*)&session->handle);
             return;
           }
 
           log_all(LOG_INFO, "PQC Handshake successful. Channel is now secure.");
           session->is_secure = 1;
-          session->state = SESSION_STATE_AUTHENTICATED;
+          session->state = SESSION_STATE_AUTHENTICATING;
+          sodium_free(session->shared_secret);
+          session->shared_secret = NULL;
+          sodium_memzero(session->kem_secret_key,
+                         session->kem->length_secret_key);
           OQS_KEM_free(session->kem);
           session->kem = NULL;
           free(session->kem_secret_key);
           session->kem_secret_key = NULL;
-          nasfs_cmd_type_t ready = session->protocol_v2
-                                       ? NASFS_CMD_SECURE_READY_V2
-                                       : NASFS_CMD_SECURE_READY;
-          session_send_frame(session, ready, server_header,
-                             sizeof(server_header), 0);
+          session_send_frame(session, NASFS_CMD_READY, ready, sizeof(ready), 0);
         }
         return;
 
@@ -955,9 +1121,13 @@ static void session_dispatch_frame(client_session_t* session,
       session_close((uv_handle_t*)&session->handle);
       return;
     }
+    uint8_t command = (uint8_t)frame->type;
+    uint8_t tag;
     if (crypto_secretstream_xchacha20poly1305_pull(
             &session->recv_crypto_state, decrypted_payload, &decrypted_len,
-            NULL, frame->payload, frame->payload_len, NULL, 0) != 0) {
+            &tag, frame->payload, frame->payload_len, &command,
+            sizeof(command)) != 0 ||
+        tag != crypto_secretstream_xchacha20poly1305_TAG_MESSAGE) {
       free(decrypted_payload);
       log_all(LOG_ERROR, "Corrupted encrypted frame received. Closing.");
       session_close((uv_handle_t*)&session->handle);
@@ -970,22 +1140,23 @@ static void session_dispatch_frame(client_session_t* session,
   switch (plain_frame.type) {
     case NASFS_CMD_PAKE_HELLO: {
       /* Payload: [u8 ulen][username][X(32)] */
-      if (!session->is_secure || session->is_authenticated ||
+      if (session->state != SESSION_STATE_AUTHENTICATING ||
+          session->pake_hello_received ||
           plain_frame.payload_len < 2 + crypto_core_ristretto255_BYTES) {
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Bad PAKE_HELLO", 14, 1);
         session_close((uv_handle_t*)&session->handle);
         break;
       }
-      if (!csv_list_contains(global_config.auth_methods,
-                             NASFS_AUTH_METHOD_PAKE)) {
+      if (!nasfs_handshake_offer_contains(global_config.auth_methods,
+                                          NASFS_AUTH_METHOD_PAKE)) {
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"PAKE not enabled", 16, 1);
         session_close((uv_handle_t*)&session->handle);
         break;
       }
       uint8_t ulen = plain_frame.payload[0];
-      if (1 + ulen + (size_t)crypto_core_ristretto255_BYTES >
+      if (1 + ulen + (size_t)crypto_core_ristretto255_BYTES !=
           plain_frame.payload_len) {
         session_send_frame(session, NASFS_CMD_ERROR,
                            (const uint8_t*)"Bad PAKE_HELLO", 14, 1);
@@ -1029,7 +1200,7 @@ static void session_dispatch_frame(client_session_t* session,
     }
 
     case NASFS_CMD_AUTH: {
-      if (session->state != SESSION_STATE_AUTHENTICATED) {
+      if (session->state != SESSION_STATE_AUTHENTICATING) {
         session_close((uv_handle_t*)&session->handle);
         break;
       }
@@ -1048,7 +1219,6 @@ static void session_dispatch_frame(client_session_t* session,
 
       log_all(LOG_INFO, "Client '%s' authenticated with %s.", auth.username,
               auth.method);
-      session->is_authenticated = 1;
       session->state = SESSION_STATE_AUTHENTICATED;
       session_send_frame(session, NASFS_CMD_AUTH_ACK, NULL, 0, 1);
       nasfs_auth_payload_free(&auth);
@@ -1056,12 +1226,6 @@ static void session_dispatch_frame(client_session_t* session,
     }
 
     case NASFS_CMD_PUT_REQ: {
-      if (!session->is_authenticated) {
-        session_send_frame(session, NASFS_CMD_ERROR,
-                           (const uint8_t*)"Authentication required", 23, 1);
-        session_close((uv_handle_t*)&session->handle);
-        break;
-      }
       if (session->state != SESSION_STATE_AUTHENTICATED) {
         session_close((uv_handle_t*)&session->handle);
         break;
@@ -1079,7 +1243,8 @@ static void session_dispatch_frame(client_session_t* session,
         /* Encrypted PUT_REQ: [1 enc][16 salt][8 size][1 cipher][1 hash][name]
          */
         if (is_enc) {
-          if (plain_frame.payload_len <= 1 + FILE_HEADER_SIZE) {
+          size_t name_offset = 1 + FILE_HEADER_SIZE + NASFS_OWNER_SLOT_V1_SIZE;
+          if (plain_frame.payload_len <= name_offset) {
             session_close((uv_handle_t*)&session->handle);
             break;
           }
@@ -1106,14 +1271,19 @@ static void session_dispatch_frame(client_session_t* session,
           }
           session->file_cipher_algo = req_cipher;
           session->file_hash_algo = req_hash;
-          filename_ptr = plain_frame.payload +
-                         (1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2);
-          filename_len = plain_frame.payload_len -
-                         (1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2);
+          memcpy(session->owner_slot,
+                 plain_frame.payload + 1 + FILE_HEADER_SIZE,
+                 sizeof(session->owner_slot));
+          filename_ptr = plain_frame.payload + name_offset;
+          filename_len = plain_frame.payload_len - name_offset;
         } else {
           filename_ptr = plain_frame.payload + 1;
           filename_len = plain_frame.payload_len - 1;
         }
+      }
+      if (!is_enc) {
+        session_close((uv_handle_t*)&session->handle);
+        break;
       }
       session->file_encryption_enabled = is_enc;
       session->has_pending_block_meta = 0;
@@ -1125,27 +1295,29 @@ static void session_dispatch_frame(client_session_t* session,
     }
 
     case NASFS_CMD_PUT_BLOCK_META: {
-      if (session->is_authenticated &&
-          session->state == SESSION_STATE_RECEIVING_FILE) {
-        if (plain_frame.payload_len < sizeof(nasfs_block_meta_t)) {
+      if (session->state == SESSION_STATE_RECEIVING_FILE &&
+          session->active_fd != -1 && !session->has_pending_block_meta) {
+        nasfs_block_meta_t meta;
+        if (protocol_decode_block_meta(plain_frame.payload,
+                                       plain_frame.payload_len, &meta) < 0) {
           log_all(LOG_ERROR, "PUT: Received invalid block meta payload size.");
           session_send_frame(session, NASFS_CMD_ERROR,
                              (const uint8_t*)"Invalid block meta", 18, 1);
           session_close((uv_handle_t*)&session->handle);
           break;
         }
-        nasfs_block_meta_t* meta = (nasfs_block_meta_t*)plain_frame.payload;
-        session->expected_block_seq = meta->seq_num;
-        session->expected_block_size = meta->size;
-        memcpy(session->expected_block_hash, meta->hash, 32);
+        session->expected_block_seq = meta.seq_num;
+        session->expected_block_size = meta.size;
+        memcpy(session->expected_block_hash, meta.hash, 32);
         session->has_pending_block_meta = 1;
+      } else {
+        session_close((uv_handle_t*)&session->handle);
       }
       break;
     }
 
     case NASFS_CMD_PUT_DATA: {  // Unencrypted
-      if (session->is_authenticated &&
-          session->state == SESSION_STATE_RECEIVING_FILE &&
+      if (session->state == SESSION_STATE_RECEIVING_FILE &&
           session->active_fd != -1) {
         if (session->file_encryption_enabled) {
           if (!session->has_pending_block_meta) {
@@ -1204,12 +1376,16 @@ static void session_dispatch_frame(client_session_t* session,
           session->server_block_seq++;
         }
 
-        if (plain_frame.payload_len > INT64_MAX - session->file_offset) {
+        size_t prefix_size =
+            session->file_encryption_enabled ? sizeof(uint32_t) : 0;
+        size_t write_size = prefix_size + plain_frame.payload_len;
+        if (write_size > INT64_MAX - session->file_offset) {
           session_close((uv_handle_t*)&session->handle);
           break;
         }
         if (session->file_encryption_enabled) {
-          if (plain_frame.payload_len <= NASFS_CIPHER_OVERHEAD) {
+          if (plain_frame.payload_len <= NASFS_CIPHER_OVERHEAD ||
+              plain_frame.payload_len > MAX_RECORD_SIZE) {
             session_close((uv_handle_t*)&session->handle);
             break;
           }
@@ -1221,6 +1397,8 @@ static void session_dispatch_frame(client_session_t* session,
             break;
           }
           session->upload_plaintext_bytes += plaintext_bytes;
+          protocol_manifest_record(&session->manifest, plain_frame.payload,
+                                   plain_frame.payload_len);
         }
 
         nasfs_fs_ctx_t* ctx = malloc(sizeof(*ctx));
@@ -1228,14 +1406,18 @@ static void session_dispatch_frame(client_session_t* session,
           session_close((uv_handle_t*)&session->handle);
           break;
         }
-        ctx->buf = uv_buf_init(malloc(plain_frame.payload_len),
-                               plain_frame.payload_len);
+        ctx->buf = uv_buf_init(malloc(write_size), write_size);
         if (!ctx->buf.base) {
           free(ctx);
           session_close((uv_handle_t*)&session->handle);
           break;
         }
-        memcpy(ctx->buf.base, plain_frame.payload, plain_frame.payload_len);
+        if (prefix_size != 0) {
+          uint32_t length = htonl((uint32_t)plain_frame.payload_len);
+          memcpy(ctx->buf.base, &length, sizeof(length));
+        }
+        memcpy(ctx->buf.base + prefix_size, plain_frame.payload,
+               plain_frame.payload_len);
         ctx->req.data = ctx;
         ctx->session = session;
         int rc = uv_fs_write(session->handle.loop, &ctx->req,
@@ -1246,7 +1428,9 @@ static void session_dispatch_frame(client_session_t* session,
           break;
         }
         session->pending_fs++;
-        session->file_offset += plain_frame.payload_len;
+        session->file_offset += write_size;
+      } else {
+        session_close((uv_handle_t*)&session->handle);
       }
       break;
     }
@@ -1254,27 +1438,35 @@ static void session_dispatch_frame(client_session_t* session,
     case NASFS_CMD_PUT_DONE:
       if (session->state == SESSION_STATE_RECEIVING_FILE &&
           session->active_fd != -1) {
-        if (plain_frame.payload_len != 0 ||
-            (session->file_encryption_enabled &&
-             (session->has_pending_block_meta ||
-              session->upload_plaintext_bytes !=
-                  session->expected_plaintext_size))) {
+        if (plain_frame.payload_len != NASFS_MANIFEST_SIZE ||
+            session->has_pending_block_meta ||
+            session->upload_plaintext_bytes !=
+                session->expected_plaintext_size ||
+            session->file_offset >
+                INT64_MAX - sizeof(uint32_t) - NASFS_MANIFEST_SIZE) {
           log_all(LOG_ERROR, "PUT: Incomplete upload.");
           session_close((uv_handle_t*)&session->handle);
           break;
         }
+        if (protocol_manifest_verify(&session->manifest, plain_frame.payload,
+                                     trusted_author) != 0) {
+          uint8_t status = NASFS_PUT_PUBLICATION_FAILED;
+          log_all(LOG_WARNING, "PUT: Manifest verification failed.");
+          session_send_frame(session, NASFS_CMD_PUT_RESULT, &status,
+                             sizeof(status), 1);
+          session_close((uv_handle_t*)&session->handle);
+          break;
+        }
+        memcpy(session->upload_manifest, plain_frame.payload,
+               NASFS_MANIFEST_SIZE);
         session->put_draining = 1;
         if (session->pending_fs == 0) finish_put(session);
+      } else {
+        session_close((uv_handle_t*)&session->handle);
       }
       break;
 
     case NASFS_CMD_GET_REQ: {
-      if (!session->is_authenticated) {
-        session_send_frame(session, NASFS_CMD_ERROR,
-                           (const uint8_t*)"Authentication required", 23, 1);
-        session_close((uv_handle_t*)&session->handle);
-        break;
-      }
       if (session->state != SESSION_STATE_AUTHENTICATED) {
         session_close((uv_handle_t*)&session->handle);
         break;
@@ -1288,6 +1480,10 @@ static void session_dispatch_frame(client_session_t* session,
         filename_ptr = plain_frame.payload + 1;
         filename_len = plain_frame.payload_len - 1;
       }
+      if (!is_enc) {
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
       session->file_encryption_enabled = is_enc;
       session->has_pending_block_meta = 0;
       session->server_block_seq = 0;
@@ -1297,6 +1493,7 @@ static void session_dispatch_frame(client_session_t* session,
       break;
     }
     default:
+      session_close((uv_handle_t*)&session->handle);
       break;
   }
 
@@ -1309,9 +1506,12 @@ static void on_socket_write_done(uv_write_t* req, int status) {
   if (status < 0) {
     log_all(LOG_ERROR, "Socket write failed: %s", uv_strerror(status));
     session_close((uv_handle_t*)&session->handle);
-  } else if (session && session->state == SESSION_STATE_SENDING_FILE &&
-             ctx->type == NASFS_CMD_GET_DATA) {
-    do_get_next_chunk(session);
+  } else {
+    session->last_activity = uv_now(req->handle->loop);
+    if (session->state == SESSION_STATE_SENDING_FILE &&
+        ctx->type == NASFS_CMD_GET_DATA) {
+      do_get_next_chunk(session);
+    }
   }
   if (ctx->buf.base) free(ctx->buf.base);
   free(ctx);
@@ -1350,9 +1550,9 @@ static void session_alloc_buffer(uv_handle_t* handle, size_t suggested_size,
 }
 
 static void process_session_frames(client_session_t* session) {
-  /* Keep reading for EOF but hold the next command until PUT releases its fd.
-   */
-  while (session->recv_length > 0 && !session->put_draining) {
+  /* Retain complete frames in the receive buffer while disk writes drain. */
+  while (session->recv_length > 0 && !session->put_draining &&
+         session->pending_fs < MAX_PENDING_PUT_WRITES) {
     nasfs_frame_t frame;
     int consumed = protocol_parse_frame(session->recv_buffer,
                                         session->recv_length, &frame);
@@ -1360,11 +1560,16 @@ static void process_session_frames(client_session_t* session) {
       if (consumed < 0) session_close((uv_handle_t*)&session->handle);
       return;
     }
+    session->last_activity = uv_now(session->handle.loop);
     session_dispatch_frame(session, &frame);
     if (session->state == SESSION_STATE_ERROR) return;
     memmove(session->recv_buffer, session->recv_buffer + consumed,
             session->recv_length - (size_t)consumed);
     session->recv_length -= (size_t)consumed;
+  }
+  if (!session->read_paused && session->pending_fs >= MAX_PENDING_PUT_WRITES) {
+    uv_read_stop((uv_stream_t*)&session->handle);
+    session->read_paused = 1;
   }
 }
 
@@ -1393,11 +1598,14 @@ void session_on_new_connection(uv_stream_t* server, int status) {
     return;
   }
 
-  session = calloc(1, sizeof(*session));
-  if (!session) {
+  void* memory = NULL;
+  if (posix_memalign(&memory, _Alignof(client_session_t), sizeof(*session)) !=
+      0) {
     log_all(LOG_ERROR, "Failed to allocate session context.");
     return;
   }
+  session = memory;
+  memset(session, 0, sizeof(*session));
 
   session->state = SESSION_STATE_NEW;
   session->active_fd = -1;
@@ -1411,6 +1619,8 @@ void session_on_new_connection(uv_stream_t* server, int status) {
     return;
   }
 
+  live_sessions++;
+  session->last_activity = uv_now(server->loop);
   session->handle.data = session;
   session->storage = server->data;
   if (uv_accept(server, (uv_stream_t*)&session->handle) != 0) {
@@ -1418,6 +1628,14 @@ void session_on_new_connection(uv_stream_t* server, int status) {
     return;
   }
 
+  size_t limit = global_config.max_connections > 0
+                     ? (size_t)global_config.max_connections
+                     : 128;
+  if (live_sessions > limit) {
+    log_all(LOG_WARNING, "Rejecting connection at session limit.");
+    session_close((uv_handle_t*)&session->handle);
+    return;
+  }
   log_all(LOG_INFO, "Accepted new client connection.");
   if (uv_read_start((uv_stream_t*)&session->handle, session_alloc_buffer,
                     session_on_read) != 0) {

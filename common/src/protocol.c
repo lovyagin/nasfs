@@ -25,7 +25,7 @@ int protocol_parse_frame(const uint8_t* buffer, size_t size,
     return -1;
   }
 
-  if (size < NASFS_PROTO_HEADER_SIZE) {
+  if (size < sizeof(uint32_t)) {
     return 0;
   }
 
@@ -36,7 +36,7 @@ int protocol_parse_frame(const uint8_t* buffer, size_t size,
   // Validate frame_len to prevent integer overflow and denial of service /
   // memory corruption. 16 MB is a very generous maximum limit for a single
   // protocol frame (with 64KB blocks).
-  if (frame_len > 1024 * 1024 * 16) {
+  if (frame_len == 0 || frame_len > NASFS_PROTO_MAX_FRAME) {
     return -1;
   }
 
@@ -61,12 +61,11 @@ int protocol_parse_frame(const uint8_t* buffer, size_t size,
 
 uint8_t* protocol_pack_frame(nasfs_cmd_type_t type, const uint8_t* payload,
                              size_t payload_len, size_t* out_size) {
-  if (!out_size) {
+  if (!out_size || (!payload && payload_len != 0)) {
     return NULL;
   }
 
-  /* payload_len must fit in uint32_t - 1 to avoid integer overflow */
-  if (payload_len > (size_t)(UINT32_MAX - 1)) {
+  if (payload_len >= NASFS_PROTO_MAX_FRAME) {
     return NULL;
   }
 
@@ -89,4 +88,75 @@ uint8_t* protocol_pack_frame(nasfs_cmd_type_t type, const uint8_t* payload,
 
   *out_size = total_size;
   return buffer;
+}
+
+void protocol_encode_block_meta(uint8_t out[NASFS_BLOCK_META_SIZE],
+                                const nasfs_block_meta_t* meta) {
+  for (size_t i = 0; i < 8; i++) {
+    out[i] = (uint8_t)(meta->seq_num >> (56 - 8 * i));
+  }
+  uint32_t size = htonl(meta->size);
+  memcpy(out + 8, &size, sizeof(size));
+  memcpy(out + 12, meta->hash, sizeof(meta->hash));
+}
+
+int protocol_decode_block_meta(const uint8_t* payload, size_t length,
+                               nasfs_block_meta_t* meta) {
+  if (!payload || !meta || length != NASFS_BLOCK_META_SIZE) return -1;
+  meta->seq_num = 0;
+  for (size_t i = 0; i < 8; i++) {
+    meta->seq_num = (meta->seq_num << 8u) | payload[i];
+  }
+  uint32_t size;
+  memcpy(&size, payload + 8, sizeof(size));
+  meta->size = ntohl(size);
+  memcpy(meta->hash, payload + 12, sizeof(meta->hash));
+  return 0;
+}
+
+void protocol_manifest_init(crypto_generichash_state* state, const char* object,
+                            uint64_t plaintext_size,
+                            const uint8_t salt[crypto_pwhash_SALTBYTES],
+                            uint8_t cipher, uint8_t hash) {
+  const uint8_t domain[] = "NASFS ciphertext manifest/1";
+  uint8_t header[10] = {cipher, hash};
+  for (size_t i = 0; i < 8; i++) {
+    header[2 + i] = (uint8_t)(plaintext_size >> (56 - 8 * i));
+  }
+  crypto_generichash_init(state, NULL, 0, 32);
+  crypto_generichash_update(state, domain, sizeof(domain));
+  crypto_generichash_update(state, header, sizeof(header));
+  crypto_generichash_update(state, salt, crypto_pwhash_SALTBYTES);
+  crypto_generichash_update(state, (const uint8_t*)object, strlen(object) + 1);
+}
+
+void protocol_manifest_owner_slot(crypto_generichash_state* state,
+                                  const uint8_t* slot, size_t length) {
+  const uint8_t tag[] = {0, 0, 0, 0, 'N', 'A', 'S', 'L', 'U', 'K', 'S', 1};
+  crypto_generichash_update(state, tag, sizeof(tag));
+  crypto_generichash_update(state, slot, length);
+}
+
+void protocol_manifest_record(crypto_generichash_state* state,
+                              const uint8_t* ciphertext, size_t length) {
+  uint32_t prefix = htonl((uint32_t)length);
+  crypto_generichash_update(state, (const uint8_t*)&prefix, sizeof(prefix));
+  crypto_generichash_update(state, ciphertext, length);
+}
+
+int protocol_manifest_sign(crypto_generichash_state* state,
+                           uint8_t manifest[NASFS_MANIFEST_SIZE],
+                           const uint8_t key[crypto_sign_SECRETKEYBYTES]) {
+  crypto_generichash_final(state, manifest, 32);
+  return crypto_sign_detached(manifest + 32, NULL, manifest, 32, key);
+}
+
+int protocol_manifest_verify(crypto_generichash_state* state,
+                             const uint8_t manifest[NASFS_MANIFEST_SIZE],
+                             const uint8_t key[crypto_sign_PUBLICKEYBYTES]) {
+  uint8_t digest[32];
+  crypto_generichash_final(state, digest, sizeof(digest));
+  if (sodium_memcmp(digest, manifest, sizeof(digest)) != 0) return -1;
+  return crypto_sign_verify_detached(manifest + 32, digest, sizeof(digest),
+                                     key);
 }

@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <oqs/oqs.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sodium.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,29 +36,30 @@
 #include "pake.h"
 #include "protocol.h"
 
-static nasfs_cipher_algo_t parse_cipher_algo(const char* s) {
-  if (!s) return NASFS_CIPHER_XSALSA20_POLY1305;
+static int parse_cipher_algo(const char* s) {
+  if (!s || !*s || strcmp(s, "xsalsa20poly1305") == 0)
+    return NASFS_CIPHER_XSALSA20_POLY1305;
   if (strcmp(s, "xchacha20poly1305") == 0)
     return NASFS_CIPHER_XCHACHA20_POLY1305;
   if (strcmp(s, "aes256gcm") == 0) return NASFS_CIPHER_AES_256_GCM;
-  return NASFS_CIPHER_XSALSA20_POLY1305; /* default */
+  return -1;
 }
 
-static nasfs_hash_algo_t parse_hash_algo(const char* s) {
-  if (!s) return NASFS_HASH_BLAKE2B;
+static int parse_hash_algo(const char* s) {
+  if (!s || !*s || strcmp(s, "blake2b") == 0) return NASFS_HASH_BLAKE2B;
   if (strcmp(s, "sha256") == 0) return NASFS_HASH_SHA256;
   if (strcmp(s, "adler32") == 0) return NASFS_HASH_ADLER32;
   if (strcmp(s, "crc32") == 0) return NASFS_HASH_CRC32;
-  return NASFS_HASH_BLAKE2B; /* default */
+  return -1;
 }
 
-static nasfs_kdf_algo_t parse_kdf_algo(const char* s) {
-  if (!s) return NASFS_KDF_ARGON2ID;
+static int parse_kdf_algo(const char* s) {
+  if (!s || !*s || strcmp(s, "argon2id") == 0) return NASFS_KDF_ARGON2ID;
   if (strcmp(s, "hkdf") == 0 || strcmp(s, "hkdf-sha256") == 0)
     return NASFS_KDF_HKDF_SHA256;
   if (strcmp(s, "pbkdf2") == 0 || strcmp(s, "pbkdf2-sha256") == 0)
     return NASFS_KDF_PBKDF2_SHA256;
-  return NASFS_KDF_ARGON2ID; /* default */
+  return -1;
 }
 
 static int read_master_salt(int dir, uint8_t salt[crypto_pwhash_SALTBYTES]) {
@@ -227,9 +229,41 @@ size_t client_recv_capacity = 0;
 uint8_t* shared_secret = NULL;
 size_t shared_secret_len = 0;
 int is_secure = 0;
+static uint8_t trusted_server_key[crypto_sign_PUBLICKEYBYTES];
+static uint8_t hello_hash[32];
+static uint8_t handshake_transcript[32];
+static uint8_t ciphertext_hash[32];
+static uint8_t auth_context[32];
+static crypto_generichash_state file_manifest;
+static uint8_t author_secret[crypto_sign_SECRETKEYBYTES];
+static uint8_t author_public[crypto_sign_PUBLICKEYBYTES];
+static int allow_unsigned_reads;
+static int download_has_owner_slot;
+static int require_manifest_digest;
+static uint8_t manifest_digest[32];
+
+static int load_server_key(const struct sockaddr_in* endpoint) {
+  const char* home = getenv("HOME");
+  char address[16];
+  if (!home || uv_ip4_name(endpoint, address, sizeof(address)) != 0) return -1;
+  size_t size =
+      strlen(home) + sizeof("/.nasfs/server-255.255.255.255-65535.pub");
+  char* path = malloc(size);
+  if (!path) return -1;
+  snprintf(path, size, "%s/.nasfs/server-%s-%u.pub", home, address,
+           (unsigned)ntohs(endpoint->sin_port));
+  int result = nasfs_handshake_read_key(path, trusted_server_key, 0);
+  if (result < 0) fprintf(stderr, "Missing or invalid server pin: %s\n", path);
+  free(path);
+  return result;
+}
 int client_exit_code = 0;
 static int client_finished;
 static int local_read_pending;
+static uv_signal_t interrupt_watcher;
+static uv_signal_t terminate_watcher;
+static uv_timer_t idle_timer;
+static uint64_t last_activity;
 crypto_secretstream_xchacha20poly1305_state send_crypto_state;
 crypto_secretstream_xchacha20poly1305_state recv_crypto_state;
 const char* client_kex_algorithms = DEFAULT_KEX_ALGORITHMS;
@@ -523,9 +557,9 @@ static int build_publickey_signature(char** algorithm, uint8_t** public_key,
     goto out;
   }
 
-  message =
-      nasfs_auth_build_message(client_auth_method, client_auth_user,
-                               shared_secret, shared_secret_len, &message_len);
+  message = nasfs_auth_build_message(client_auth_method, client_auth_user,
+                                     auth_context, sizeof(auth_context),
+                                     &message_len);
   *signature = malloc(sig->length_signature);
   if (!message || !*signature) {
     goto out;
@@ -658,11 +692,11 @@ static void send_auth(uv_stream_t* stream) {
       return;
     }
 
-    // 2. DoS-safe Fast Challenge-Response: Proof = BLAKE2b(shared_secret,
+    // 2. DoS-safe Fast Challenge-Response: Proof = BLAKE2b(auth_context,
     // key=P_auth)
     uint8_t proof[32];
-    if (crypto_generichash(proof, sizeof(proof), (const uint8_t*)shared_secret,
-                           shared_secret_len, p_auth, sizeof(p_auth)) != 0) {
+    if (crypto_generichash(proof, sizeof(proof), auth_context,
+                           sizeof(auth_context), p_auth, sizeof(p_auth)) != 0) {
       fprintf(stderr, "Failed to compute fast session password proof\n");
       client_exit_code = 1;
       close_connection((uv_handle_t*)stream);
@@ -751,7 +785,7 @@ static void send_put_req(uv_stream_t* stream) {
   size_t fn_len = strlen(remote_filename);
   if (file_encryption_enabled) {
     size_t payload_len =
-        1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2 + fn_len + 1;
+        1 + NASFS_FILE_METADATA_SIZE + NASFS_OWNER_SLOT_V1_SIZE + fn_len + 1;
     uint8_t* req_payload = malloc(payload_len);
     if (!req_payload) {
       close_connection((uv_handle_t*)stream);
@@ -759,11 +793,10 @@ static void send_put_req(uv_stream_t* stream) {
     }
     req_payload[0] = 1;
     randombytes_buf(file_salt, crypto_pwhash_SALTBYTES);
-    if (crypto_engine_derive_key(NASFS_KDF_HKDF_SHA256, (const char*)master_key,
-                                 sizeof(master_key), file_salt,
-                                 crypto_pwhash_SALTBYTES, encryption_key,
-                                 sizeof(encryption_key)) != 0) {
-      fprintf(stderr, "Failed to derive file key\n");
+    uint8_t owner_slot[NASFS_OWNER_SLOT_V1_SIZE];
+    if (crypto_engine_create_owner_slot(owner_slot, encryption_key, master_key,
+                                        file_salt) != 0) {
+      fprintf(stderr, "Failed to create NASLUKS owner slot\n");
       free(req_payload);
       close_connection((uv_handle_t*)stream);
       return;
@@ -775,7 +808,13 @@ static void send_put_req(uv_stream_t* stream) {
     off += sizeof(uint64_t);
     req_payload[off++] = (uint8_t)file_cipher_algo;
     req_payload[off++] = (uint8_t)file_hash_algo;
+    memcpy(req_payload + off, owner_slot, sizeof(owner_slot));
+    off += sizeof(owner_slot);
     memcpy(req_payload + off, (const uint8_t*)remote_filename, fn_len + 1);
+    protocol_manifest_init(&file_manifest, remote_filename, put_plaintext_size,
+                           file_salt, file_cipher_algo, file_hash_algo);
+    protocol_manifest_owner_slot(&file_manifest, owner_slot,
+                                 sizeof(owner_slot));
     send_command(stream, NASFS_CMD_PUT_REQ, req_payload, payload_len, 1);
     free(req_payload);
   } else {
@@ -900,16 +939,32 @@ static void start_next_operation(uv_stream_t* stream) {
 
 static void close_connection(uv_handle_t* handle) {
   if (uv_is_closing(handle)) return;
-  if (!client_finished) client_exit_code = 1;
+  if (!client_finished && client_exit_code == 0) client_exit_code = 1;
   if (put_result_pending) {
     fprintf(stderr,
             "PUT outcome unknown for '%s': no valid publication response\n",
             remote_filename);
   }
   uv_close(handle, NULL);
+  if (interrupt_watcher.data) uv_close((uv_handle_t*)&interrupt_watcher, NULL);
+  if (terminate_watcher.data) uv_close((uv_handle_t*)&terminate_watcher, NULL);
+  if (idle_timer.data) uv_close((uv_handle_t*)&idle_timer, NULL);
   if (!local_read_pending) close_local_file();
   discard_download();
   printf("\nConnection closed.\n");
+}
+
+static void on_client_signal(uv_signal_t* watcher, int signum) {
+  fprintf(stderr, "Transfer interrupted by signal %d\n", signum);
+  client_exit_code = 128 + signum;
+  close_connection(watcher->data);
+}
+
+static void on_client_timeout(uv_timer_t* timer) {
+  if (uv_now(timer->loop) - last_activity >= 30000) {
+    fprintf(stderr, "Connection idle timeout\n");
+    close_connection(timer->data);
+  }
 }
 
 void on_write(uv_write_t* req, int status) {
@@ -918,6 +973,8 @@ void on_write(uv_write_t* req, int status) {
   if (status) {
     fprintf(stderr, "Write error: %s\n", uv_strerror(status));
     close_connection((uv_handle_t*)stream);
+  } else {
+    last_activity = uv_now(stream->loop);
   }
 
   if (ctx->buf.base) free(ctx->buf.base);
@@ -946,9 +1003,14 @@ void send_command(uv_stream_t* stream, nasfs_cmd_type_t cmd,
     encrypted_payload = malloc(payload_to_pack_len);
     if (!encrypted_payload) goto fail;
 
-    crypto_secretstream_xchacha20poly1305_push(&send_crypto_state,
-                                               encrypted_payload, NULL, payload,
-                                               payload_len, NULL, 0, 0);
+    uint8_t command = (uint8_t)cmd;
+    if (crypto_secretstream_xchacha20poly1305_push(
+            &send_crypto_state, encrypted_payload, NULL, payload, payload_len,
+            &command, sizeof(command),
+            crypto_secretstream_xchacha20poly1305_TAG_MESSAGE) != 0) {
+      free(encrypted_payload);
+      goto fail;
+    }
     payload_to_pack = encrypted_payload;
   }
 
@@ -996,8 +1058,14 @@ void on_local_read(uv_fs_t* req) {
     close_connection((uv_handle_t*)stream);
   } else if (req->result == 0) {
     printf("\nFinished reading local file. Waiting for publication.\n");
+    uint8_t manifest[NASFS_MANIFEST_SIZE];
+    if (protocol_manifest_sign(&file_manifest, manifest, author_secret) != 0) {
+      close_connection((uv_handle_t*)stream);
+      goto cleanup;
+    }
+    memcpy(manifest_digest, manifest, sizeof(manifest_digest));
     put_result_pending = 1;
-    send_command(stream, NASFS_CMD_PUT_DONE, NULL, 0, 1);
+    send_command(stream, NASFS_CMD_PUT_DONE, manifest, sizeof(manifest), 1);
   } else {
     size_t bytes_read = req->result;
     file_offset += bytes_read;
@@ -1051,10 +1119,13 @@ void on_local_read(uv_fs_t* req) {
         goto cleanup;
       }
 
-      send_command(stream, NASFS_CMD_PUT_BLOCK_META, (const uint8_t*)&meta,
-                   sizeof(meta), 1);
+      uint8_t encoded_meta[NASFS_BLOCK_META_SIZE];
+      protocol_encode_block_meta(encoded_meta, &meta);
+      send_command(stream, NASFS_CMD_PUT_BLOCK_META, encoded_meta,
+                   sizeof(encoded_meta), 1);
       client_block_seq++;
 
+      protocol_manifest_record(&file_manifest, ciphertext, ciphertext_len);
       send_command(stream, NASFS_CMD_PUT_DATA, ciphertext, ciphertext_len, 0);
       free(ciphertext);
     } else {
@@ -1108,21 +1179,43 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
       int consumed =
           protocol_parse_frame(client_recv_buffer, client_recv_length, &frame);
       if (consumed > 0) {
+        last_activity = uv_now(stream->loop);
         if (!is_secure) {
           if (frame.type == NASFS_CMD_PQC_PUBLIC_KEY) {
             OQS_KEM* kem;
             uint8_t* public_key = NULL;
             size_t public_key_len = 0;
 
+            if (shared_secret || frame.payload_len <= crypto_sign_BYTES + 1) {
+              close_connection((uv_handle_t*)stream);
+              return;
+            }
+            size_t selection_len = frame.payload_len - crypto_sign_BYTES;
+            nasfs_handshake_transcript(handshake_transcript, hello_hash,
+                                       frame.payload, selection_len);
+            if (crypto_sign_verify_detached(frame.payload + selection_len,
+                                            handshake_transcript, 32,
+                                            trusted_server_key) != 0) {
+              fprintf(stderr, "Server identity verification failed\n");
+              close_connection((uv_handle_t*)stream);
+              return;
+            }
+
             if (nasfs_handshake_unpack_server_selection(
-                    frame.payload, frame.payload_len, &negotiated_kex_algorithm,
+                    frame.payload, selection_len - 1, &negotiated_kex_algorithm,
                     &negotiated_cipher_algorithm, &public_key,
                     &public_key_len) != 0) {
               close_connection((uv_handle_t*)stream);
               return;
             }
 
-            if (strcmp(negotiated_cipher_algorithm,
+            uint8_t profile = nasfs_handshake_profile(negotiated_kex_algorithm);
+            if (profile == 0 || profile != frame.payload[selection_len - 1] ||
+                !nasfs_handshake_offer_contains(client_kex_algorithms,
+                                                negotiated_kex_algorithm) ||
+                !nasfs_handshake_offer_contains(client_cipher_algorithms,
+                                                negotiated_cipher_algorithm) ||
+                strcmp(negotiated_cipher_algorithm,
                        NASFS_CONTROL_CIPHER_XCHACHA20POLY1305) != 0) {
               free(public_key);
               close_connection((uv_handle_t*)stream);
@@ -1137,12 +1230,17 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               uint8_t* payload = malloc(payload_size);
               shared_secret = sodium_malloc(kem->length_shared_secret);
               shared_secret_len = kem->length_shared_secret;
+              uint8_t key[32];
               if (payload && shared_secret &&
                   OQS_KEM_encaps(kem, payload, shared_secret, public_key) ==
                       OQS_SUCCESS &&
+                  nasfs_handshake_key(key, shared_secret, shared_secret_len,
+                                      handshake_transcript,
+                                      NASFS_KEY_CLIENT_CONTROL) == 0 &&
                   crypto_secretstream_xchacha20poly1305_init_push(
                       &send_crypto_state, payload + kem->length_ciphertext,
-                      shared_secret) == 0) {
+                      key) == 0) {
+                nasfs_handshake_hash(ciphertext_hash, payload, payload_size);
                 printf("Negotiated KEX %s with control cipher %s.\n",
                        negotiated_kex_algorithm, negotiated_cipher_algorithm);
                 printf(
@@ -1153,6 +1251,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               } else {
                 close_connection((uv_handle_t*)stream);
               }
+              sodium_memzero(key, sizeof(key));
               free(payload);
               OQS_KEM_free(kem);
             } else {
@@ -1162,15 +1261,36 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               close_connection((uv_handle_t*)stream);
             }
             free(public_key);
-          } else if (frame.type == NASFS_CMD_SECURE_READY_V2) {
-            if (!shared_secret ||
-                frame.payload_len !=
-                    crypto_secretstream_xchacha20poly1305_HEADERBYTES ||
+          } else if (frame.type == NASFS_CMD_READY) {
+            size_t header_len =
+                crypto_secretstream_xchacha20poly1305_HEADERBYTES;
+            uint8_t key[32], expected[32];
+            int invalid =
+                !shared_secret ||
+                frame.payload_len != header_len + sizeof(expected) ||
+                nasfs_handshake_key(key, shared_secret, shared_secret_len,
+                                    handshake_transcript,
+                                    NASFS_KEY_SERVER_FINISHED) ||
+                nasfs_handshake_finished(expected, key, ciphertext_hash,
+                                         frame.payload, header_len) ||
+                sodium_memcmp(expected, frame.payload + header_len,
+                              sizeof(expected)) ||
+                nasfs_handshake_key(key, shared_secret, shared_secret_len,
+                                    handshake_transcript,
+                                    NASFS_KEY_SERVER_CONTROL) ||
                 crypto_secretstream_xchacha20poly1305_init_pull(
-                    &recv_crypto_state, frame.payload, shared_secret) != 0) {
+                    &recv_crypto_state, frame.payload, key) ||
+                nasfs_handshake_key(auth_context, shared_secret,
+                                    shared_secret_len, handshake_transcript,
+                                    NASFS_KEY_CLIENT_AUTH);
+            sodium_memzero(key, sizeof(key));
+            if (invalid) {
+              fprintf(stderr, "Server handshake confirmation failed\n");
               close_connection((uv_handle_t*)stream);
               return;
             }
+            sodium_free(shared_secret);
+            shared_secret = NULL;
             is_secure = 1;
             printf(
                 "PQC Handshake successful. Channel is now secure. Sending "
@@ -1180,13 +1300,11 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
             } else {
               send_auth(stream);
             }
-          } else if (frame.type == NASFS_CMD_SECURE_READY) {
-            fprintf(stderr,
-                    "Server does not support required NASFS protocol v2\n");
-            close_connection((uv_handle_t*)stream);
           } else if (frame.type == NASFS_CMD_ERROR) {
             fprintf(stderr, "Handshake failed: %.*s\n", (int)frame.payload_len,
                     (const char*)frame.payload);
+            close_connection((uv_handle_t*)stream);
+          } else {
             close_connection((uv_handle_t*)stream);
           }
         } else {
@@ -1194,15 +1312,20 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
           nasfs_frame_t plain_frame = frame;
           unsigned char* decrypted_payload = NULL;
 
-          if (frame.type >= 0x10 && frame.type < 0x20) {
+          if ((frame.type >= 0x10 && frame.type < 0x20) ||
+              frame.type == NASFS_CMD_ERROR) {
             decrypted_payload = malloc(frame.payload_len);
             if (!decrypted_payload) {
               close_connection((uv_handle_t*)stream);
               return;
             }
+            uint8_t command = (uint8_t)frame.type;
+            uint8_t tag;
             if (crypto_secretstream_xchacha20poly1305_pull(
-                    &recv_crypto_state, decrypted_payload, &decrypted_len, NULL,
-                    frame.payload, frame.payload_len, NULL, 0) != 0) {
+                    &recv_crypto_state, decrypted_payload, &decrypted_len, &tag,
+                    frame.payload, frame.payload_len, &command,
+                    sizeof(command)) != 0 ||
+                tag != crypto_secretstream_xchacha20poly1305_TAG_MESSAGE) {
               free(decrypted_payload);
               close_connection((uv_handle_t*)stream);
               return;
@@ -1223,14 +1346,15 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               break;
 
             case NASFS_CMD_AUTH_ACK:
-              if (current_op != OP_NONE) {
+              if (current_op != OP_NONE || plain_frame.payload_len != 0) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
               start_next_operation(stream);
               break;
             case NASFS_CMD_PUT_ACK:
-              if (current_op != OP_PUT || !put_ack_pending || local_fd == -1) {
+              if (current_op != OP_PUT || !put_ack_pending || local_fd == -1 ||
+                  plain_frame.payload_len != 0) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
@@ -1245,7 +1369,10 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               }
               if (plain_frame.payload[0] == NASFS_PUT_PUBLISHED) {
                 put_result_pending = 0;
-                printf("Upload published.\n");
+                char version[2 * sizeof(manifest_digest) + 1];
+                sodium_bin2hex(version, sizeof(version), manifest_digest,
+                               sizeof(manifest_digest));
+                printf("Upload published. Manifest digest: %s\n", version);
                 start_next_operation(stream);
               } else if (plain_frame.payload[0] ==
                          NASFS_PUT_PUBLICATION_FAILED) {
@@ -1264,11 +1391,13 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               }
               if (file_encryption_enabled) {
                 /* GET_ACK payload: [16 salt][8 size][1 cipher][1 hash] */
-                size_t expected_ack_len =
-                    crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 2;
-                if (plain_frame.payload_len < expected_ack_len) {
+                download_has_owner_slot =
+                    plain_frame.payload_len ==
+                    NASFS_FILE_METADATA_SIZE + NASFS_OWNER_SLOT_V1_SIZE;
+                if (!download_has_owner_slot &&
+                    plain_frame.payload_len != NASFS_FILE_METADATA_SIZE) {
                   fprintf(stderr,
-                          "Failed to download: Server GET_ACK too short.\n");
+                          "Failed to download: Invalid GET_ACK length.\n");
                   client_exit_code = 1;
                   if (decrypted_payload) free(decrypted_payload);
                   close_connection((uv_handle_t*)stream);
@@ -1286,12 +1415,27 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                         plain_frame.payload[crypto_pwhash_SALTBYTES +
                                             sizeof(uint64_t) + 1];
 
-                if (crypto_engine_derive_key(
-                        NASFS_KDF_HKDF_SHA256, (const char*)master_key,
-                        sizeof(master_key), file_salt, crypto_pwhash_SALTBYTES,
-                        encryption_key, sizeof(encryption_key)) != 0) {
+                if (file_cipher_algo > NASFS_CIPHER_AES_256_GCM ||
+                    file_hash_algo > NASFS_HASH_CRC32) {
+                  fprintf(stderr, "Invalid file cipher or hash algorithm\n");
+                  close_connection((uv_handle_t*)stream);
+                  break;
+                }
+                int key_rc =
+                    download_has_owner_slot
+                        ? crypto_engine_open_owner_slot(
+                              encryption_key,
+                              plain_frame.payload + NASFS_FILE_METADATA_SIZE,
+                              master_key, file_salt)
+                        : crypto_engine_derive_key(
+                              NASFS_KDF_HKDF_SHA256, (const char*)master_key,
+                              sizeof(master_key), file_salt,
+                              crypto_pwhash_SALTBYTES, encryption_key,
+                              sizeof(encryption_key));
+                if (key_rc != 0) {
                   fprintf(stderr,
-                          "Failed to derive file key from downloaded salt\n");
+                          "Cannot open NASLUKS owner slot or derive legacy "
+                          "file key\n");
                   client_exit_code = 1;
                   if (decrypted_payload) free(decrypted_payload);
                   close_connection((uv_handle_t*)stream);
@@ -1299,6 +1443,15 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 }
               }
 
+              protocol_manifest_init(&file_manifest, remote_filename,
+                                     expected_plaintext_size, file_salt,
+                                     file_cipher_algo, file_hash_algo);
+              if (download_has_owner_slot) {
+                protocol_manifest_owner_slot(
+                    &file_manifest,
+                    plain_frame.payload + NASFS_FILE_METADATA_SIZE,
+                    NASFS_OWNER_SLOT_V1_SIZE);
+              }
               if (open_download_file() < 0) {
                 fprintf(stderr,
                         "Cannot create temporary download for '%s': %s\n",
@@ -1308,18 +1461,21 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               break;
             }
             case NASFS_CMD_GET_BLOCK_META: {
-              if (plain_frame.payload_len < sizeof(nasfs_block_meta_t)) {
+              nasfs_block_meta_t meta;
+              if (current_op != OP_GET || local_fd < 0 ||
+                  has_pending_block_meta ||
+                  protocol_decode_block_meta(plain_frame.payload,
+                                             plain_frame.payload_len,
+                                             &meta) < 0) {
                 fprintf(stderr, "Received invalid block meta size\n");
                 client_exit_code = 1;
                 if (decrypted_payload) free(decrypted_payload);
                 close_connection((uv_handle_t*)stream);
                 return;
               }
-              nasfs_block_meta_t* meta =
-                  (nasfs_block_meta_t*)plain_frame.payload;
-              expected_block_seq = meta->seq_num;
-              expected_block_size = meta->size;
-              memcpy(expected_block_hash, meta->hash, 32);
+              expected_block_seq = meta.seq_num;
+              expected_block_size = meta.size;
+              memcpy(expected_block_hash, meta.hash, 32);
               has_pending_block_meta = 1;
               break;
             }
@@ -1431,6 +1587,8 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                   close_connection((uv_handle_t*)stream);
                   return;
                 }
+                protocol_manifest_record(&file_manifest, plain_frame.payload,
+                                         plain_frame.payload_len);
                 write_data = decrypted_buf;
                 write_len = plaintext_len;
 
@@ -1480,6 +1638,23 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
+              if (!(allow_unsigned_reads && !download_has_owner_slot &&
+                    plain_frame.payload_len == 0) &&
+                  (plain_frame.payload_len != NASFS_MANIFEST_SIZE ||
+                   protocol_manifest_verify(&file_manifest, plain_frame.payload,
+                                            author_public) != 0)) {
+                fprintf(stderr, "File manifest missing or invalid\n");
+                close_connection((uv_handle_t*)stream);
+                break;
+              }
+              if (require_manifest_digest &&
+                  (plain_frame.payload_len != NASFS_MANIFEST_SIZE ||
+                   sodium_memcmp(manifest_digest, plain_frame.payload,
+                                 sizeof(manifest_digest)) != 0)) {
+                fprintf(stderr, "Unexpected file manifest version\n");
+                close_connection((uv_handle_t*)stream);
+                break;
+              }
               if (has_pending_block_meta || publish_download() < 0) {
                 close_connection((uv_handle_t*)stream);
                 break;
@@ -1495,6 +1670,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               close_connection((uv_handle_t*)stream);
               break;
             default:
+              close_connection((uv_handle_t*)stream);
               break;
           }
 
@@ -1511,7 +1687,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   } else if (nread < 0) {
     if (!is_secure) {
       fprintf(stderr,
-              "Connection ended before NASFS protocol v2 was confirmed\n");
+              "Connection ended before the NASFS handshake completed\n");
     }
     close_connection((uv_handle_t*)stream);
   }
@@ -1536,8 +1712,21 @@ void on_connect(uv_connect_t* req, int status) {
       return;
     }
 
-    send_command(req->handle, NASFS_CMD_PQC_HELLO_V2, hello_payload,
-                 hello_payload_len, 0);
+    uint8_t* with_nonce =
+        realloc(hello_payload, hello_payload_len + NASFS_HANDSHAKE_NONCE);
+    if (!with_nonce) {
+      free(hello_payload);
+      close_connection((uv_handle_t*)req->handle);
+      return;
+    }
+    hello_payload = with_nonce;
+    memmove(hello_payload + NASFS_HANDSHAKE_NONCE, hello_payload,
+            hello_payload_len);
+    randombytes_buf(hello_payload, NASFS_HANDSHAKE_NONCE);
+    hello_payload_len += NASFS_HANDSHAKE_NONCE;
+    nasfs_handshake_hash(hello_hash, hello_payload, hello_payload_len);
+    send_command(req->handle, NASFS_CMD_HELLO, hello_payload, hello_payload_len,
+                 0);
     free(hello_payload);
   }
   if (!uv_is_closing((uv_handle_t*)req->handle)) {
@@ -1586,6 +1775,8 @@ int main(int argc, char** argv) {
             argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 1;
   }
+
+  signal(SIGPIPE, SIG_IGN);
 
   if (sodium_init() < 0) {
     fprintf(stderr, "Failed to initialize libsodium\n");
@@ -1637,12 +1828,27 @@ int main(int argc, char** argv) {
   const char* env_file_hash = getenv("NASFS_FILE_HASH");
   const char* env_kdf = getenv("NASFS_KDF");
   const char* env_block_size = getenv("NASFS_BLOCK_SIZE");
-  file_cipher_algo = parse_cipher_algo(env_file_cipher);
-  file_hash_algo = parse_hash_algo(env_file_hash);
-  master_kdf_algo = parse_kdf_algo(env_kdf);
+  int selected_cipher = parse_cipher_algo(env_file_cipher);
+  int selected_hash = parse_hash_algo(env_file_hash);
+  int selected_kdf = parse_kdf_algo(env_kdf);
+  if (selected_cipher < 0 || selected_hash < 0 || selected_kdf < 0) {
+    fprintf(stderr, "Invalid %s selection\n",
+            selected_cipher < 0 ? "NASFS_FILE_CIPHER"
+            : selected_hash < 0 ? "NASFS_FILE_HASH"
+                                : "NASFS_KDF");
+    return 1;
+  }
+  file_cipher_algo = (nasfs_cipher_algo_t)selected_cipher;
+  file_hash_algo = (nasfs_hash_algo_t)selected_hash;
+  master_kdf_algo = (nasfs_kdf_algo_t)selected_kdf;
   if (env_block_size && env_block_size[0] != '\0') {
-    long bs = strtol(env_block_size, NULL, 10);
-    if (bs >= 4096 && bs <= 4194304) io_chunk_size = (size_t)bs;
+    char* end;
+    long bs = strtol(env_block_size, &end, 10);
+    if (*end != '\0' || bs < 4096 || bs > 4194304) {
+      fprintf(stderr, "Invalid NASFS_BLOCK_SIZE (expected 4096–4194304)\n");
+      return 1;
+    }
+    io_chunk_size = (size_t)bs;
   }
 
   const char* env_encryption_key = getenv("NASFS_ENCRYPTION_KEY");
@@ -1671,10 +1877,6 @@ int main(int argc, char** argv) {
                                sizeof(master_key)) != 0) {
     fprintf(stderr, "Failed to derive master key\n");
     return 1;
-  }
-
-  if (env_auth_password && env_auth_password[0] != '\0') {
-    client_auth_password = strdup(env_auth_password);
   }
 
   if (!auth_method_requires_password(client_auth_method) &&
@@ -1723,6 +1925,43 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  if (strcmp(env_encryption_key, client_auth_password) == 0) {
+    fprintf(stderr,
+            "File encryption password must differ from the login password\n");
+    return 1;
+  }
+  if (batch_queue[0].op == OP_PUT) {
+    uint8_t seed[crypto_sign_SEEDBYTES];
+    if (nasfs_handshake_read_key(getenv("NASFS_AUTHOR_SIGNING_SEED"), seed, 1) <
+        0) {
+      fprintf(stderr, "Expected a private NASFS_AUTHOR_SIGNING_SEED file\n");
+      return 1;
+    }
+    int result = crypto_sign_seed_keypair(author_public, author_secret, seed);
+    sodium_memzero(seed, sizeof(seed));
+    if (result != 0) return 1;
+  } else {
+    const char* expected = getenv("NASFS_EXPECTED_MANIFEST");
+    if (expected) {
+      if (batch_count != 1 || strlen(expected) != 2 * sizeof(manifest_digest) ||
+          sodium_hex2bin(manifest_digest, sizeof(manifest_digest), expected,
+                         strlen(expected), NULL, NULL, NULL) != 0) {
+        fprintf(stderr,
+                "NASFS_EXPECTED_MANIFEST requires one GET and a 64-digit hex "
+                "digest\n");
+        return 1;
+      }
+      require_manifest_digest = 1;
+    }
+    const char* allow_unsigned = getenv("NASFS_ALLOW_UNSIGNED_READ");
+    allow_unsigned_reads = allow_unsigned && strcmp(allow_unsigned, "1") == 0;
+    if (nasfs_handshake_read_key(getenv("NASFS_AUTHOR_PUBLIC_KEY"),
+                                 author_public, 0) < 0) {
+      fprintf(stderr, "Expected a trusted NASFS_AUTHOR_PUBLIC_KEY file\n");
+      return 1;
+    }
+  }
+
   loop = uv_default_loop();
   uv_tcp_t socket;
   int rc = uv_tcp_init(loop, &socket);
@@ -1732,8 +1971,26 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  rc = uv_signal_init(loop, &interrupt_watcher);
+  if (rc == 0) {
+    interrupt_watcher.data = &socket;
+    rc = uv_signal_start(&interrupt_watcher, on_client_signal, SIGINT);
+  }
+  if (rc == 0) rc = uv_signal_init(loop, &terminate_watcher);
+  if (rc == 0) {
+    terminate_watcher.data = &socket;
+    rc = uv_signal_start(&terminate_watcher, on_client_signal, SIGTERM);
+  }
+  if (rc == 0) rc = uv_timer_init(loop, &idle_timer);
+  if (rc == 0) {
+    idle_timer.data = &socket;
+    last_activity = uv_now(loop);
+    rc = uv_timer_start(&idle_timer, on_client_timeout, 1000, 1000);
+  }
+
   struct sockaddr_in dest;
-  rc = uv_ip4_addr(client_server_ip, client_server_port, &dest);
+  if (rc == 0) rc = uv_ip4_addr(client_server_ip, client_server_port, &dest);
+  if (rc == 0 && load_server_key(&dest) < 0) rc = UV_EACCES;
   uv_connect_t connect_req;
   if (rc == 0) {
     rc = uv_tcp_connect(&connect_req, &socket, (const struct sockaddr*)&dest,
@@ -1753,6 +2010,10 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Event loop close failed: %s\n", uv_strerror(rc));
     client_exit_code = 1;
   }
+  sodium_memzero(auth_context, sizeof(auth_context));
+  sodium_memzero(author_secret, sizeof(author_secret));
+  sodium_memzero(master_key, sizeof(master_key));
+  sodium_memzero(encryption_key, sizeof(encryption_key));
   free(client_recv_buffer);
   if (shared_secret) sodium_free(shared_secret);
   free(negotiated_kex_algorithm);

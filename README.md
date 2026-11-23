@@ -286,6 +286,18 @@ NASFS_ENCRYPTION_KEY="super-secret-key" nasfs_client put ./local.bin encrypted_r
 NASFS_ENCRYPTION_KEY="super-secret-key" nasfs_client get encrypted_remote.bin ./local_decrypted.bin
 ```
 
+Keep a backup of `~/.nasfs/master.salt` and record the `NASFS_KDF` used
+to upload your files. The first upload creates the salt. Downloads require
+the original salt, KDF, and file encryption password. The client stops
+before connecting when it cannot load or save the salt.
+
+For a container written before record lengths were stored, start the server
+with `BlockSize` set to the original upload's `NASFS_BLOCK_SIZE` and use
+the original byte order. Verify the downloaded bytes against a trusted hash,
+then re-upload under a separate name and verify a second download with the
+current server settings before replacing the old object. New containers
+record their block lengths and can be downloaded after a block size change.
+
 Override client-side preference lists:
 
 ```sh
@@ -296,6 +308,58 @@ NASFS_AUTH_USER="alice" \
 NASFS_AUTH_PASSWORD="change-me" \
 nasfs_client put ./local.bin remote.bin
 ```
+
+## NASLUKS owner slot
+
+New PUTs generate a random file key and wrap it in one NASLUKS owner slot
+using XChaCha20-Poly1305. The wrapping key comes from the client master key
+and per-file salt. Backup and recovery require the original encryption
+password, client `master.salt`, and `NASFS_KDF`. Keep these on the client.
+The login password belongs to a separate authentication flow.
+
+Set `NASFS_AUTHOR_SIGNING_SEED` to a private 32-byte Ed25519 seed on the
+uploading client. Independently install its raw public key as
+`NASFS_AUTHOR_PUBLIC_KEY` on the server and downloading clients. Use a
+separate key pair from the server identity. PUT and GET verify the manifest
+before publishing. For an exact version, save the 64-digit manifest digest
+reported after PUT and use it as `NASFS_EXPECTED_MANIFEST` for a single GET.
+
+For migration of an unsigned container, explicitly set
+`NASFS_ALLOW_UNSIGNED_READ=1` for the historical GET. Verify the resulting
+plaintext independently, then upload it under a separate name and check
+the new signed download before retiring the old object.
+
+## Server identity
+
+The server requires `NASFS_SERVER_SIGNING_SEED`, the path to a raw 32-byte
+Ed25519 seed owned by the server process user with mode `0600`. Set the
+variable in the server's process environment, including the service
+environment when using a service manager.
+
+Provision a seed and its matching public key using OpenSSL 3:
+
+```sh
+umask 077
+openssl genpkey -algorithm ED25519 -out server-key.pem
+openssl pkey -in server-key.pem -outform DER | tail -c 32 > server.seed
+openssl pkey -in server-key.pem -pubout -outform DER | tail -c 32 > server.pub
+```
+
+Keep the PEM private along with the seed. Deliver the raw public key to the
+client over an independently trusted channel. For a server at
+`192.0.2.10:8080`, install it as
+`~/.nasfs/server-192.0.2.10-8080.pub` under the client account. To rotate
+the identity, verify the replacement public key independently and atomically
+replace the endpoint's pin. The CLI reads the pin on each invocation and
+requires a valid signature and key-exchange confirmation before sending AUTH
+or PAKE. Update client and server together. The handshake requires independent
+cryptographic review before release.
+
+After forced process termination, a hidden `.nasfs-upload.*` or
+`.nasfs-download.*` staging file may remain. Confirm that the process that
+owned the file has stopped before removing it. The server rejects staging
+names as remote object names. Start a fresh transfer to recover; an incomplete
+staging file carries no publication result.
 
 ## Testing
 

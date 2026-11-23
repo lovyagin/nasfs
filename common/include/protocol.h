@@ -10,6 +10,7 @@
 #define NASFS_PROTOCOL_H
 
 #include <pthread.h>
+#include <sodium.h>
 #include <stdint.h>
 #include <uv.h>
 
@@ -29,17 +30,12 @@
  */
 typedef enum {
   /* PQC Key Exchange Commands (Unencrypted) */
-  NASFS_CMD_PQC_HELLO =
-      0x01, /**< C->S: Initiate a PQC handshake. Payload contains KEM name. */
+  NASFS_CMD_HELLO = 0x05, /**< C->S: Offer handshake algorithms. */
   NASFS_CMD_PQC_PUBLIC_KEY =
       0x02, /**< S->C: Server responds with its public key. */
   NASFS_CMD_PQC_CIPHERTEXT =
       0x03, /**< C->S: Client sends the encapsulated shared secret. */
-  NASFS_CMD_SECURE_READY = 0x04, /**< S->C: Server confirms secure channel and
-                                    sends its stream header. */
-
-  NASFS_CMD_PQC_HELLO_V2 = 0x05,    /**< C->S: Require protocol v2. */
-  NASFS_CMD_SECURE_READY_V2 = 0x06, /**< S->C: Accept protocol v2. */
+  NASFS_CMD_READY = 0x06, /**< S->C: Send the server stream header. */
 
   /* Control Commands (Payload will be encrypted) */
   NASFS_CMD_AUTH = 0x10,     /**< C->S: Authenticate with credentials. */
@@ -59,7 +55,7 @@ typedef enum {
       0x1A, /**< C->S: SPAKE2 client share [u8 ulen][username][X(32)]. */
   NASFS_CMD_PAKE_RESPONSE = 0x1B, /**< S->C: SPAKE2 server share [Y(32)]. */
 
-  NASFS_CMD_PUT_RESULT = 0x1C, /**< S->C: Final v2 PUT status, one byte. */
+  NASFS_CMD_PUT_RESULT = 0x1C, /**< S->C: Final PUT status, one byte. */
 
   /* Data Transfer Commands (Unencrypted Payload) */
   NASFS_CMD_PUT_DATA = 0x20, /**< C->S: Data chunk for file upload. */
@@ -80,6 +76,7 @@ typedef enum {
  * command).
  */
 #define NASFS_PROTO_HEADER_SIZE 5
+#define NASFS_PROTO_MAX_FRAME (16u * 1024u * 1024u)
 
 /**
  * @struct nasfs_frame_t
@@ -118,12 +115,33 @@ int protocol_parse_frame(const uint8_t* buffer, size_t size,
 uint8_t* protocol_pack_frame(nasfs_cmd_type_t type, const uint8_t* payload,
                              size_t payload_len, size_t* out_size);
 
-#pragma pack(push, 1)
 typedef struct {
   uint64_t seq_num;
   uint32_t size;
   uint8_t hash[32];
 } nasfs_block_meta_t;
-#pragma pack(pop)
+#define NASFS_BLOCK_META_SIZE 44
+
+void protocol_encode_block_meta(uint8_t out[NASFS_BLOCK_META_SIZE],
+                                const nasfs_block_meta_t* meta);
+int protocol_decode_block_meta(const uint8_t* payload, size_t length,
+                               nasfs_block_meta_t* meta);
+
+#define NASFS_FILE_METADATA_SIZE 26
+#define NASFS_MANIFEST_SIZE (32 + crypto_sign_BYTES)
+void protocol_manifest_init(crypto_generichash_state* state, const char* object,
+                            uint64_t plaintext_size,
+                            const uint8_t salt[crypto_pwhash_SALTBYTES],
+                            uint8_t cipher, uint8_t hash);
+void protocol_manifest_owner_slot(crypto_generichash_state* state,
+                                  const uint8_t* slot, size_t length);
+void protocol_manifest_record(crypto_generichash_state* state,
+                              const uint8_t* ciphertext, size_t length);
+int protocol_manifest_sign(crypto_generichash_state* state,
+                           uint8_t manifest[NASFS_MANIFEST_SIZE],
+                           const uint8_t key[crypto_sign_SECRETKEYBYTES]);
+int protocol_manifest_verify(crypto_generichash_state* state,
+                             const uint8_t manifest[NASFS_MANIFEST_SIZE],
+                             const uint8_t key[crypto_sign_PUBLICKEYBYTES]);
 
 #endif /* NASFS_PROTOCOL_H */

@@ -31,6 +31,18 @@ setup_integration() {
     trap 'exit 143' TERM
     export HOME="$TEST_ROOT/home"
     mkdir -p "$STORAGE_DIR" "$LOG_DIR" "$HOME"
+    export NASFS_SERVER_SIGNING_SEED="$TEST_ROOT/server.seed"
+    export NASFS_AUTHOR_SIGNING_SEED="$TEST_ROOT/author.seed"
+    export NASFS_AUTHOR_PUBLIC_KEY="$TEST_ROOT/author.pub"
+    (
+        umask 077
+        openssl genpkey -algorithm ED25519 -out "$TEST_ROOT/server-key.pem"
+        openssl pkey -in "$TEST_ROOT/server-key.pem" -outform DER | tail -c 32 > "$NASFS_SERVER_SIGNING_SEED"
+        openssl pkey -in "$TEST_ROOT/server-key.pem" -pubout -outform DER | tail -c 32 > "$TEST_ROOT/server.pub"
+        openssl genpkey -algorithm ED25519 -out "$TEST_ROOT/author-key.pem"
+        openssl pkey -in "$TEST_ROOT/author-key.pem" -outform DER | tail -c 32 > "$TEST_ROOT/author.seed"
+        openssl pkey -in "$TEST_ROOT/author-key.pem" -pubout -outform DER | tail -c 32 > "$TEST_ROOT/author.pub"
+    )
 }
 
 start_integration_server() {
@@ -43,6 +55,10 @@ start_integration_server() {
             port=$(sed -n 's/.*nasfs_server listening on 127\.0\.0\.1:\([0-9][0-9]*\)\.\.\.$/\1/p' "$LOG_DIR/server.log")
             if [[ -n $port && $port != 0 ]]; then
                 export NASFS_SERVER_IP=127.0.0.1 NASFS_SERVER_PORT="$port"
+                (umask 077; mkdir -p "$HOME/.nasfs")
+                if [[ ! -e "$HOME/.nasfs/server-127.0.0.1-$port.pub" ]]; then
+                    cp "$TEST_ROOT/server.pub" "$HOME/.nasfs/server-127.0.0.1-$port.pub"
+                fi
                 return
             fi
         fi

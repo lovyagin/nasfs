@@ -85,4 +85,30 @@ int nasfs_handshake_unpack_server_selection(const uint8_t* payload,
                                             uint8_t** public_key_out,
                                             size_t* public_key_len_out);
 
+/* Stable wire IDs of KEM + Ed25519 + BLAKE2b + secretstream profiles. */
+uint8_t nasfs_handshake_profile(const char* kex);
+int nasfs_handshake_offer_contains(const char* list, const char* value);
+
+#define NASFS_HANDSHAKE_HASH 32
+#define NASFS_HANDSHAKE_NONCE 32
+
+/* Hash exact wire bytes with fixed, role-specific transcript slots. */
+void nasfs_handshake_hash(uint8_t out[32], const uint8_t* data, size_t size);
+void nasfs_handshake_transcript(uint8_t out[32], const uint8_t hello[32],
+                                const uint8_t* selection, size_t size);
+typedef enum {
+  NASFS_KEY_CLIENT_CONTROL = 1,
+  NASFS_KEY_SERVER_CONTROL = 2,
+  NASFS_KEY_SERVER_FINISHED = 3,
+  NASFS_KEY_CLIENT_AUTH = 4,
+} nasfs_handshake_key_purpose_t;
+
+int nasfs_handshake_key(uint8_t out[32], const uint8_t* secret,
+                        size_t secret_len, const uint8_t transcript[32],
+                        uint8_t purpose);
+int nasfs_handshake_finished(uint8_t out[32], const uint8_t key[32],
+                             const uint8_t ciphertext_frame[32],
+                             const uint8_t* ready_header, size_t size);
+int nasfs_handshake_read_key(const char* path, uint8_t out[32], int secret);
+
 #endif /* NASFS_HANDSHAKE_H */

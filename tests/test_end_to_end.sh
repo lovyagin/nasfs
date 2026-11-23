@@ -83,7 +83,7 @@ verify_download_hash() {
 }
 
 try_kex_download() {
-    local kex_algorithm=$1
+    local kex_algorithm=$1 required=${2:-yes}
     local output_file="$TEST_DIR/test_file_${kex_algorithm//[^A-Za-z0-9]/_}.bin"
     local log_file="$LOG_DIR/client_kex_${kex_algorithm//[^A-Za-z0-9]/_}.log"
 
@@ -94,7 +94,7 @@ try_kex_download() {
         return
     fi
 
-    if grep -Eq "No compatible KEX/cipher suite|Connection closed|Connection error" \
+    if [[ $required == no ]] && grep -Fq "No compatible KEX/cipher suite" \
         "$log_file"; then
         printf "${YELLOW}%s${NC}\n" "      SKIP: KEX $kex_algorithm is not enabled in this liboqs build."
         return
@@ -141,7 +141,7 @@ PidFile $LOG_DIR/server.pid
 StorageDir $STORAGE_DIR
 KexAlgorithms ML-KEM-512,Kyber512,ML-KEM-768,Kyber768
 CipherAlgorithms xchacha20poly1305
-AuthMethods password,publickey,password+publickey
+AuthMethods password,publickey,password+publickey,pake
 AuthPassword e2e-password
 AuthorizedKeysFile $AUTHORIZED_KEYS
 PubKeyAuthAlgorithms ML-DSA-65,ML-DSA-44
@@ -220,9 +220,9 @@ if [ "$HAS_ML_DSA_44" -eq 1 ]; then
 fi
 
 try_kex_download "ML-KEM-512"
-try_kex_download "Kyber512"
+try_kex_download "Kyber512" no
 try_kex_download "ML-KEM-768"
-try_kex_download "Kyber768"
+try_kex_download "Kyber768" no
 
 if ! grep -Eq "Negotiated KEX: (ML-KEM-512|Kyber512|ML-KEM-768|Kyber768); control cipher: xchacha20poly1305" "$LOG_DIR/server.log"; then
     printf "${RED}%s${NC}\n" "FAIL: Negotiated suite was not logged as expected."
@@ -245,6 +245,11 @@ expect_client_failure "$LOG_DIR/client_missing_source.log" "Cannot open PUT sour
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
     put "$TEST_DIR/missing-source.bin" "missing-source.bin"
 test ! -e "$STORAGE_DIR/missing-source.bin"
+
+expect_client_failure "$LOG_DIR/client_missing_remote.log" "File not found" \
+    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
+    get "absent.bin" "$TEST_DIR/absent.bin"
+test ! -e "$TEST_DIR/absent.bin"
 
 mkdir "$TEST_DIR/get_destination_directory"
 expect_client_failure "$LOG_DIR/client_publish_failure.log" "Cannot publish download" \
@@ -313,6 +318,22 @@ if compgen -G "$STORAGE_DIR/.nasfs-upload.*" > /dev/null; then
     printf "Temporary upload was not removed.\n" >&2
     exit 1
 fi
+
+# Verify PAKE and successful batches across independent CLI invocations.
+mkdir "$TEST_DIR/batch-input" "$TEST_DIR/batch-output"
+cp "$TEST_INPUT" "$TEST_DIR/batch-input/batch_a.bin"
+printf 'Second batch member\n' > "$TEST_DIR/batch-input/batch_b.bin"
+run_client "$LOG_DIR/client_pake_mput.log" "ML-KEM-512" "pake" \
+    "e2e-password" "" "ML-DSA-65" mput "$TEST_DIR/batch-input/batch_a.bin" \
+    "$TEST_DIR/batch-input/batch_b.bin"
+(
+    CLIENT_BIN="$(cd "$(dirname "$CLIENT_BIN")" && pwd)/$(basename "$CLIENT_BIN")"
+    cd "$TEST_DIR/batch-output"
+    run_client "$LOG_DIR/client_pake_mget.log" "ML-KEM-512" "pake" \
+        "e2e-password" "" "ML-DSA-65" mget batch_a.bin batch_b.bin
+)
+cmp "$TEST_DIR/batch-input/batch_a.bin" "$TEST_DIR/batch-output/batch_a.bin"
+cmp "$TEST_DIR/batch-input/batch_b.bin" "$TEST_DIR/batch-output/batch_b.bin"
 
 printf "${YELLOW}%s${NC}\n" "=============================================="
 printf "${GREEN}%s${NC}\n" "    SUCCESS: All tests passed!               "

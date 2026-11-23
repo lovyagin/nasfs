@@ -321,3 +321,44 @@ int crypto_engine_hash(nasfs_hash_algo_t algo, const uint8_t* data,
   }
   return -1;
 }
+
+/* Derive a per-container wrapping key in its own domain. */
+static void owner_wrap_key(uint8_t out[32], const uint8_t master_key[32],
+                           const uint8_t file_salt[16]) {
+  const uint8_t domain[] = "NASLUKS owner wrap v1";
+  crypto_generichash_state state;
+  crypto_generichash_init(&state, master_key, 32, 32);
+  crypto_generichash_update(&state, domain, sizeof(domain));
+  crypto_generichash_update(&state, file_salt, 16);
+  crypto_generichash_final(&state, out, 32);
+  sodium_memzero(&state, sizeof(state));
+}
+
+int crypto_engine_create_owner_slot(uint8_t slot[NASFS_OWNER_SLOT_V1_SIZE],
+                                    uint8_t file_key[32],
+                                    const uint8_t master_key[32],
+                                    const uint8_t file_salt[16]) {
+  uint8_t wrapping_key[32];
+  owner_wrap_key(wrapping_key, master_key, file_salt);
+  randombytes_buf(file_key, 32);
+  randombytes_buf(slot, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+  int result = crypto_aead_xchacha20poly1305_ietf_encrypt(
+      slot + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, NULL, file_key, 32,
+      file_salt, 16, NULL, slot, wrapping_key);
+  sodium_memzero(wrapping_key, sizeof(wrapping_key));
+  return result;
+}
+
+int crypto_engine_open_owner_slot(uint8_t file_key[32],
+                                  const uint8_t slot[NASFS_OWNER_SLOT_V1_SIZE],
+                                  const uint8_t master_key[32],
+                                  const uint8_t file_salt[16]) {
+  uint8_t wrapping_key[32];
+  owner_wrap_key(wrapping_key, master_key, file_salt);
+  int result = crypto_aead_xchacha20poly1305_ietf_decrypt(
+      file_key, NULL, NULL, slot + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
+      NASFS_OWNER_SLOT_V1_SIZE - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
+      file_salt, 16, slot, wrapping_key);
+  sodium_memzero(wrapping_key, sizeof(wrapping_key));
+  return result;
+}

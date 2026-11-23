@@ -43,6 +43,10 @@ void on_signal(uv_signal_t* watcher, int signum) {
   uv_stop(watcher->loop);
 }
 
+static void expire_sessions(uv_timer_t* timer) {
+  uv_walk(timer->loop, session_expire_idle, &server);
+}
+
 static void close_server_handle(uv_handle_t* handle, void* arg) {
   (void)arg;
   if (uv_is_closing(handle)) return;
@@ -64,8 +68,18 @@ int main(int argc, char** argv) {
   const char* config_file = (argc > 1) ? argv[1] : "config/nasfs.conf";
   int exit_code = 0;
 
+  signal(SIGPIPE, SIG_IGN);
+
   if (sodium_init() < 0) {
     fprintf(stderr, "Failed to initialize libsodium\n");
+    return 1;
+  }
+
+  if (session_load_identity(getenv("NASFS_SERVER_SIGNING_SEED"),
+                            getenv("NASFS_AUTHOR_PUBLIC_KEY")) < 0) {
+    fprintf(stderr,
+            "Expected NASFS_SERVER_SIGNING_SEED and NASFS_AUTHOR_PUBLIC_KEY "
+            "files\n");
     return 1;
   }
 
@@ -115,6 +129,9 @@ int main(int argc, char** argv) {
   if (r == 0) r = uv_signal_init(loop, &sigterm_watcher);
   if (r == 0) r = uv_signal_start(&sigterm_watcher, on_signal, SIGTERM);
   if (r == 0) r = uv_tcp_init(loop, &server);
+  uv_timer_t idle_timer;
+  if (r == 0) r = uv_timer_init(loop, &idle_timer);
+  if (r == 0) r = uv_timer_start(&idle_timer, expire_sessions, 1000, 1000);
   if (r < 0) {
     log_all(LOG_ERROR, "Event loop setup failed: %s", uv_strerror(r));
     exit_code = 1;

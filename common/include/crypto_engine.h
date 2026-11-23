@@ -40,39 +40,16 @@ typedef enum {
   NASFS_HASH_CRC32    /**< High-speed CRC polynomial checksum for networks */
 } nasfs_hash_algo_t;
 
-/**
- * @struct nasfs_luks_header_t
- * @brief Conceptual LUKS-like Metadata block header for NASFS files.
- *
- * This structure sits at the beginning of the file and stores details of key
- * derivation, cipher suites, and key enveloping slots for multi-user sharing.
- */
-#pragma pack(push, 1)
-typedef struct {
-  uint8_t magic[6];      /**< "NASLUX" magic signature */
-  uint16_t version;      /**< Header version (e.g., 1) */
-  uint8_t kdf_algo;      /**< nasfs_kdf_algo_t choice */
-  uint8_t cipher_algo;   /**< nasfs_cipher_algo_t choice */
-  uint8_t hash_algo;     /**< nasfs_hash_algo_t choice */
-  uint32_t block_size;   /**< Block size (e.g., 65536) */
-  uint64_t file_size;    /**< Original plaintext size (protects against GET
-                            truncation) */
-  uint8_t file_salt[16]; /**< Key derivation salt */
-  uint8_t master_key_salt[16]; /**< Salt for OPAQUE PAKE or Master Key slot */
-
-  /* Enveloped Key Slots (Concept: Multi-user sharing) */
-  uint8_t slot_0_username[32]; /**< User name for Slot 0 */
-  uint8_t slot_0_enc_key[32];  /**< File key encrypted (enveloped) with Slot 0's
-                                  Public Key (X25519) */
-
-  uint8_t slot_1_username[32]; /**< User name for Slot 1 */
-  uint8_t slot_1_enc_key[32];  /**< File key encrypted (enveloped) with Slot 1's
-                                  Public Key (X25519) */
-
-  uint8_t
-      header_mac[16]; /**< Poly1305 Authentication tag over the entire header */
-} nasfs_luks_header_t;
-#pragma pack(pop)
+/* NASLUKS owner slot v1: 24-byte nonce, 32-byte key, 16-byte tag. */
+#define NASFS_OWNER_SLOT_V1_SIZE 72
+int crypto_engine_create_owner_slot(uint8_t slot[NASFS_OWNER_SLOT_V1_SIZE],
+                                    uint8_t file_key[32],
+                                    const uint8_t master_key[32],
+                                    const uint8_t file_salt[16]);
+int crypto_engine_open_owner_slot(uint8_t file_key[32],
+                                  const uint8_t slot[NASFS_OWNER_SLOT_V1_SIZE],
+                                  const uint8_t master_key[32],
+                                  const uint8_t file_salt[16]);
 
 /**
  * @brief Derive a key using the specified KDF algorithm.

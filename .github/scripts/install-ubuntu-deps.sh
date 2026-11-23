@@ -28,6 +28,7 @@ run_root apt-get install -y \
   libtool \
   libuv1-dev \
   ninja-build \
+  openssl \
   pkg-config \
   shellcheck \
   clang \

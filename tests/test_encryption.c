@@ -159,112 +159,44 @@ static int test_block_metadata_integrity(void) {
     return 1;
   }
 
-  // Verify struct packing size (must be 8 + 4 + 32 = 44 bytes exactly)
-  if (sizeof(nasfs_block_meta_t) != 44) {
-    return 1;
-  }
+  uint8_t bytes[NASFS_BLOCK_META_SIZE];
+  protocol_encode_block_meta(bytes, &meta);
+  const uint8_t expected_prefix[] = {0, 0, 0, 0, 0, 0, 5, 57, 0, 0, 1, 0};
+  if (memcmp(bytes, expected_prefix, sizeof(expected_prefix)) != 0) return 1;
 
-  // Re-verify computed hash
-  uint8_t computed[32];
-  crypto_generichash(computed, sizeof(computed), mock_ciphertext,
-                     sizeof(mock_ciphertext), NULL, 0);
-  if (memcmp(meta.hash, computed, 32) != 0) {
+  nasfs_block_meta_t decoded;
+  if (protocol_decode_block_meta(bytes, sizeof(bytes) - 1, &decoded) == 0 ||
+      protocol_decode_block_meta(bytes, sizeof(bytes), &decoded) != 0 ||
+      decoded.seq_num != meta.seq_num || decoded.size != meta.size ||
+      memcmp(decoded.hash, meta.hash, sizeof(meta.hash)) != 0) {
     return 1;
   }
 
   return 0;
 }
 
-static int test_request_payload_parsing_backward_compatibility(void) {
-  // Scenario 1: New client with encryption enabled (prefix 0x01 + 24-byte salt)
-  {
-    uint8_t payload[1 + 24 + 8] = {0};
-    payload[0] = 0x01;              // encrypted
-    memset(payload + 1, 0xAB, 24);  // mock salt
-    memcpy(payload + 25, "file.txt", 8);
-    size_t payload_len = sizeof(payload);
-
-    int is_enc = 0;
-    const uint8_t* filename_ptr = payload;
-    size_t filename_len = payload_len;
-    uint8_t extracted_salt[24] = {0};
-
-    if (payload_len > 1 && (payload[0] == 0 || payload[0] == 1)) {
-      is_enc = payload[0];
-      if (is_enc && payload_len >= 25) {
-        memcpy(extracted_salt, payload + 1, 24);
-        filename_ptr = payload + 25;
-        filename_len = payload_len - 25;
-      } else {
-        filename_ptr = payload + 1;
-        filename_len = payload_len - 1;
-      }
-    }
-
-    if (is_enc != 1 || filename_len != 8 ||
-        memcmp(filename_ptr, "file.txt", 8) != 0 || extracted_salt[0] != 0xAB) {
-      return 1;
-    }
+static int test_frame_codec(void) {
+  nasfs_frame_t frame;
+  const uint8_t zero_length[] = {0, 0, 0, 0, NASFS_CMD_HELLO};
+  const uint8_t oversized[] = {1, 0, 0, 1};
+  uint8_t buffers[] = {0, 0, 0, 2, NASFS_CMD_PUT_RESULT, NASFS_PUT_PUBLISHED,
+                       0, 0, 0, 1, NASFS_CMD_GET_DONE};
+  if (protocol_parse_frame(zero_length, sizeof(zero_length), &frame) >= 0 ||
+      protocol_parse_frame(oversized, sizeof(oversized), &frame) >= 0 ||
+      protocol_parse_frame(buffers, 5, &frame) != 0 ||
+      protocol_parse_frame(buffers, sizeof(buffers), &frame) != 6 ||
+      frame.type != NASFS_CMD_PUT_RESULT || frame.payload_len != 1 ||
+      frame.payload[0] != NASFS_PUT_PUBLISHED ||
+      protocol_parse_frame(buffers + 6, sizeof(buffers) - 6, &frame) != 5 ||
+      frame.type != NASFS_CMD_GET_DONE || frame.payload_len != 0) {
+    return 1;
   }
-
-  // Scenario 2: New client with encryption disabled (prefix 0x00)
-  {
-    uint8_t payload[] = {0x00, 'f', 'i', 'l', 'e', '.', 't', 'x', 't'};
-    size_t payload_len = sizeof(payload);
-
-    int is_enc = 0;
-    const uint8_t* filename_ptr = payload;
-    size_t filename_len = payload_len;
-    uint8_t extracted_salt[24] = {0};
-
-    if (payload_len > 1 && (payload[0] == 0 || payload[0] == 1)) {
-      is_enc = payload[0];
-      if (is_enc && payload_len >= 25) {
-        memcpy(extracted_salt, payload + 1, 24);
-        filename_ptr = payload + 25;
-        filename_len = payload_len - 25;
-      } else {
-        filename_ptr = payload + 1;
-        filename_len = payload_len - 1;
-      }
-    }
-
-    if (is_enc != 0 || filename_len != 8 ||
-        memcmp(filename_ptr, "file.txt", 8) != 0) {
-      return 1;
-    }
-  }
-
-  // Scenario 3: Legacy client with no prefix (plain filename starting with 'f'
-  // = 0x66)
-  {
-    uint8_t payload[] = {'f', 'i', 'l', 'e', '.', 't', 'x', 't'};
-    size_t payload_len = sizeof(payload);
-
-    int is_enc = 0;
-    const uint8_t* filename_ptr = payload;
-    size_t filename_len = payload_len;
-    uint8_t extracted_salt[24] = {0};
-
-    if (payload_len > 1 && (payload[0] == 0 || payload[0] == 1)) {
-      is_enc = payload[0];
-      if (is_enc && payload_len >= 25) {
-        memcpy(extracted_salt, payload + 1, 24);
-        filename_ptr = payload + 25;
-        filename_len = payload_len - 25;
-      } else {
-        filename_ptr = payload + 1;
-        filename_len = payload_len - 1;
-      }
-    }
-
-    if (is_enc != 0 || filename_len != 8 ||
-        memcmp(filename_ptr, "file.txt", 8) != 0) {
-      return 1;
-    }
-  }
-
-  return 0;
+  size_t size;
+  uint8_t* packed =
+      protocol_pack_frame(NASFS_CMD_PUT_RESULT, buffers + 5, 1, &size);
+  int result = !packed || size != 6 || memcmp(packed, buffers, 6) != 0;
+  free(packed);
+  return result;
 }
 
 int main(void) {
@@ -288,9 +220,8 @@ int main(void) {
     return 1;
   }
 
-  if (test_request_payload_parsing_backward_compatibility() != 0) {
-    fprintf(stderr,
-            "test_request_payload_parsing_backward_compatibility failed\n");
+  if (test_frame_codec() != 0) {
+    fprintf(stderr, "test_frame_codec failed\n");
     return 1;
   }
 
