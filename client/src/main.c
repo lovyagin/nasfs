@@ -310,6 +310,33 @@ static int auth_method_requires_publickey(const char* method) {
          strcmp(method, NASFS_AUTH_METHOD_PASSWORD_PUBLICKEY) == 0;
 }
 
+static FILE* stage_key_file(const char* destination, char** temporary) {
+  const char suffix[] = ".nasfs-key.XXXXXX";
+  size_t length = strlen(destination);
+  *temporary = malloc(length + sizeof(suffix));
+  if (!*temporary) return NULL;
+  memcpy(*temporary, destination, length);
+  memcpy(*temporary + length, suffix, sizeof(suffix));
+  int fd = mkstemp(*temporary);
+  if (fd < 0) {
+    free(*temporary);
+    *temporary = NULL;
+    return NULL;
+  }
+  FILE* stream = fdopen(fd, "w");
+  if (!stream) close(fd);
+  return stream;
+}
+
+static int finish_key_file(FILE** stream) {
+  FILE* file = *stream;
+  *stream = NULL;
+  int result = fflush(file);
+  if (result == 0) result = fsync(fileno(file));
+  if (fclose(file) != 0) result = -1;
+  return result;
+}
+
 static int write_keypair_files(const char* private_path,
                                const char* public_path, const char* algorithm) {
   OQS_SIG* sig;
@@ -319,8 +346,14 @@ static int write_keypair_files(const char* private_path,
   char* secret_hex = NULL;
   FILE* private_file = NULL;
   FILE* public_file = NULL;
+  char* private_temp = NULL;
+  char* public_temp = NULL;
   int rc = 1;
 
+  if (strcmp(private_path, public_path) == 0) {
+    fprintf(stderr, "Key destinations must be distinct\n");
+    return 1;
+  }
   sig = OQS_SIG_new(algorithm);
   if (!sig) {
     fprintf(stderr, "Unsupported signature algorithm: %s\n", algorithm);
@@ -342,7 +375,7 @@ static int write_keypair_files(const char* private_path,
     goto out;
   }
 
-  private_file = fopen(private_path, "w");
+  private_file = stage_key_file(private_path, &private_temp);
   if (!private_file) {
     fprintf(stderr, "Failed to open private key file: %s\n", private_path);
     goto out;
@@ -352,11 +385,12 @@ static int write_keypair_files(const char* private_path,
     fprintf(stderr, "Failed to write private key file: %s\n", private_path);
     goto out;
   }
-  fclose(private_file);
-  private_file = NULL;
-  chmod(private_path, S_IRUSR | S_IWUSR);
+  if (finish_key_file(&private_file) != 0) {
+    fprintf(stderr, "Failed to save private key file: %s\n", private_path);
+    goto out;
+  }
 
-  public_file = fopen(public_path, "w");
+  public_file = stage_key_file(public_path, &public_temp);
   if (!public_file) {
     fprintf(stderr, "Failed to open public key file: %s\n", public_path);
     goto out;
@@ -366,13 +400,36 @@ static int write_keypair_files(const char* private_path,
     goto out;
   }
 
+  if (finish_key_file(&public_file) != 0) {
+    fprintf(stderr, "Failed to save public key file: %s\n", public_path);
+    goto out;
+  }
+  if (link(private_temp, private_path) != 0) {
+    fprintf(stderr, "Failed to publish private key file: %s\n", private_path);
+    goto out;
+  }
+  if (link(public_temp, public_path) != 0) {
+    fprintf(stderr, "Failed to publish public key file: %s\n", public_path);
+    if (unlink(private_path) != 0) {
+      fprintf(stderr,
+              "Failed to remove unpublished keypair's private key: %s\n",
+              private_path);
+    }
+    goto out;
+  }
   rc = 0;
 
 out:
   if (private_file) fclose(private_file);
   if (public_file) fclose(public_file);
+  if (private_temp) unlink(private_temp);
+  if (public_temp) unlink(public_temp);
+  free(private_temp);
+  free(public_temp);
   free(public_hex);
+  if (secret_hex) sodium_memzero(secret_hex, strlen(secret_hex));
   free(secret_hex);
+  if (secret_key) sodium_memzero(secret_key, sig->length_secret_key);
   free(public_key);
   free(secret_key);
   OQS_SIG_free(sig);
