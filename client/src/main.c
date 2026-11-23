@@ -9,6 +9,10 @@
  * encrypted control channel.
  */
 
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -54,6 +58,124 @@ static nasfs_kdf_algo_t parse_kdf_algo(const char* s) {
   if (strcmp(s, "pbkdf2") == 0 || strcmp(s, "pbkdf2-sha256") == 0)
     return NASFS_KDF_PBKDF2_SHA256;
   return NASFS_KDF_ARGON2ID; /* default */
+}
+
+static int read_master_salt(int dir, uint8_t salt[crypto_pwhash_SALTBYTES]) {
+  int fd = openat(dir, "master.salt", O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  if (fd < 0) return errno == ENOENT ? 1 : -1;
+
+  struct stat st;
+  uint8_t bytes[crypto_pwhash_SALTBYTES + 1];
+  int result = -1;
+  if (fstat(fd, &st) == 0) {
+    if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+        (st.st_mode & 077u) != 0) {
+      errno = EINVAL;
+    } else {
+      size_t used = 0;
+      while (used < sizeof(bytes)) {
+        ssize_t n = read(fd, bytes + used, sizeof(bytes) - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) break;
+        if (n == 0) {
+          if (used == crypto_pwhash_SALTBYTES) {
+            memcpy(salt, bytes, used);
+            result = 0;
+          } else {
+            errno = EINVAL;
+          }
+          break;
+        }
+        used += (size_t)n;
+      }
+      if (used == sizeof(bytes)) errno = EINVAL;
+    }
+  }
+  int saved = errno;
+  if (close(fd) < 0 && result == 0) return -1;
+  errno = saved;
+  return result;
+}
+
+static int publish_master_salt(int dir) {
+  unsigned char random_suffix[16];
+  char name[sizeof(".master.salt.") + 2 * sizeof(random_suffix)];
+  uint8_t salt[crypto_pwhash_SALTBYTES];
+  randombytes_buf(random_suffix, sizeof(random_suffix));
+  memcpy(name, ".master.salt.", sizeof(".master.salt.") - 1);
+  sodium_bin2hex(name + sizeof(".master.salt.") - 1,
+                 2 * sizeof(random_suffix) + 1, random_suffix,
+                 sizeof(random_suffix));
+  int fd = openat(dir, name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) return -1;
+
+  randombytes_buf(salt, sizeof(salt));
+  size_t written = 0;
+  int result = -1;
+  while (written < sizeof(salt)) {
+    ssize_t n = write(fd, salt + written, sizeof(salt) - written);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      if (n == 0) errno = EIO;
+      break;
+    }
+    written += (size_t)n;
+  }
+  if (written == sizeof(salt)) result = fsync(fd);
+  int saved = errno;
+  if (close(fd) < 0 && result == 0) {
+    result = -1;
+    saved = errno;
+  }
+  if (result == 0 && linkat(dir, name, dir, "master.salt", 0) < 0 &&
+      errno != EEXIST) {
+    result = -1;
+    saved = errno;
+  }
+  if (unlinkat(dir, name, 0) < 0 && result == 0) return -1;
+  errno = saved;
+  return result;
+}
+
+static int load_master_salt(uint8_t salt[crypto_pwhash_SALTBYTES],
+                            int allow_create) {
+  const char* home = getenv("HOME");
+  if (!home || !*home) {
+    errno = ENOENT;
+    return -1;
+  }
+
+  int home_fd = open(home, O_RDONLY | O_DIRECTORY);
+  if (home_fd < 0) return -1;
+  int dir = -1;
+  int result = -1;
+  int saved;
+  if (allow_create && mkdirat(home_fd, ".nasfs", 0700) < 0 && errno != EEXIST)
+    goto done;
+  dir = openat(home_fd, ".nasfs", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  if (dir < 0) goto done;
+  struct stat st;
+  if (fstat(dir, &st) < 0) goto done;
+  if (st.st_uid != geteuid() || (st.st_mode & 022u) != 0) {
+    errno = EACCES;
+    goto done;
+  }
+
+  result = read_master_salt(dir, salt);
+  if (result == 1 && allow_create && publish_master_salt(dir) == 0) {
+    result = read_master_salt(dir, salt);
+  }
+  if (result == 0) {
+    /* A concurrent reader can observe the link before its creator syncs it. */
+    if (fsync(dir) < 0 || fsync(home_fd) < 0) result = -1;
+  }
+
+done:
+  saved = errno;
+  if (dir >= 0) close(dir);
+  close(home_fd);
+  errno = saved;
+  return result == 0 ? 0 : -1;
 }
 
 static size_t io_chunk_size = 64 * 1024;
@@ -126,7 +248,6 @@ char* negotiated_cipher_algorithm = NULL;
 
 /* File Encryption/Integrity State */
 int file_encryption_enabled = 0;
-char* raw_encryption_password = NULL;
 uint8_t file_salt[crypto_pwhash_SALTBYTES] = {0};
 uint8_t encryption_key[crypto_secretbox_KEYBYTES] = {0};
 uint8_t master_key[32] = {0};
@@ -1478,55 +1599,17 @@ int main(int argc, char** argv) {
   }
 
   file_encryption_enabled = 1;
-  raw_encryption_password = strdup(env_encryption_key);
-
-  /*
-   * Load or create a per-client random Argon2id salt stored in
-   * ~/.nasfs/master.salt.  A fixed salt would allow precomputation attacks
-   * against the master key; a random per-client salt prevents this.
-   */
   uint8_t master_salt[crypto_pwhash_SALTBYTES];
-  {
-    const char* home = getenv("HOME");
-    char salt_path[512] = {0};
-    if (home && home[0] != '\0') {
-      snprintf(salt_path, sizeof(salt_path), "%s/.nasfs/master.salt", home);
-    }
-
-    int loaded = 0;
-    if (salt_path[0] != '\0') {
-      FILE* sf = fopen(salt_path, "rb");
-      if (sf) {
-        if (fread(master_salt, 1, sizeof(master_salt), sf) ==
-            sizeof(master_salt)) {
-          loaded = 1;
-        }
-        fclose(sf);
-      }
-
-      if (!loaded) {
-        randombytes_buf(master_salt, sizeof(master_salt));
-        /* Create ~/.nasfs/ if it doesn't exist */
-        char dir_path[512] = {0};
-        if (home) {
-          snprintf(dir_path, sizeof(dir_path), "%s/.nasfs", home);
-          mkdir(dir_path, 0700);
-        }
-        FILE* wf = fopen(salt_path, "wb");
-        if (wf) {
-          (void)fwrite(master_salt, 1, sizeof(master_salt), wf);
-          fclose(wf);
-          chmod(salt_path, S_IRUSR | S_IWUSR);
-        }
-      }
-    } else {
-      /* Fallback: derive from env if no HOME (CI / containers) */
-      memset(master_salt, 0x44, sizeof(master_salt));
-    }
+  int allow_salt_creation =
+      strcmp(argv[1], "put") == 0 || strcmp(argv[1], "mput") == 0;
+  if (load_master_salt(master_salt, allow_salt_creation) < 0) {
+    fprintf(stderr, "Cannot load or save ~/.nasfs/master.salt: %s\n",
+            strerror(errno));
+    return 1;
   }
 
-  if (crypto_engine_derive_key(master_kdf_algo, raw_encryption_password,
-                               strlen(raw_encryption_password), master_salt,
+  if (crypto_engine_derive_key(master_kdf_algo, env_encryption_key,
+                               strlen(env_encryption_key), master_salt,
                                crypto_pwhash_SALTBYTES, master_key,
                                sizeof(master_key)) != 0) {
     fprintf(stderr, "Failed to derive master key\n");
