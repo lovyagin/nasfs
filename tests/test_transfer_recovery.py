@@ -206,6 +206,61 @@ def main():
             assert (storage / remote).read_bytes() != previous
             await_cleanup(storage, ".nasfs-upload.*")
             return
+        if mode == ["cancel-slow-mput"]:
+            items = [root / f"slow-put-{index}.bin" for index in range(3)]
+            items[0].touch()
+            items[1].write_bytes(source.read_bytes()[:65536])
+            items[2].write_bytes(b"Must not be transferred")
+            output_log = root / "logs/server_stdout.log"
+            gate = root / "release-writes"
+
+            def await_saturated_queue():
+                deadline = time.monotonic() + 5
+                while "Test fixture pending writes: 4" not in output_log.read_text():
+                    assert time.monotonic() < deadline, output_log.read_text()
+                    time.sleep(0.01)
+
+            try:
+                interrupt_transfer(client, ["mput", *map(str, items)], upstream_port,
+                                   "put", PUT_DONE, signal.SIGINT, occurrence=2,
+                                   on_pause=await_saturated_queue)
+            finally:
+                gate.touch()
+            await_cleanup(storage, ".nasfs-upload.*")
+            subprocess.run([client, "get", items[0].name, str(destination)],
+                           check=True, capture_output=True, timeout=10)
+            assert destination.read_bytes() == b""
+            assert not any((storage / item.name).exists() for item in items[1:])
+            return
+
+        if mode == ["cancel-slow-mget"]:
+            output = root / "slow-get-output"
+            output.mkdir()
+            names = [f"slow-get-{index}.bin" for index in range(3)]
+            for name in names:
+                (output / name).write_bytes(b"Previous destination")
+            output_log = root / "logs/server_stdout.log"
+            gate = root / "release-read"
+            with subprocess.Popen([client, "mget", *names], cwd=output,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) as child:
+                try:
+                    deadline = time.monotonic() + 8
+                    while "Test fixture blocked record read" not in output_log.read_text():
+                        assert child.poll() is None and time.monotonic() < deadline
+                        time.sleep(0.01)
+                    child.send_signal(signal.SIGINT)
+                    _, stderr = child.communicate(timeout=5)
+                    assert child.returncode == 130, stderr
+                    assert b"Transfer interrupted by signal" in stderr, stderr
+                finally:
+                    gate.touch()
+                    if child.poll() is None:
+                        child.kill()
+            assert (output / names[0]).read_bytes() == source.read_bytes()
+            for name in names[1:]:
+                assert (output / name).read_bytes() == b"Previous destination"
+            await_cleanup(output, ".nasfs-download.*")
+            return
         if mode in (["stop-during-open"], ["stop-during-read"]):
             reading = mode == ["stop-during-read"]
             server_pid = int(server_pid)

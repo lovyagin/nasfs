@@ -819,6 +819,32 @@ PYTHON
     cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
     transfer get encrypted_remote.bin "$TEST_ROOT/rename-stop-recovered.bin"
     cmp "$TEST_ROOT/replacement.bin" "$TEST_ROOT/rename-stop-recovered.bin"
+
+    # The first PUT is empty, so only the second file fills the gated queue.
+    kill -TERM "$SERVER_PID"
+    wait "$SERVER_PID"
+    SERVER_PID=
+    rm "$LOG_DIR/server.log" "$TEST_ROOT/release-writes"
+    NASFS_TEST_DELAY_WRITES=.nasfs-upload. NASFS_TEST_WRITE_GATE="$TEST_ROOT/release-writes" \
+        SERVER_BIN="$TEST_ROOT/fault-server" start_integration_server "$TEST_ROOT/server-restarted.conf"
+    cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
+    NASFS_BLOCK_SIZE=4096 NASFS_KEX_ALGORITHMS=ML-KEM-512 NASFS_AUTH_METHOD=password \
+        NASFS_AUTH_PASSWORD=super-secret python3 "$ROOT_DIR/tests/test_transfer_recovery.py" \
+        "$CLIENT_BIN" "$TEST_ROOT" "$STORAGE_DIR" "$TEST_INPUT" "$SERVER_PID" cancel-slow-mput
+    for index in 0 1 2; do
+        transfer put "$TEST_INPUT" "slow-get-$index.bin" > "$LOG_DIR/slow-get-prepare.log" 2>&1
+    done
+
+    kill -TERM "$SERVER_PID"
+    wait "$SERVER_PID"
+    SERVER_PID=
+    rm "$LOG_DIR/server.log" "$TEST_ROOT/release-read"
+    UV_USE_IO_URING=0 NASFS_TEST_BLOCK_READS=slow-get-1.bin NASFS_TEST_READ_GATE="$TEST_ROOT/release-read" \
+        SERVER_BIN="$TEST_ROOT/fault-server" start_integration_server "$TEST_ROOT/server-restarted.conf"
+    cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
+    NASFS_KEX_ALGORITHMS=ML-KEM-512 NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=super-secret \
+        python3 "$ROOT_DIR/tests/test_transfer_recovery.py" "$CLIENT_BIN" "$TEST_ROOT" \
+        "$STORAGE_DIR" "$TEST_INPUT" "$SERVER_PID" cancel-slow-mget
 fi
 
 printf '%b%s%b\n' "$GREEN" "==============================================" "$NC"
