@@ -123,6 +123,67 @@ keygen(other_private, public)
 assert not other_private.exists() and public.read_bytes() == old_public
 PYTHON
 
+# Inject pauses between signal registration, bind and listen on Linux.
+if [[ $(uname -s) == Linux ]]; then
+    "${CC:-cc}" -shared -fPIC -Wall -Wextra -Werror \
+        "$(dirname "${BASH_SOURCE[0]}")/fault_injection.c" -ldl -o "$TEST_ROOT/startup.so"
+    python3 - "$SERVER_BIN" "$TEST_ROOT" <<'PYTHON'
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+server, root = sys.argv[1:]
+root = Path(root)
+preload = str(root / "startup.so")
+asan = re.search(r"libasan\S* => (\S+)", subprocess.check_output(["ldd", server], text=True))
+if asan:
+    preload = f"{asan[1]}:{preload}"
+
+for phase, signum, expected in (
+    ("before-sigint", signal.SIGINT, -signal.SIGINT),
+    ("before-sigterm", signal.SIGINT, 0),
+    ("before-sigterm", signal.SIGTERM, -signal.SIGTERM),
+    ("before-bind", signal.SIGTERM, 0),
+    ("before-listen", signal.SIGINT, 0),
+):
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    config = root / "startup.conf"
+    config.write_text((root / "server.conf").read_text().replace("Port 0", f"Port {port}"))
+    gate = root / "startup-release"
+    if gate.exists():
+        gate.unlink()
+    output = root / "logs" / f"{phase}-{signum}.log"
+    env = dict(os.environ, LD_PRELOAD=preload, NASFS_TEST_STARTUP_PHASE=phase,
+               NASFS_TEST_STARTUP_GATE=str(gate))
+    with output.open("wb") as diagnostics, subprocess.Popen(
+            [server, str(config)], env=env, stdout=diagnostics, stderr=diagnostics) as child:
+        try:
+            deadline = time.monotonic() + 5
+            while f"Test fixture startup phase: {phase}" not in output.read_text():
+                assert child.poll() is None and time.monotonic() < deadline, output.read_text()
+                time.sleep(0.01)
+            assert not (root / "logs/server.pid").exists()
+            child.send_signal(signum)
+            if expected == 0:
+                gate.touch()
+            assert child.wait(timeout=5) == expected, output.read_text()
+        finally:
+            gate.touch()
+            if child.poll() is None:
+                child.kill()
+    assert not (root / "logs/server.pid").exists()
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", port))
+PYTHON
+fi
+
 rm -f "$LOG_DIR/server.log"
 start_integration_server "$TEST_ROOT/server.conf"
 python3 - "$NASFS_SERVER_PORT" "$LOG_DIR/server.log" <<'PYTHON'

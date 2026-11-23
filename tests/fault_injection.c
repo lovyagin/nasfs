@@ -256,3 +256,38 @@ int renameat(int olddir, const char* oldpath, int newdir, const char* newpath) {
   }
   return actual(olddir, oldpath, newdir, newpath);
 }
+
+static void wait_startup_checkpoint(const char* phase) {
+  const char* expected = getenv("NASFS_TEST_STARTUP_PHASE");
+  const char* gate = getenv("NASFS_TEST_STARTUP_GATE");
+  if (!expected || !gate || strcmp(phase, expected) != 0) return;
+  fprintf(stderr, "Test fixture startup phase: %s\n", phase);
+  const struct timespec pause = {.tv_nsec = 10000000};
+  while (access(gate, F_OK) != 0) nanosleep(&pause, NULL);
+}
+
+int uv_signal_start(uv_signal_t* handle, uv_signal_cb callback, int signum) {
+  typedef int (*start_fn)(uv_signal_t*, uv_signal_cb, int);
+  start_fn actual = (start_fn)dlsym(RTLD_NEXT, "uv_signal_start");
+  if (!actual) abort();
+  if (signum == SIGINT) wait_startup_checkpoint("before-sigint");
+  if (signum == SIGTERM) wait_startup_checkpoint("before-sigterm");
+  return actual(handle, callback, signum);
+}
+
+int uv_tcp_bind(uv_tcp_t* handle, const struct sockaddr* address,
+                unsigned flags) {
+  typedef int (*bind_fn)(uv_tcp_t*, const struct sockaddr*, unsigned);
+  bind_fn actual = (bind_fn)dlsym(RTLD_NEXT, "uv_tcp_bind");
+  if (!actual) abort();
+  wait_startup_checkpoint("before-bind");
+  return actual(handle, address, flags);
+}
+
+int uv_listen(uv_stream_t* stream, int backlog, uv_connection_cb callback) {
+  typedef int (*listen_fn)(uv_stream_t*, int, uv_connection_cb);
+  listen_fn actual = (listen_fn)dlsym(RTLD_NEXT, "uv_listen");
+  if (!actual) abort();
+  wait_startup_checkpoint("before-listen");
+  return actual(stream, backlog, callback);
+}
