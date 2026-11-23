@@ -30,6 +30,7 @@ run_root apt-get install -y \
   ninja-build \
   openssl \
   pkg-config \
+  python3 \
   shellcheck \
   clang \
   clang-tidy \

@@ -355,13 +355,32 @@ requires a valid signature and key-exchange confirmation before sending AUTH
 or PAKE. Update client and server together. The handshake requires independent
 cryptographic review before release.
 
+The server requires a readable configuration and a writable configured log
+file. It rejects a second process using the same PID file. `ClientTimeout`
+sets the server's idle session timeout in seconds. Key generation creates
+new destination files, so choose unused paths for a replacement key pair.
+
 After forced process termination, a hidden `.nasfs-upload.*` or
 `.nasfs-download.*` staging file may remain. Confirm that the process that
 owned the file has stopped before removing it. The server rejects staging
 names as remote object names. Start a fresh transfer to recover; an incomplete
 staging file carries no publication result.
 
+If key generation is forcibly stopped between the two publications, the
+private key may exist before its corresponding public file. A retry on
+those paths preserves the existing private key and fails. To generate a
+fresh pair, use two unused paths.
+
 ## Testing
+
+The integration tests require Python 3.8 or later.
+
+On Linux with a running systemd user manager, run the optional service test:
+
+```sh
+NASFS_SERVER_BIN="$PWD/build/nasfs_server" NASFS_CLIENT_BIN="$PWD/build/nasfs_client" \
+    tests/test_systemd.sh
+```
 
 Autotools:
 

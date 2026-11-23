@@ -178,6 +178,15 @@ set_tests_properties(
     "NASFS_SERVER_BIN=$<TARGET_FILE:nasfs_server>;NASFS_CLIENT_BIN=$<TARGET_FILE:nasfs_client>"
 )
 
+add_test(NAME integration_lifecycle COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lifecycle.sh)
+set_tests_properties(
+  integration_lifecycle
+  PROPERTIES
+  TIMEOUT 30
+  ENVIRONMENT
+    "NASFS_SERVER_BIN=$<TARGET_FILE:nasfs_server>;NASFS_CLIENT_BIN=$<TARGET_FILE:nasfs_client>"
+)
+
 install(TARGETS nasfs_server nasfs_client
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )

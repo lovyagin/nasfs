@@ -20,82 +20,76 @@ run_with_sudo() {
 }
 
 server_pid() {
-    if [ -f "$PID_FILE" ]; then
-        cat "$PID_FILE"
-        return 0
-    fi
-
-    pgrep -f "$BINARY" 2>/dev/null | head -n 1
+    [ -f "$PID_FILE" ] || return 1
+    IFS= read -r candidate < "$PID_FILE" || return 1
+    case "$candidate" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$candidate" -gt 1 ] 2>/dev/null || return 1
+    command_line=$(ps -p "$candidate" -o args= 2>/dev/null) || return 1
+    [ "$command_line" = "$BINARY $CONFIG" ] || return 1
+    printf '%s\n' "$candidate"
 }
 
 start_server() {
-    if [ -n "$(server_pid)" ] && kill -0 "$(server_pid)" 2>/dev/null; then
-        echo "NASFS server is already running with PID $(server_pid)"
+    if pid=$(server_pid); then
+        echo "NASFS server is already running with PID $pid"
         return 0
     fi
 
     echo "Starting NASFS server..."
-    run_with_sudo mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
-    run_with_sudo sh -c "'$BINARY' '$CONFIG' >>'$LOG_FILE' 2>&1 &"
+    run_with_sudo mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")" || return 1
+    # The positional parameters belong to the inner shell.
+    # shellcheck disable=SC2016
+    run_with_sudo sh -c '"$1" "$2" >>"$3" 2>&1 &' nasfsctl "$BINARY" "$CONFIG" "$LOG_FILE" || return 1
 
-    sleep 2
-    if [ -f "$PID_FILE" ]; then
-        echo "NASFS server started with PID $(cat "$PID_FILE")"
-        return 0
-    fi
-
-    PID="$(server_pid)"
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-        echo "$PID" | run_with_sudo tee "$PID_FILE" >/dev/null
-        echo "NASFS server started with PID $PID"
-        return 0
-    fi
+    count=0
+    while [ "$count" -lt 20 ]; do
+        if pid=$(server_pid); then
+            echo "NASFS server started with PID $pid"
+            return 0
+        fi
+        sleep 0.25
+        count=$((count + 1))
+    done
 
     echo "Failed to start NASFS server"
     return 1
 }
 
 stop_server() {
-    PID="$(server_pid)"
-
-    if [ -z "$PID" ]; then
+    if ! pid=$(server_pid); then
         echo "NASFS server is not running"
-        run_with_sudo rm -f "$PID_FILE"
         return 0
     fi
 
-    echo "Stopping NASFS server (PID: $PID)..."
-    run_with_sudo kill -TERM "$PID" 2>/dev/null || true
-
-    COUNT=0
-    while kill -0 "$PID" 2>/dev/null && [ "$COUNT" -lt 15 ]; do
-        sleep 1
-        COUNT=$((COUNT + 1))
+    echo "Stopping NASFS server (PID: $pid)..."
+    run_with_sudo kill -TERM "$pid" 2>/dev/null || return 1
+    count=0
+    while [ "$count" -lt 60 ]; do
+        current=$(server_pid) || break
+        [ "$current" = "$pid" ] || break
+        sleep 0.25
+        count=$((count + 1))
     done
-
-    if kill -0 "$PID" 2>/dev/null; then
-        echo "Process did not terminate gracefully, sending SIGKILL"
-        run_with_sudo kill -KILL "$PID"
+    if [ "$count" -eq 60 ]; then
+        echo "NASFS server did not stop within 15 seconds" >&2
+        return 1
     fi
-
-    run_with_sudo rm -f "$PID_FILE"
     echo "NASFS server stopped"
 }
 
 status_server() {
-    PID="$(server_pid)"
-
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-        echo "NASFS server is running with PID $PID"
+    if pid=$(server_pid); then
+        echo "NASFS server is running with PID $pid"
         return 0
     fi
 
     echo "NASFS server is not running"
-    run_with_sudo rm -f "$PID_FILE"
     return 1
 }
 
-case "$1" in
+case "${1:-}" in
     start)
         start_server
         ;;
@@ -103,8 +97,7 @@ case "$1" in
         stop_server
         ;;
     restart)
-        stop_server
-        start_server
+        stop_server && start_server
         ;;
     status)
         status_server

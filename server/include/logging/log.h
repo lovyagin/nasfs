@@ -30,7 +30,7 @@ typedef enum log_level {
  * @param log_path The file path where logs should be written.
  * @param min_level The minimum severity level to record.
  */
-void log_init(const char* log_path, log_level_t min_level);
+int log_init(const char* log_path, log_level_t min_level);
 
 /**
  * @brief Writes a formatted log message to a specific stream.

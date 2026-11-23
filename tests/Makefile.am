@@ -1,10 +1,10 @@
 check_PROGRAMS = test_handshake test_config test_auth test_encryption
-TESTS = $(check_PROGRAMS) test_end_to_end.sh test_file_encryption.sh
+TESTS = $(check_PROGRAMS) test_end_to_end.sh test_file_encryption.sh test_lifecycle.sh
 TESTS_ENVIRONMENT = \
 	NASFS_SERVER_BIN="$(top_builddir)/server/nasfs_server" \
 	NASFS_CLIENT_BIN="$(top_builddir)/client/nasfs_client"
 
-EXTRA_DIST = test_end_to_end.sh test_file_encryption.sh integration_helpers.sh
+EXTRA_DIST = test_end_to_end.sh test_file_encryption.sh test_lifecycle.sh integration_helpers.sh test_systemd.sh
 
 AM_CFLAGS = -I$(top_srcdir)/common/include -I$(top_srcdir)/server/include
 

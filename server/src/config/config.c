@@ -79,19 +79,22 @@ int load_config(const char* filename, server_config_t* config) {
         return -1;
       }
     } else if (strcmp(key, "Port") == 0) {
-      if (parse_config_int(value, &config->port) != 0) {
+      if (parse_config_int(value, &config->port) != 0 || config->port < 0 ||
+          config->port > 65535) {
         fprintf(stderr, "Invalid Port value: %s\n", value);
         fclose(file);
         return -1;
       }
     } else if (strcmp(key, "MaxConn") == 0) {
-      if (parse_config_int(value, &config->max_connections) != 0) {
+      if (parse_config_int(value, &config->max_connections) != 0 ||
+          config->max_connections <= 0) {
         fprintf(stderr, "Invalid MaxConn value: %s\n", value);
         fclose(file);
         return -1;
       }
     } else if (strcmp(key, "ClientTimeout") == 0) {
-      if (parse_config_int(value, &config->client_timeout) != 0) {
+      if (parse_config_int(value, &config->client_timeout) != 0 ||
+          config->client_timeout <= 0) {
         fprintf(stderr, "Invalid ClientTimeout value: %s\n", value);
         fclose(file);
         return -1;
@@ -198,7 +201,8 @@ int load_config(const char* filename, server_config_t* config) {
     }
   }
 
-  fclose(file);
+  int failed = ferror(file);
+  if (fclose(file) != 0 || failed) return -1;
   return 0;
 }
 

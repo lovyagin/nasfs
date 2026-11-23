@@ -40,7 +40,7 @@ jobs:
         run: |
           shellcheck autogen.sh
           shellcheck autoclean.sh
-          shellcheck tests/test_end_to_end.sh
+          shellcheck tests/test_end_to_end.sh tests/test_file_encryption.sh tests/test_lifecycle.sh tests/test_systemd.sh
 
   autotools:
     runs-on: ubuntu-24.04
@@ -53,6 +53,13 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: Ensure test runtime dependencies are available
+        run: |
+          if ! command -v python3 >/dev/null || ! command -v openssl >/dev/null; then
+            apt-get update
+            apt-get install -y python3 openssl
+          fi
 
       - name: Configure
         run: |
@@ -84,6 +91,13 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: Ensure test runtime dependencies are available
+        run: |
+          if ! command -v python3 >/dev/null || ! command -v openssl >/dev/null; then
+            apt-get update
+            apt-get install -y python3 openssl
+          fi
 
       - name: Configure
         run: >
@@ -118,6 +132,13 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: Ensure test runtime dependencies are available
+        run: |
+          if ! command -v python3 >/dev/null || ! command -v openssl >/dev/null; then
+            apt-get update
+            apt-get install -y python3 openssl
+          fi
 
       - name: Configure sanitizer build
         run: >

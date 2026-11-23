@@ -23,32 +23,7 @@
  */
 int create_pid_file(const char* pid_file_path);
 
-/**
- * @brief Remove a specific PID file.
- *
- * Deletes the file at the specified path and logs the result.
- *
- * @param pid_file_path The path to the PID file to remove.
- */
-void remove_pid_file(const char* pid_file_path);
-
-/**
- * @brief Store the path of the PID file for later cleanup.
- *
- * Makes a copy of the provided path to be used automatically by
- * cleanup_pid_file() during application shutdown.
- *
- * @param path The path to the PID file to store.
- */
-void set_pid_file_path(const char* path);
-
-/**
- * @brief Clean up the PID file when the program exits.
- *
- * Removes the PID file whose path was previously stored with
- * set_pid_file_path(). This function is intended to be registered with atexit()
- * for automatic cleanup.
- */
+/** Release the process's locked PID file. */
 void cleanup_pid_file(void);
 
 #endif /* PID_FILE_H */

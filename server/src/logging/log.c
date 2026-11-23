@@ -23,21 +23,16 @@ static log_level_t min_level_saved;
 
 /* Initialize the logging module.
    Opens the log file at LOG_PATH and sets the minimum log level to MIN_LEVEL.
-   If the log file cannot be opened, logs a warning to stderr and stdout.  */
-void log_init(const char* log_path, log_level_t min_level) {
+   Returns an error if the log file cannot be opened. */
+int log_init(const char* log_path, log_level_t min_level) {
+  if (!log_path) return -1;
   FILE* log_file = fopen(log_path, "a");
-  if (!log_file) {
-    fprintf(stderr, "Failed to open log file '%s'\n", log_path);
-    fprintf(stdout,
-            "WARNING!!! Logging only to stdout\nTo fix this "
-            "issue, ensure that the log file path is correct "
-            "and that the server has write permissions.\n");
-  }
-  min_level_saved = min_level;
+  if (!log_file) return -1;
+  if (fclose(log_file) != 0) return -1;
   log_path_saved = strdup(log_path);
-  if (log_file) {
-    fclose(log_file);
-  }
+  if (!log_path_saved) return -1;
+  min_level_saved = min_level;
+  return 0;
 }
 
 /* Convert a log level to its string representation.

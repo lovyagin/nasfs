@@ -85,30 +85,21 @@ int main(int argc, char** argv) {
 
   memset(&global_config, 0, sizeof(global_config));
   if (load_config(config_file, &global_config) != 0) {
-    fprintf(stderr,
-            "Warning: Failed to load config file '%s'. Using defaults.\n",
-            config_file);
-    set_defaults(&global_config);
+    fprintf(stderr, "Failed to load config file '%s'.\n", config_file);
+    free_config(&global_config);
+    return 1;
   }
 
-  log_init(global_config.log_file, global_config.log_level);
+  if (log_init(global_config.log_file, global_config.log_level) != 0) {
+    fprintf(stderr, "Failed to initialize configured log file\n");
+    free_config(&global_config);
+    return 1;
+  }
   log_all(LOG_INFO, "Starting NASFS server...");
 
   if (global_config.daemon_mode) {
     log_all(LOG_INFO, "Daemonizing process...");
     daemonize();
-  }
-
-  if (global_config.pid_file && strlen(global_config.pid_file) > 0) {
-    if (create_pid_file(global_config.pid_file) == 0) {
-      set_pid_file_path(global_config.pid_file);
-      atexit(cleanup_pid_file);
-    } else {
-      log_all(LOG_ERROR, "Failed to create PID file: %s",
-              global_config.pid_file);
-      exit_code = 1;
-      goto cleanup;
-    }
   }
 
   nasfs_storage_t storage;
@@ -167,6 +158,15 @@ int main(int argc, char** argv) {
     exit_code = 1;
     goto close_handles;
   }
+  if (global_config.pid_file && strlen(global_config.pid_file) > 0) {
+    if (create_pid_file(global_config.pid_file) != 0) {
+      log_all(LOG_ERROR, "Failed to create PID file: %s",
+              global_config.pid_file);
+      exit_code = 1;
+      goto close_handles;
+    }
+  }
+
   log_all(LOG_INFO, "nasfs_server listening on %s:%d...", bind_addr,
           ntohs(bound_addr.sin_port));
 
@@ -185,6 +185,7 @@ close_handles:
   nasfs_storage_close(&storage);
 
 cleanup:
+  cleanup_pid_file();
   free_config(&global_config);
   return exit_code;
 }
