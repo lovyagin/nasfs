@@ -1,53 +1,21 @@
 #!/usr/bin/env bash
 
 # autoclean.sh -- Deep clean script for NASFS project
-# Removes all build artifacts, generated files, and temporary data.
+# Removes generated files from a source-tree build.
 
 set -euo pipefail
 
 echo "Starting aggressive project cleanup..."
 
-# 1. Remove Autotools generated files
-echo "Cleaning Autotools..."
-rm -rf autom4te.cache/ m4/
+# Use the generated makefiles for source-tree build products.
+if [[ -f Makefile && -x config.status ]]; then
+    "${MAKE:-make}" distclean
+fi
+
+# Leave separate build trees, runtime directories and local m4 macros intact.
+rm -rf autom4te.cache/
 rm -f aclocal.m4 configure config.h.in config.h.in~ stamp-h1
 rm -f ar-lib compile config.guess config.sub depcomp install-sh ltmain.sh missing test-driver
-rm -f utils/nasfsctl
-
-# Remove generated Makefiles and dependencies recursively
-find . -name "Makefile.in" -type f -delete
-find . -name "Makefile" -type f -delete
-find . -name ".deps" -type d -exec rm -rf {} +
-find . -name ".libs" -type d -exec rm -rf {} +
-find . -name "*.o" -type f -delete
-find . -name "*.lo" -type f -delete
-find . -name "*.la" -type f -delete
-find . -name "*.a" -type f -delete
-find . -name "*.dirstamp" -type f -delete
-
-# 2. Remove CMake artifacts
-echo "Cleaning CMake..."
-rm -rf CMakeFiles/ CMakeCache.txt cmake_install.cmake install_manifest.txt CTestTestfile.cmake
-rm -rf _CPack_Packages/ CPackConfig.cmake CPackSourceConfig.cmake
-rm -rf build*/ out/ bin/
-
-# 3. Remove runtime data and logs
-echo "Cleaning logs and storage..."
-rm -f nasfs.log nasfs.pid
-rm -rf storage/
-rm -f config.log config.status config.h
-
-# 4. Remove test artifacts
-echo "Cleaning test workspace..."
-rm -rf tests/workspace/
-find tests/ -name "*.log" -type f -delete
-find tests/ -name "*.trs" -type f -delete
-
-# 5. Remove misc temporary files
-echo "Cleaning temporary files..."
-find . -name "*.tmp" -type f -delete
-find . -name "*.bak" -type f -delete
-find . -name "*~" -type f -delete
-find . -name ".DS_Store" -type f -delete
+rm -f Makefile.in common/Makefile.in server/Makefile.in client/Makefile.in tests/Makefile.in
 
 echo "Project is clean."

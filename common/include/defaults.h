@@ -1,0 +1,6 @@
+#ifndef NASFS_DEFAULTS_H
+#define NASFS_DEFAULTS_H
+
+#define NASFS_DEFAULT_PORT 5252
+
+#endif

@@ -54,17 +54,14 @@ Environment=LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
 KEYS
 cp -p "$installed_config" "$TEST_ROOT/installed.conf"
 config_saved=1
-cat > "$installed_config" <<CONFIG
-ListenAddr 127.0.0.1
-Port 0
-LogFile $LOG_DIR/server.log
-LogLevel Debug
-DaemonMode Yes
-PidFile $pid_file
-StorageDir $storage_dir
-AuthMethods password
-AuthPassword integration-password
-CONFIG
+if grep -Eq '^AuthPassword[[:space:]]' "$TEST_ROOT/installed.conf"; then exit 1; fi
+grep -Fxq 'AuthMethods publickey' "$TEST_ROOT/installed.conf"
+grep -Eq '^Port 5252([[:space:]]|$)' "$TEST_ROOT/installed.conf"
+"$CLIENT_BIN" keygen "$TEST_ROOT/client.key" "$TEST_ROOT/authorized_keys" ML-DSA-65
+sed -e 's/^ListenAddr .*/ListenAddr 127.0.0.1/' \
+    -e "s|^LogFile .*|LogFile $LOG_DIR/server.log|" \
+    -e "s|^AuthorizedKeysFile .*|AuthorizedKeysFile $TEST_ROOT/authorized_keys|" \
+    "$TEST_ROOT/installed.conf" > "$installed_config"
 systemctl --user daemon-reload
 systemctl --user start "$unit"
 
@@ -80,14 +77,23 @@ check_instance() {
 }
 check_instance
 printf 'NASFS systemd integration\n' > "$TEST_ROOT/source.bin"
-export NASFS_AUTH_PASSWORD=integration-password NASFS_ENCRYPTION_KEY=integration-file-secret
+export NASFS_AUTH_METHOD=publickey NASFS_IDENTITY_FILE="$TEST_ROOT/client.key"
+export NASFS_ENCRYPTION_KEY=integration-file-secret
+unset NASFS_SERVER_PORT
 "$CLIENT_BIN" put "$TEST_ROOT/source.bin" service.bin
 first_pid=$(cat "$pid_file")
 systemctl --user restart "$unit"
 check_instance
+unset NASFS_SERVER_PORT
 test "$(cat "$pid_file")" != "$first_pid"
 "$CLIENT_BIN" get service.bin "$TEST_ROOT/result.bin"
 cmp "$TEST_ROOT/source.bin" "$TEST_ROOT/result.bin"
+if NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=nasfs \
+    "$CLIENT_BIN" get service.bin "$TEST_ROOT/rejected.bin" > "$LOG_DIR/rejected.log" 2>&1; then
+    exit 1
+fi
+grep -Fq 'Authentication failed' "$LOG_DIR/rejected.log"
+test ! -e "$TEST_ROOT/rejected.bin"
 systemctl --user stop "$unit"
 if systemctl --user is-active --quiet "$unit"; then exit 1; fi
 test ! -e "$pid_file"

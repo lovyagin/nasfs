@@ -19,6 +19,7 @@
 #include <uv.h>
 
 #include "config/config.h"
+#include "defaults.h"
 #include "logging/log.h"
 #include "network/session.h"
 #include "protocol.h"
@@ -137,7 +138,7 @@ int main(int argc, char** argv) {
   struct sockaddr_in addr;
   const char* bind_addr =
       global_config.bind_address ? global_config.bind_address : "0.0.0.0";
-  int port = global_config.port >= 0 ? global_config.port : 8080;
+  int port = global_config.port >= 0 ? global_config.port : NASFS_DEFAULT_PORT;
 
   int max_conn =
       global_config.max_connections > 0 ? global_config.max_connections : 128;

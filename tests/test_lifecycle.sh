@@ -218,7 +218,8 @@ kill -TERM "$SERVER_PID"
 wait "$SERVER_PID"
 SERVER_PID=
 test ! -e "$LOG_DIR/server.pid"
-if NASFS_ENCRYPTION_KEY=lifecycle-file-secret "$CLIENT_BIN" put "$TEST_ROOT/absent" \
+if NASFS_AUTH_PASSWORD=lifecycle-login-password NASFS_ENCRYPTION_KEY=lifecycle-file-secret \
+    "$CLIENT_BIN" put "$TEST_ROOT/absent" \
     > "$LOG_DIR/client_offline.log" 2>&1; then
     exit 1
 fi

@@ -6,9 +6,11 @@
 
 #define NASFS_STORAGE_NAME_MAX 255
 #define NASFS_UPLOAD_TEMP_SIZE 64
+#define NASFS_STORAGE_SERVICE_DIR ".nasfs"
 
 typedef struct {
   int root_fd;
+  int service_fd;
   int uploads_locked;
 } nasfs_storage_t;
 

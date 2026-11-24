@@ -52,8 +52,3 @@ install-data-local:
 	$(MKDIR_P) $(DESTDIR)$(localstatedir)/log/nasfs
 	chmod 755 $(DESTDIR)$(localstatedir)/run/nasfs
 	chmod 755 $(DESTDIR)$(localstatedir)/log/nasfs
-
-# Hook into distclean to run our more aggressive cleanup script
-distclean-local:
-	@echo "Running aggressive cleanup..."
-	$(abs_top_srcdir)/autoclean.sh

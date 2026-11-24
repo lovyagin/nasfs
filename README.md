@@ -103,6 +103,10 @@ For staged install verification:
 cmake --install build --prefix "$PWD/install-root"
 ```
 
+`make distclean` cleans Autotools outputs. The optional `./autoclean.sh`
+removes generated source-tree bootstrap files and leaves runtime data and
+separate build directories in place.
+
 ## Installed layout
 
 Default install targets:
@@ -125,6 +129,11 @@ Default PID file:
 ```
 
 ## Configuration
+
+The server and client default to TCP port 5252. Set `Port` on the server
+and `NASFS_SERVER_PORT` on the client to use another port. The installed
+config enables public-key login. Password and PAKE login require an explicit,
+nonempty `AuthPassword` and a corresponding `AuthMethods` entry.
 
 The default server config is installed as:
 
@@ -166,7 +175,7 @@ PidFile /usr/local/var/run/nasfs/nasfs-server.pid
 KexAlgorithms ML-KEM-512,Kyber512,ML-KEM-768,Kyber768
 CipherAlgorithms xchacha20poly1305
 AuthMethods password,publickey,password+publickey
-AuthPassword nasfs
+AuthPassword change-me
 AuthorizedKeysFile /usr/local/etc/nasfs/authorized_keys
 PubKeyAuthAlgorithms ML-DSA-65,ML-DSA-44
 ```
@@ -292,12 +301,15 @@ sudo systemctl start nasfs
 sudo systemctl status nasfs
 ```
 
-At startup, NASFS removes abandoned staging files when it can lock the
-storage directory exclusively. If another NASFS process is using the same
+Server staging files and the publication lock live in a private `.nasfs/`
+directory inside `StorageDir`, on the same filesystem as the objects.
+PUT and GET reserve that name and its case variants. At startup, NASFS
+removes abandoned staging files when it can lock the service directory
+exclusively. If another NASFS process is using the same
 directory, cleanup waits for a later startup with no other NASFS process
 running. On NFS mounts detected by Linux or macOS, and where exclusive
 locking is unavailable, startup cleanup is skipped. On detected NFS
-mounts, or if shared locking fails, the server uses `.nasfs-upload.unlocked.*` staging
+mounts, or if shared locking fails, the server uses `.nasfs/.nasfs-upload.unlocked.*` staging
 names that are excluded from automatic cleanup. Remove abandoned files
 with that prefix only after stopping all servers using the directory.
 If cleanup cannot remove an orphan, the server logs a warning and continues
@@ -325,7 +337,7 @@ PUT requires a storage directory owned by the server account, with no
 group or other write permission. On macOS it also requires the directory
 to have no extended ACL. NASFS supports replacement on local macOS
 filesystems and on Linux ext2/3/4, XFS, Btrfs, tmpfs, OverlayFS and F2FS.
-It serializes its publishers with `.nasfs-publish.lock` from the destination checks through
+It serializes its publishers with `.nasfs/.nasfs-publish.lock` from the destination checks through
 the atomic rename. Replacement requires a regular file owned by the
 server account with owner write permission and effective write access.
 On macOS, a target with an extended ACL is protected from replacement as
@@ -424,8 +436,8 @@ openssl pkey -in server-key.pem -pubout -outform DER | tail -c 32 > server.pub
 
 Keep the PEM private along with the seed. Deliver the raw public key to the
 client over an independently trusted channel. For a server at
-`192.0.2.10:8080`, install it as
-`~/.nasfs/server-192.0.2.10-8080.pub` under the client account. To rotate
+`192.0.2.10:5252`, install it as
+`~/.nasfs/server-192.0.2.10-5252.pub` under the client account. To rotate
 the identity, verify the replacement public key independently and atomically
 replace the endpoint's pin. The CLI reads the pin on each invocation and
 requires a valid signature and key-exchange confirmation before sending AUTH
@@ -437,10 +449,11 @@ file. It rejects a second process using the same PID file. `ClientTimeout`
 sets the server's idle session timeout in seconds. Key generation creates
 new destination files, so choose unused paths for a replacement key pair.
 
-After forced process termination, a hidden `.nasfs-upload.*` or
+After forced process termination, a hidden `.nasfs/.nasfs-upload.*` or
 `.nasfs-download.*` staging file may remain. Confirm that the process that
 owned the file has stopped before removing it. The server rejects staging
-names as remote object names. Start a fresh transfer to recover; an incomplete
+names as remote object names. Root-level staging files from older versions
+can be removed manually after all old server instances have stopped. Start a fresh transfer to recover; an incomplete
 staging file carries no publication result.
 
 If key generation is forcibly stopped between the two publications, the

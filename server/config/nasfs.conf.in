@@ -23,8 +23,9 @@ KexAlgorithms ML-KEM-512,Kyber512,ML-KEM-768,Kyber768
 CipherAlgorithms xchacha20poly1305
 
 # Authentication
-AuthMethods password,publickey,password+publickey
-AuthPassword nasfs
+AuthMethods publickey
+# To enable password or PAKE, configure AuthMethods and set AuthPassword.
+# AuthPassword
 AuthorizedKeysFile @NASFS_SYSCONFDIR@/authorized_keys
 PubKeyAuthAlgorithms ML-DSA-65,ML-DSA-44
 

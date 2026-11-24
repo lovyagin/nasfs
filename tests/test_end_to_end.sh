@@ -270,7 +270,15 @@ test -f "$TEST_DIR/empty_output.bin"
 test ! -s "$TEST_DIR/empty_output.bin"
 
 expect_client_failure "$LOG_DIR/client_duplicate_destination.log" "Duplicate batch destination" \
-    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mget x/file y/file
+    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mget x/file x/file
+expect_client_failure "$LOG_DIR/client_duplicate_upload.log" "Duplicate batch destination" \
+    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mput x/file y/file
+mkdir "$TEST_DIR/first-destination" "$TEST_DIR/second-destination"
+run_client "$LOG_DIR/client_distinct_destinations.log" "ML-KEM-512" "password" \
+    "e2e-password" "" "ML-DSA-65" mget "$TEST_DIR/first-destination/$REMOTE_NAME" \
+    "$TEST_DIR/second-destination/$REMOTE_NAME"
+cmp "$TEST_INPUT" "$TEST_DIR/first-destination/$REMOTE_NAME"
+cmp "$TEST_INPUT" "$TEST_DIR/second-destination/$REMOTE_NAME"
 too_many_files=()
 for ((i = 0; i < 513; i++)); do
     too_many_files+=("file-$i")
@@ -327,7 +335,7 @@ test ! -e "$STORAGE_DIR/batch_last.bin"
 run_client "$LOG_DIR/client_batch_first_get.log" "ML-KEM-512" "password" \
     "e2e-password" "" "ML-DSA-65" get "batch_first.bin" "$TEST_DIR/batch_first_get.bin"
 verify_download_hash "$INPUT_HASH" "$TEST_DIR/batch_first_get.bin"
-if compgen -G "$STORAGE_DIR/.nasfs-upload.*" > /dev/null; then
+if compgen -G "$STORAGE_DIR/.nasfs/.nasfs-upload.*" > /dev/null; then
     printf "Temporary upload was not removed.\n" >&2
     exit 1
 fi
@@ -347,6 +355,26 @@ run_client "$LOG_DIR/client_pake_mput.log" "ML-KEM-512" "pake" \
 )
 cmp "$TEST_DIR/batch-input/batch_a.bin" "$TEST_DIR/batch-output/batch_a.bin"
 cmp "$TEST_DIR/batch-input/batch_b.bin" "$TEST_DIR/batch-output/batch_b.bin"
+
+# Leaving AuthPassword unset or clearing it disables password and PAKE.
+for setting in omitted empty; do
+    kill -TERM "$SERVER_PID"
+    wait "$SERVER_PID"
+    SERVER_PID=
+    rm "$LOG_DIR/server.log"
+    if [[ $setting == omitted ]]; then
+        sed '/^AuthPassword /d' "$TEST_DIR/test_server.conf" > "$TEST_DIR/no-password.conf"
+    else
+        cp "$TEST_DIR/test_server.conf" "$TEST_DIR/no-password.conf"
+        printf 'AuthPassword # cleared\n' >> "$TEST_DIR/no-password.conf"
+    fi
+    start_integration_server "$TEST_DIR/no-password.conf"
+    expect_client_failure "$LOG_DIR/client_password_$setting.log" "Authentication failed" \
+        "ML-KEM-512" "password" "nasfs" "" "ML-DSA-65" get "$REMOTE_NAME" "$TEST_OUTPUT"
+    run_client "$LOG_DIR/client_key_$setting.log" "ML-KEM-512" "publickey" "" \
+        "$CLIENT_KEY" "ML-DSA-65" get "$REMOTE_NAME" "$TEST_OUTPUT"
+    verify_download_hash "$INPUT_HASH" "$TEST_OUTPUT"
+done
 
 printf "${YELLOW}%s${NC}\n" "=============================================="
 printf "${GREEN}%s${NC}\n" "    SUCCESS: All tests passed!               "

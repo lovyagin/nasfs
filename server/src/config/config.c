@@ -6,6 +6,7 @@
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
+
 #endif
 
 #include <ctype.h>
@@ -15,6 +16,7 @@
 #include <string.h>
 
 #include "config/config.h"
+#include "defaults.h"
 
 server_config_t global_config;
 
@@ -68,7 +70,13 @@ int load_config(const char* filename, server_config_t* config) {
     if (!key) continue;
 
     char* value = strtok(NULL, " \t#");
-    if (!value) continue;
+    if (!value) {
+      if (strcmp(key, "AuthPassword") == 0) {
+        free(config->auth_password);
+        config->auth_password = NULL;
+      }
+      continue;
+    }
 
     if (strcmp(key, "ListenAddr") == 0) {
       free(config->bind_address);
@@ -227,7 +235,7 @@ int load_config(const char* filename, server_config_t* config) {
    no configuration file is available or when options are not specified.  */
 void set_defaults(server_config_t* config) {
   config->bind_address = strdup("127.0.0.1");
-  config->port = 8080;
+  config->port = NASFS_DEFAULT_PORT;
   config->max_connections = 10;
   config->client_timeout = 30;
   config->log_file = strdup("/var/log/nasfs-server.log");
@@ -238,7 +246,7 @@ void set_defaults(server_config_t* config) {
   config->kex_algorithms = strdup("ML-KEM-512,Kyber512,ML-KEM-768,Kyber768");
   config->cipher_algorithms = strdup("xchacha20poly1305");
   config->auth_methods = strdup("password,publickey,password+publickey");
-  config->auth_password = strdup("nasfs");
+  config->auth_password = NULL;
   config->authorized_keys_file = strdup("/usr/local/etc/nasfs/authorized_keys");
   config->pubkey_auth_algorithms = strdup("ML-DSA-65,ML-DSA-44");
   config->block_size = 65536;

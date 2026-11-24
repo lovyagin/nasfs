@@ -127,40 +127,82 @@ static int is_private_directory(int fd) {
          (st.st_mode & (S_IWGRP | S_IWOTH)) == 0 && has_private_permissions(fd);
 }
 
+static int open_service_directory(int root) {
+  if (!is_private_directory(root)) return -1;
+  if (mkdirat(root, NASFS_STORAGE_SERVICE_DIR, 0700) < 0 && errno != EEXIST)
+    return -1;
+
+  int fd = openat(root, NASFS_STORAGE_SERVICE_DIR,
+                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return -1;
+
+  struct stat root_stat, service_stat;
+  if (fstat(root, &root_stat) == 0 && fstat(fd, &service_stat) == 0 &&
+      service_stat.st_dev == root_stat.st_dev &&
+      service_stat.st_uid == geteuid() && (service_stat.st_mode & 077u) == 0 &&
+      has_private_permissions(fd))
+    return fd;
+
+  close(fd);
+  return -1;
+}
+
 int nasfs_storage_init(nasfs_storage_t* storage, const char* directory) {
+  storage->service_fd = -1;
   storage->root_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (storage->root_fd < 0) return uv_translate_sys_error(errno);
 
   storage->uploads_locked = 0;
+  storage->service_fd = open_service_directory(storage->root_fd);
+  if (storage->service_fd < 0) {
+    log_all(LOG_WARNING,
+            "Private storage service directory unavailable in '%s'", directory);
+    return 0;
+  }
+
   // NFS can use client-local locks or share storage with local writers.
   if (!can_coordinate_uploads(storage->root_fd)) return 0;
 
   // A directory opened read-only may only support shared locks.
   // Only sweep under an exclusive lock, and only use sweepable names while
   // holding a shared lock for the lifetime of all uploads.
-  if (flock(storage->root_fd, LOCK_EX | LOCK_NB) == 0) {
-    int rc = sweep_uploads(storage->root_fd);
+  if (flock(storage->service_fd, LOCK_EX | LOCK_NB) == 0) {
+    int rc = sweep_uploads(storage->service_fd);
     if (rc < 0)
       log_all(LOG_WARNING, "Could not complete orphan cleanup in '%s': %s",
               directory, uv_strerror(rc));
   }
-  storage->uploads_locked = flock(storage->root_fd, LOCK_SH) == 0;
+  storage->uploads_locked = flock(storage->service_fd, LOCK_SH) == 0;
   return 0;
 }
 
 void nasfs_storage_close(nasfs_storage_t* storage) {
+  if (storage->service_fd >= 0) close(storage->service_fd);
+  storage->service_fd = -1;
   if (storage->root_fd >= 0) close(storage->root_fd);
   storage->root_fd = -1;
+}
+
+static int has_ascii_prefix(const uint8_t* name, size_t length,
+                            const char* prefix) {
+  for (size_t i = 0; prefix[i]; i++) {
+    if (i == length) return 0;
+    uint8_t ch = name[i];
+    if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+    if (ch != (uint8_t)prefix[i]) return 0;
+  }
+  return 1;
 }
 
 static int is_flat_name(const uint8_t* name, size_t length) {
   return length != 0 && length <= NASFS_STORAGE_NAME_MAX &&
          !(length == 1 && name[0] == '.') &&
          !(length == 2 && name[0] == '.' && name[1] == '.') &&
-         !(length >= sizeof(upload_prefix) - 1 &&
-           memcmp(name, upload_prefix, sizeof(upload_prefix) - 1) == 0) &&
+         !(length == sizeof(NASFS_STORAGE_SERVICE_DIR) - 1 &&
+           has_ascii_prefix(name, length, NASFS_STORAGE_SERVICE_DIR)) &&
          !(length == sizeof(publication_lock) - 1 &&
-           memcmp(name, publication_lock, length) == 0) &&
+           has_ascii_prefix(name, length, publication_lock)) &&
+         !has_ascii_prefix(name, length, upload_prefix) &&
          !memchr(name, '/', length) && !memchr(name, '\\', length) &&
          !memchr(name, '\0', length);
 }
@@ -197,7 +239,8 @@ int nasfs_storage_open_object(const nasfs_storage_t* storage,
 
 int nasfs_storage_begin_upload(const nasfs_storage_t* storage,
                                char temp_name[NASFS_UPLOAD_TEMP_SIZE]) {
-  if (!is_private_directory(storage->root_fd)) return UV_EACCES;
+  if (storage->service_fd < 0 || !is_private_directory(storage->root_fd))
+    return UV_EACCES;
 
   char candidate[NASFS_UPLOAD_TEMP_SIZE];
   const char* prefix =
@@ -209,7 +252,7 @@ int nasfs_storage_begin_upload(const nasfs_storage_t* storage,
     randombytes_buf(random_id, sizeof(random_id));
     sodium_bin2hex(candidate + prefix_len, sizeof(candidate) - prefix_len,
                    random_id, sizeof(random_id));
-    int fd = openat(storage->root_fd, candidate,
+    int fd = openat(storage->service_fd, candidate,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd >= 0) {
       snprintf(temp_name, NASFS_UPLOAD_TEMP_SIZE, "%s", candidate);
@@ -222,7 +265,8 @@ int nasfs_storage_begin_upload(const nasfs_storage_t* storage,
 
 // Called with an exclusive publication lock. Local writers must use the
 // same lock or keep the server stopped while administering the storage.
-static int replace_upload(int root, const char* temp_name, const char* name) {
+static int replace_upload(int root, int service, const char* temp_name,
+                          const char* name) {
   struct stat st;
   if (fstatat(root, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
     if (!S_ISREG(st.st_mode)) return UV_EINVAL;
@@ -240,7 +284,7 @@ static int replace_upload(int root, const char* temp_name, const char* name) {
     return uv_translate_sys_error(errno);
   }
 
-  if (renameat(root, temp_name, root, name) < 0)
+  if (renameat(service, temp_name, root, name) < 0)
     return uv_translate_sys_error(errno);
   return 0;
 }
@@ -258,11 +302,12 @@ int nasfs_storage_publish_upload(const nasfs_storage_t* storage,
                                  const char* temp_name, const char* name) {
   if (!is_flat_name((const uint8_t*)name, strlen(name))) return UV_EINVAL;
   int root = storage->root_fd;
-  if (!is_private_directory(root)) return UV_EACCES;
+  int service = storage->service_fd;
+  if (service < 0 || !is_private_directory(root)) return UV_EACCES;
 
   if (!can_replace_uploads(root)) {
     // On shared filesystems, atomically create the name without overwriting.
-    if (linkat(root, temp_name, root, name, 0) < 0)
+    if (linkat(service, temp_name, root, name, 0) < 0)
       return uv_translate_sys_error(errno);
     int rc = nasfs_storage_discard_upload(storage, temp_name);
     if (rc < 0)
@@ -271,7 +316,7 @@ int nasfs_storage_publish_upload(const nasfs_storage_t* storage,
     return 0;
   }
 
-  int lock = open_publication_lock(root);
+  int lock = open_publication_lock(service);
   if (lock < 0) return uv_translate_sys_error(errno);
   struct stat st;
   int rc = 0;
@@ -282,8 +327,9 @@ int nasfs_storage_publish_upload(const nasfs_storage_t* storage,
     rc = UV_EACCES;
   }
   if (rc == 0) {
-    rc = flock(lock, LOCK_EX) < 0 ? uv_translate_sys_error(errno)
-                                  : replace_upload(root, temp_name, name);
+    rc = flock(lock, LOCK_EX) < 0
+             ? uv_translate_sys_error(errno)
+             : replace_upload(root, service, temp_name, name);
   }
   close(lock);
   return rc;
@@ -291,7 +337,7 @@ int nasfs_storage_publish_upload(const nasfs_storage_t* storage,
 
 int nasfs_storage_discard_upload(const nasfs_storage_t* storage,
                                  const char* temp_name) {
-  if (unlinkat(storage->root_fd, temp_name, 0) < 0 && errno != ENOENT)
+  if (unlinkat(storage->service_fd, temp_name, 0) < 0 && errno != ENOENT)
     return uv_translate_sys_error(errno);
   return 0;
 }

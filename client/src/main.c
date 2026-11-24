@@ -32,6 +32,7 @@
 
 #include "auth.h"
 #include "crypto_engine.h"
+#include "defaults.h"
 #include "handshake.h"
 #include "pake.h"
 #include "protocol.h"
@@ -274,7 +275,7 @@ const char* client_auth_method = NASFS_AUTH_METHOD_PASSWORD;
 static uint8_t pake_x[32]; /* client ephemeral scalar */
 static uint8_t pake_w[32]; /* password scalar */
 const char* client_auth_user = "user";
-const char* client_auth_password = "nasfs";
+const char* client_auth_password;
 const char* client_identity_file = NULL;
 const char* client_auth_sig_algorithm = NASFS_AUTH_DEFAULT_SIG_ALGORITHM;
 char* negotiated_kex_algorithm = NULL;
@@ -299,11 +300,10 @@ uint64_t expected_plaintext_size = 0; /* expected size announced in GET_ACK */
 nasfs_cipher_algo_t file_cipher_algo = NASFS_CIPHER_XSALSA20_POLY1305;
 nasfs_hash_algo_t file_hash_algo = NASFS_HASH_BLAKE2B;
 
-#define SERVER_PORT 8080
 #define SERVER_IP "127.0.0.1"
 
 const char* client_server_ip = SERVER_IP;
-int client_server_port = SERVER_PORT;
+int client_server_port = NASFS_DEFAULT_PORT;
 
 /* Forward Declarations */
 void send_command(uv_stream_t* stream, nasfs_cmd_type_t cmd,
@@ -1886,9 +1886,12 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Invalid NASFS_AUTH_METHOD: %s\n", client_auth_method);
     return 1;
   }
-  if (strcmp(client_auth_method, NASFS_AUTH_METHOD_PAKE) == 0 &&
+  if ((auth_method_requires_password(client_auth_method) ||
+       strcmp(client_auth_method, NASFS_AUTH_METHOD_PAKE) == 0) &&
       (!client_auth_password || client_auth_password[0] == '\0')) {
-    fprintf(stderr, "NASFS_AUTH_PASSWORD required for PAKE authentication\n");
+    fprintf(stderr,
+            "NASFS_AUTH_PASSWORD required for the selected authentication "
+            "method\n");
     return 1;
   }
 
@@ -1909,24 +1912,26 @@ int main(int argc, char** argv) {
     int uploading = strcmp(argv[1], "mput") == 0;
     for (int i = 2; i < argc; i++) {
       const char* name = get_basename(argv[i]);
+      const char* requested_dest = uploading ? name : argv[i];
       for (int j = 0; j < batch_count; j++) {
         const char* dest =
             uploading ? batch_queue[j].remote_name : batch_queue[j].local_path;
-        if (strcmp(name, dest) == 0) {
-          fprintf(stderr, "Duplicate batch destination: %s\n", name);
+        if (strcmp(requested_dest, dest) == 0) {
+          fprintf(stderr, "Duplicate batch destination: %s\n", requested_dest);
           return 1;
         }
       }
       batch_queue[batch_count++] =
           uploading ? (nasfs_batch_op_t){OP_PUT, argv[i], name}
-                    : (nasfs_batch_op_t){OP_GET, name, argv[i]};
+                    : (nasfs_batch_op_t){OP_GET, argv[i], name};
     }
   } else {
     fprintf(stderr, "Invalid operation. Use put, get, mput, or mget.\n");
     return 1;
   }
 
-  if (strcmp(env_encryption_key, client_auth_password) == 0) {
+  if (client_auth_password &&
+      strcmp(env_encryption_key, client_auth_password) == 0) {
     fprintf(stderr,
             "File encryption password must differ from the login password\n");
     return 1;

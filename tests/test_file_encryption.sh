@@ -15,6 +15,7 @@ CLIENT_BIN="${NASFS_CLIENT_BIN:-$ROOT_DIR/build/nasfs_client}"
 # shellcheck source-path=SCRIPTDIR
 source "$(dirname "${BASH_SOURCE[0]}")/integration_helpers.sh"
 setup_integration
+staging_dir="$STORAGE_DIR/.nasfs"
 
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -620,13 +621,28 @@ crash_server_during_put() {
 crash_server_during_put crash-before
 cmp "$TEST_INPUT" "$TEST_ROOT/crash-recovery.bin"
 # The crash test checks for staging before restart. Recovery removes it.
-test -z "$(find "$STORAGE_DIR" -maxdepth 1 -name '.nasfs-upload.*' -print)"
+test -z "$(find "$staging_dir" -maxdepth 1 -name '.nasfs-upload.*' -print)"
 if transfer get .nasfs-upload.reserved "$TEST_ROOT/unpublished.bin" \
     > "$LOG_DIR/orphan_get.log" 2>&1; then
     exit 1
 fi
 grep -Fq 'Invalid file name' "$LOG_DIR/orphan_get.log"
 test ! -e "$TEST_ROOT/unpublished.bin"
+
+# Reject the service namespace even when the filesystem folds case.
+for name in .nasfs .NASFS .NaSfS .NASFS/.nasfs-publish.lock .NASFS-PUBLISH.LOCK; do
+    if transfer get "$name" "$TEST_ROOT/service-get.bin" > "$LOG_DIR/service-get.log" 2>&1; then
+        exit 1
+    fi
+    grep -Fq 'Invalid file name' "$LOG_DIR/service-get.log"
+    if transfer put "$TEST_INPUT" "$name" > "$LOG_DIR/service-put.log" 2>&1; then
+        exit 1
+    fi
+    grep -Fq 'Invalid file name' "$LOG_DIR/service-put.log"
+done
+test -d "$staging_dir"
+test -f "$staging_dir/.nasfs-publish.lock"
+test ! -e "$TEST_ROOT/service-get.bin"
 
 crash_server_during_put crash-after
 cmp "$TEST_ROOT/replacement.bin" "$TEST_ROOT/crash-recovery.bin"
@@ -710,7 +726,7 @@ if transfer put "$TEST_INPUT" encrypted_remote.bin > "$LOG_DIR/server_short_writ
     exit 1
 fi
 deadline=$((SECONDS + 5))
-while compgen -G "$STORAGE_DIR/.nasfs-upload.*" >/dev/null; do
+while compgen -G "$staging_dir/.nasfs-upload.*" >/dev/null; do
     test "$SECONDS" -lt "$deadline"
     sleep 0.02
 done
@@ -746,14 +762,14 @@ os.execve(server, [server, *sys.argv[1:]], env)
 PYTHON
     chmod +x "$TEST_ROOT/fault-server"
     readonly_orphan=.nasfs-upload.00000000000000000000000000000000
-    printf 'abandoned staging file\n' > "$STORAGE_DIR/$readonly_orphan"
+    printf 'abandoned staging file\n' > "$staging_dir/$readonly_orphan"
     NASFS_TEST_READONLY_ORPHAN="$readonly_orphan" SERVER_BIN="$TEST_ROOT/fault-server" \
         start_integration_server "$TEST_ROOT/server-restarted.conf"
     cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
     transfer get encrypted_remote.bin "$TEST_ROOT/readonly-get.bin"
     cmp "$TEST_INPUT" "$TEST_ROOT/readonly-get.bin"
     grep -Fq 'Could not complete orphan cleanup' "$LOG_DIR/server.log"
-    grep -Fxq 'abandoned staging file' "$STORAGE_DIR/$readonly_orphan"
+    grep -Fxq 'abandoned staging file' "$staging_dir/$readonly_orphan"
     kill -TERM "$SERVER_PID"
     wait "$SERVER_PID"
     SERVER_PID=
@@ -772,7 +788,7 @@ PYTHON
     grep -Fq 'File close failed' "$LOG_DIR/server.log"
     grep -Fq 'Server could not publish' "$LOG_DIR/server_close.log"
     test "$(hash_file "$SERVER_STORED_FILE")" = "$before"
-    test -z "$(find "$STORAGE_DIR" -maxdepth 1 -name '.nasfs-upload.*' -print)"
+    test -z "$(find "$staging_dir" -maxdepth 1 -name '.nasfs-upload.*' -print)"
 
     kill -TERM "$SERVER_PID"
     wait "$SERVER_PID"
@@ -840,7 +856,7 @@ PYTHON
     wait "$SERVER_PID"
     SERVER_PID=
     test ! -e "$LOG_DIR/server.pid"
-    test -z "$(find "$STORAGE_DIR" -maxdepth 1 -name '.nasfs-upload.*' -print)"
+    test -z "$(find "$staging_dir" -maxdepth 1 -name '.nasfs-upload.*' -print)"
     test "$(hash_file "$SERVER_STORED_FILE")" = "$before"
 
     for read_phase in read prefix; do
@@ -883,7 +899,7 @@ PYTHON
         SERVER_PID=
         rm "$LOG_DIR/server.log"
         test "$(hash_file "$SERVER_STORED_FILE")" = "$before"
-        test -z "$(find "$STORAGE_DIR" -maxdepth 1 -name '.nasfs-upload.*' -print)"
+        test -z "$(find "$staging_dir" -maxdepth 1 -name '.nasfs-upload.*' -print)"
     done
 
     NASFS_TEST_OPEN_SUBMISSION_ERROR=1 SERVER_BIN="$TEST_ROOT/fault-server" \
@@ -917,7 +933,7 @@ PYTHON
         wait "$SERVER_PID"
         SERVER_PID=
         test ! -e "$LOG_DIR/server.pid"
-        test -z "$(find "$STORAGE_DIR" -maxdepth 1 -name '.nasfs-upload.*' -print)"
+        test -z "$(find "$staging_dir" -maxdepth 1 -name '.nasfs-upload.*' -print)"
         rm "$LOG_DIR/server.log"
     done
     start_integration_server "$TEST_ROOT/server-restarted.conf"
@@ -934,7 +950,7 @@ PYTHON
         rm -f "$TEST_ROOT/release-rename"
         if [[ $lock_mode == all ]]; then
             scenario=publication-without-lock
-            touch "$STORAGE_DIR/.nasfs-upload.00000000000000000000000000000000"
+            touch "$staging_dir/.nasfs-upload.00000000000000000000000000000000"
         fi
         NASFS_TEST_DIRECTORY_LOCK_ERROR="$lock_mode" \
             NASFS_TEST_RENAME_GATE="$TEST_ROOT/release-rename" SERVER_BIN="$TEST_ROOT/fault-server" \

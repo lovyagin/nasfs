@@ -188,6 +188,7 @@ def main():
     client, root, storage, source, server_pid, *mode = sys.argv[1:]
     client = str(Path(client).resolve())
     root, storage, source = Path(root), Path(storage), Path(source)
+    staging = storage / ".nasfs"
     upstream_port = int(os.environ["NASFS_SERVER_PORT"])
     remote = "encrypted_remote.bin"
     destination = root / "interrupted.bin"
@@ -215,7 +216,7 @@ def main():
                                wait_for_remote_close=True, stall_partial=True)
             assert stored.read_bytes() == before
             assert "Session idle timeout." in (root / "logs/server.log").read_text()
-            await_cleanup(storage, ".nasfs-upload.*")
+            await_cleanup(staging, ".nasfs-upload.*")
             return
         if mode == ["partial-get"]:
             slow_get = ["get", "slow-frame.bin", str(destination)]
@@ -225,7 +226,7 @@ def main():
             return
         if mode[0] in ("stop-during-publication", "publication-without-lock"):
             unlocked = mode == ["publication-without-lock"]
-            orphan = storage / (".nasfs-upload." + "0" * 32)
+            orphan = staging / (".nasfs-upload." + "0" * 32)
             server_pid = int(server_pid)
             output_log = root / "logs/server_stdout.log"
             gate = root / "release-rename"
@@ -238,7 +239,7 @@ def main():
                         assert time.monotonic() < deadline, output_log.read_text()
                         time.sleep(0.01)
                     assert (storage / remote).read_bytes() == previous
-                    uploads = set(storage.glob(".nasfs-upload.*"))
+                    uploads = set(staging.glob(".nasfs-upload.*"))
                     if unlocked:
                         assert orphan in uploads
                         uploads.remove(orphan)
@@ -266,7 +267,7 @@ def main():
                                 assert peer.poll() is None
                                 assert time.monotonic() < deadline
                                 time.sleep(0.01)
-                            assert set(storage.glob(".nasfs-upload.*")) == {active}
+                            assert set(staging.glob(".nasfs-upload.*")) == {active}
                         finally:
                             if peer.poll() is None:
                                 peer.terminate()
@@ -284,7 +285,7 @@ def main():
                     gate.touch()
                     if child.poll() is None:
                         child.kill()
-            await_cleanup(storage, ".nasfs-upload.*")
+            await_cleanup(staging, ".nasfs-upload.*")
             assert (storage / remote).read_bytes() != previous
             return
         if mode == ["cancel-slow-mput"]:
@@ -307,7 +308,7 @@ def main():
                                    on_pause=await_saturated_queue)
             finally:
                 gate.touch()
-            await_cleanup(storage, ".nasfs-upload.*")
+            await_cleanup(staging, ".nasfs-upload.*")
             subprocess.run([client, "get", items[0].name, str(destination)],
                            check=True, capture_output=True, timeout=10)
             assert destination.read_bytes() == b""
@@ -386,7 +387,7 @@ def main():
                     if child.poll() is None:
                         child.kill()
             if disconnecting:
-                await_cleanup(storage, ".nasfs-upload.*")
+                await_cleanup(staging, ".nasfs-upload.*")
             assert (storage / remote).read_bytes() == previous
             if reading:
                 assert destination.read_bytes() == b"Previous destination"
@@ -422,7 +423,7 @@ def main():
                     os.kill(int(server_pid), 0)
             finally:
                 gate.touch()
-            await_cleanup(storage, ".nasfs-upload.*")
+            await_cleanup(staging, ".nasfs-upload.*")
             assert (storage / remote).read_bytes() == previous
             return
         before_publication = mode == ["crash-before"]
@@ -431,7 +432,7 @@ def main():
         stderr = interrupt_transfer(client, put, upstream_port, direction, command,
                                     signal.SIGKILL, int(server_pid))
         assert b"PUT outcome unknown" in stderr, stderr
-        temporary = list(storage.glob(".nasfs-upload.*"))
+        temporary = list(staging.glob(".nasfs-upload.*"))
         if before_publication:
             assert (storage / remote).read_bytes() == previous
             assert len(temporary) == 1, temporary
@@ -477,7 +478,7 @@ def main():
     ):
         interrupt_transfer(client, put, upstream_port, direction, command,
                            signal.SIGINT)
-        await_cleanup(storage, ".nasfs-upload.*")
+        await_cleanup(staging, ".nasfs-upload.*")
         assert (storage / remote).read_bytes() == previous
 
     shrinking_source = root / "shrinking-source.bin"
@@ -486,7 +487,7 @@ def main():
                                 upstream_port, "get", PUT_ACK, None,
                                 before_forward=lambda: shrinking_source.write_bytes(b""))
     assert b"PUT source size changed during upload" in stderr, stderr
-    await_cleanup(storage, ".nasfs-upload.*")
+    await_cleanup(staging, ".nasfs-upload.*")
     assert (storage / remote).read_bytes() == previous
 
     destination.write_bytes(b"Previous destination")
@@ -507,7 +508,7 @@ def main():
 
     stderr = interrupt_transfer(client, put, upstream_port, "get", PUT_RESULT, None)
     assert b"PUT outcome unknown" in stderr, stderr
-    await_cleanup(storage, ".nasfs-upload.*")
+    await_cleanup(staging, ".nasfs-upload.*")
     subprocess.run([client, *get], check=True, stdout=subprocess.DEVNULL)
     assert destination.read_bytes() == replacement.read_bytes()
     subprocess.run([client, "put", str(source), remote], check=True,
@@ -519,7 +520,7 @@ def main():
             path.write_bytes(f"Batch member {index}".encode())
         interrupt_transfer(client, ["mput", *map(str, batch)], upstream_port,
                            "put", PUT_DONE, signal.SIGINT, occurrence=cancelled + 1)
-        await_cleanup(storage, ".nasfs-upload.*")
+        await_cleanup(staging, ".nasfs-upload.*")
         for path in batch[:cancelled]:
             subprocess.run([client, "get", path.name, str(destination)], check=True,
                            stdout=subprocess.DEVNULL)
@@ -548,7 +549,7 @@ def main():
     stderr = interrupt_transfer(client, put, upstream_port, "put", PUT_DONE,
                                 signal.SIGINT, int(server_pid))
     assert b"PUT outcome unknown" in stderr, stderr
-    await_cleanup(storage, ".nasfs-upload.*")
+    await_cleanup(staging, ".nasfs-upload.*")
     assert (storage / remote).read_bytes() == previous
 
 
