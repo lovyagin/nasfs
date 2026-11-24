@@ -345,6 +345,16 @@ static void wait_startup_checkpoint(const char* phase) {
   while (access(gate, F_OK) != 0) nanosleep(&pause, NULL);
 }
 
+ssize_t write(int fd, const void* data, size_t length) {
+  if (getenv("NASFS_TEST_STARTUP_PHASE") && data && length == 1 &&
+      *(const char*)data == '1') {
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode))
+      wait_startup_checkpoint("before-daemon-status");
+  }
+  return syscall(SYS_write, fd, data, length);
+}
+
 int uv_signal_start(uv_signal_t* handle, uv_signal_cb callback, int signum) {
   typedef int (*start_fn)(uv_signal_t*, uv_signal_cb, int);
   start_fn actual = (start_fn)dlsym(RTLD_NEXT, "uv_signal_start");

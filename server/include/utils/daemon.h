@@ -12,15 +12,13 @@
 #define DAEMON_H
 
 /**
- * @brief Turn the current process into a daemon.
- *
- * Performs the standard Unix double-fork method to properly daemonize
- * the process. This detaches the process from the controlling terminal
- * and allows it to run in the background independently.
- *
- * @return 0 on success. If an error occurs, the function will exit
- *         the process with a failure status.
+ * Detach via double fork. The original process exits with the startup result.
+ * Returns the readiness pipe descriptor in the daemon, or -1 on setup error
+ * before detaching. Close the descriptor on startup failure without writing.
  */
-int daemonize(void);
+int daemonize(const char* pid_path);
+
+/* Report startup success and consume the readiness pipe descriptor. */
+int daemon_notify_ready(int status_fd);
 
 #endif /* DAEMON_H */

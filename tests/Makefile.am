@@ -1,4 +1,4 @@
-check_PROGRAMS = test_handshake test_config test_auth test_encryption
+check_PROGRAMS = test_handshake test_config test_auth test_encryption test_pake
 TESTS = $(check_PROGRAMS) test_end_to_end.sh test_file_encryption.sh test_lifecycle.sh
 TESTS_ENVIRONMENT = \
 	NASFS_SERVER_BIN="$(top_builddir)/server/nasfs_server" \
@@ -20,3 +20,6 @@ test_auth_LDADD = $(top_builddir)/common/libnasfs_common.a $(SODIUM_LIBS) $(OQS_
 
 test_encryption_SOURCES = test_encryption.c
 test_encryption_LDADD = $(top_builddir)/common/libnasfs_common.a $(SODIUM_LIBS) $(OQS_LIBS) $(OPENSSL_LIBS)
+
+test_pake_SOURCES = test_pake.c
+test_pake_LDADD = $(top_builddir)/common/libnasfs_common.a $(SODIUM_LIBS)

@@ -12,6 +12,8 @@
 #ifndef PID_FILE_H
 #define PID_FILE_H
 
+#include <sys/types.h>
+
 /**
  * @brief Create a PID file with the current process ID.
  *
@@ -25,5 +27,8 @@ int create_pid_file(const char* pid_file_path);
 
 /** Release the process's locked PID file. */
 void cleanup_pid_file(void);
+
+/** Remove a PID file left by a detached child that failed to start. */
+void cleanup_failed_startup_pid(const char* path, pid_t child);
 
 #endif /* PID_FILE_H */

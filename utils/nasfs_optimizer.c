@@ -120,9 +120,10 @@ static double bench_blake2b(size_t block_size, int runs) {
   return best;
 }
 
-static double harmonic2(double a, double b) {
+// Both stages process the same bytes, so their times add.
+static double combined_throughput(double a, double b) {
   if (a <= 0 || b <= 0) return 0;
-  return 2.0 / (1.0 / a + 1.0 / b);
+  return 1.0 / (1.0 / a + 1.0 / b);
 }
 
 int main(int argc, char** argv) {
@@ -161,8 +162,8 @@ int main(int argc, char** argv) {
     double xcha = bench_xchacha20(bs, runs);
     double aes = bench_aesgcm(bs, runs);
     double blake = bench_blake2b(bs, runs);
-    double comb_xcha = harmonic2(xcha, blake);
-    double comb_aes = harmonic2(aes, blake);
+    double comb_xcha = combined_throughput(xcha, blake);
+    double comb_aes = combined_throughput(aes, blake);
     double best_comb = comb_aes > comb_xcha ? comb_aes : comb_xcha;
     const char* winner = comb_aes > comb_xcha ? "AES" : "XCH";
 

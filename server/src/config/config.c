@@ -20,6 +20,8 @@
 
 server_config_t global_config;
 
+#define NASFS_CONFIG_MAX_LINE 4096
+
 /* Parse a positive integer option from the configuration file.
    Returns 0 on success and stores the parsed value in OUT_VALUE.  */
 static int parse_config_int(const char* value, int* out_value) {
@@ -53,16 +55,26 @@ int load_config(const char* filename, server_config_t* config) {
 
   set_defaults(config);
 
-  char line[512];
-  while (fgets(line, sizeof(line), file)) {
-    char* newline;
-
-    if (line[0] == '#' || line[0] == '\n') continue;
-
-    newline = memchr(line, '\n', sizeof(line));
-    if (newline) {
-      *newline = '\0';
+  char line[NASFS_CONFIG_MAX_LINE + 1] = {0};
+  size_t line_number = 0;
+  int byte;
+  while (!feof(file) && (byte = fgetc(file)) != EOF) {
+    line_number++;
+    size_t length = 0;
+    for (; byte != EOF && byte != '\n'; byte = fgetc(file)) {
+      if (length == NASFS_CONFIG_MAX_LINE || byte == '\0') {
+        fprintf(stderr, "Invalid configuration line %zu: %s\n", line_number,
+                byte == '\0' ? "embedded NUL byte" : "line exceeds 4096 bytes");
+        fclose(file);
+        return -1;
+      }
+      line[length++] = (char)byte;
     }
+    if (ferror(file)) {
+      fclose(file);
+      return -1;
+    }
+    line[length] = '\0';
 
     trim_string(line);
 

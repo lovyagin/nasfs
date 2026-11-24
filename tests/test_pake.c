@@ -55,6 +55,19 @@ int main(void) {
   uint8_t key_client[NASFS_PAKE_KEYBYTES];
   uint8_t key_server[NASFS_PAKE_KEYBYTES];
 
+  uint8_t invalid_share[NASFS_PAKE_POINTBYTES];
+  memset(invalid_share, 0xff, sizeof(invalid_share));
+  const uint8_t untouched[NASFS_PAKE_KEYBYTES] = {0};
+  memcpy(key_client, untouched, sizeof(key_client));
+  memcpy(key_server, untouched, sizeof(key_server));
+  if (pake_client_derive_key(w_client, x, invalid_share, key_client) == 0 ||
+      pake_server_derive_key(w_server, y, invalid_share, key_server) == 0 ||
+      memcmp(key_client, untouched, sizeof(key_client)) != 0 ||
+      memcmp(key_server, untouched, sizeof(key_server)) != 0) {
+    fprintf(stderr, "PAKE accepted an invalid share or wrote an invalid key\n");
+    return 1;
+  }
+
   if (pake_client_derive_key(w_client, x, Y, key_client) != 0 ||
       pake_server_derive_key(w_server, y, X, key_server) != 0) {
     fprintf(stderr, "Failed to derive session keys\n");

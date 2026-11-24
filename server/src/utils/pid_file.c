@@ -12,6 +12,7 @@
 #include "config.h"
 #endif
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,4 +75,28 @@ void cleanup_pid_file(void) {
   pid_fd = -1;
   free(pid_file_path);
   pid_file_path = NULL;
+}
+
+void cleanup_failed_startup_pid(const char* path, pid_t child) {
+  if (!path || !*path) return;
+  int fd = open(path, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) return;
+
+  struct stat info;
+  if (fstat(fd, &info) == 0 && S_ISREG(info.st_mode) &&
+      flock(fd, LOCK_EX | LOCK_NB) == 0) {
+    char expected[32];
+    char stored[sizeof(expected)];
+    int length = snprintf(expected, sizeof(expected), "%d\n", child);
+    ssize_t count;
+    do {
+      count = read(fd, stored, sizeof(stored));
+    } while (count < 0 && errno == EINTR);
+    if (length > 0 && (size_t)length < sizeof(expected) && count == length &&
+        memcmp(expected, stored, (size_t)length) == 0 &&
+        owns_pid_path(fd, path) && unlink(path) != 0) {
+      log_all(LOG_WARNING, "Could not remove failed daemon PID file: %s", path);
+    }
+  }
+  close(fd);
 }

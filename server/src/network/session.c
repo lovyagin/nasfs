@@ -57,9 +57,6 @@ static size_t live_sessions;
  * [cipher plus record-length flag][hash]. Marked files store a big-endian
  * uint32_t ciphertext length before each record. */
 #define FILE_HEADER_SIZE NASFS_FILE_METADATA_SIZE
-#define FILE_HEADER_RECORD_LENGTHS 0x80u
-#define FILE_HEADER_MANIFEST 0x40u
-#define FILE_HEADER_OWNER_SLOT_V1 0x20u
 #define MAX_RECORD_SIZE (4194304 + NASFS_CIPHER_OVERHEAD)
 #define NASFS_CIPHER_OVERHEAD \
   16 /* MAC tag bytes — true for all supported ciphers */
@@ -860,14 +857,14 @@ static void on_get_fs_open(client_session_t* session, int result,
       uint8_t disk_cipher =
           file_header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES];
       session->has_record_lengths =
-          (disk_cipher & FILE_HEADER_RECORD_LENGTHS) != 0;
-      session->has_manifest = (disk_cipher & FILE_HEADER_MANIFEST) != 0;
-      int has_slot = (disk_cipher & FILE_HEADER_OWNER_SLOT_V1) != 0;
+          (disk_cipher & NASFS_FILE_RECORD_LENGTHS) != 0;
+      session->has_manifest = (disk_cipher & NASFS_FILE_MANIFEST) != 0;
+      int has_slot = (disk_cipher & NASFS_FILE_OWNER_SLOT_V1) != 0;
       uint8_t portable = disk_cipher & NASFS_FILE_CIPHER_PORTABLE;
       session->file_cipher_algo =
           disk_cipher &
-          ~(FILE_HEADER_RECORD_LENGTHS | FILE_HEADER_MANIFEST |
-            FILE_HEADER_OWNER_SLOT_V1 | NASFS_FILE_CIPHER_PORTABLE);
+          ~(NASFS_FILE_RECORD_LENGTHS | NASFS_FILE_MANIFEST |
+            NASFS_FILE_OWNER_SLOT_V1 | NASFS_FILE_CIPHER_PORTABLE);
       if ((session->has_manifest && !session->has_record_lengths) ||
           (has_slot && !session->has_manifest) || (portable && !has_slot)) {
         session_close((uv_handle_t*)&session->handle);
@@ -951,7 +948,7 @@ static void open_storage_object(uv_work_t* req) {
   uv_fs_req_cleanup(&request);
   if (ctx->header_result == FILE_HEADER_SIZE &&
       (ctx->header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES] &
-       FILE_HEADER_OWNER_SLOT_V1)) {
+       NASFS_FILE_OWNER_SLOT_V1)) {
     buf = uv_buf_init((char*)ctx->header + FILE_HEADER_SIZE,
                       NASFS_OWNER_SLOT_V1_SIZE);
     ctx->slot_result = uv_fs_read(NULL, &request, ctx->result, &buf, 1,
@@ -1007,8 +1004,8 @@ static void submit_file_open(client_session_t* session, const uint8_t* name,
     memcpy(header + sizeof(uint64_t), session->file_salt,
            crypto_pwhash_SALTBYTES);
     header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES] =
-        session->file_cipher_algo | FILE_HEADER_RECORD_LENGTHS |
-        FILE_HEADER_MANIFEST | FILE_HEADER_OWNER_SLOT_V1 |
+        session->file_cipher_algo | NASFS_FILE_RECORD_LENGTHS |
+        NASFS_FILE_MANIFEST | NASFS_FILE_OWNER_SLOT_V1 |
         NASFS_FILE_CIPHER_PORTABLE;
     header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 1] =
         session->file_hash_algo;

@@ -118,7 +118,9 @@ int pake_client_derive_key(const uint8_t* w, const uint8_t* x, const uint8_t* Y,
   }
 
   // 2. Compute Y - w * N (point subtraction)
-  crypto_core_ristretto255_sub(Y_minus_wN, Y, w_N);
+  if (crypto_core_ristretto255_sub(Y_minus_wN, Y, w_N) != 0) {
+    return -1;
+  }
 
   // 3. Compute K_client = x * (Y - w * N) = x * y * G
   if (crypto_scalarmult_ristretto255(K, x, Y_minus_wN) != 0) {
@@ -148,7 +150,9 @@ int pake_server_derive_key(const uint8_t* w, const uint8_t* y, const uint8_t* X,
   }
 
   // 2. Compute X - w * M (point subtraction)
-  crypto_core_ristretto255_sub(X_minus_wM, X, w_M);
+  if (crypto_core_ristretto255_sub(X_minus_wM, X, w_M) != 0) {
+    return -1;
+  }
 
   // 3. Compute K_server = y * (X - w * M) = y * x * G
   if (crypto_scalarmult_ristretto255(K, y, X_minus_wM) != 0) {

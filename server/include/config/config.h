@@ -48,6 +48,7 @@ extern server_config_t global_config;
  * @brief Load configuration from a file.
  *
  * Reads settings from the specified filename into the configuration structure.
+ * Lines may contain up to 4096 bytes before the newline.
  *
  * @param filename The path to the configuration file.
  * @param config Pointer to the configuration structure to populate.

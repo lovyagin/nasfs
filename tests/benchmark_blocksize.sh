@@ -153,34 +153,40 @@ run_nasfs_get() {
   awk "BEGIN {printf \"%.4f\", ($fsz / 1048576.0) / (($t1 - $t0) / 1e9)}"
 }
 
+sftp_batch() {
+  sftp "${SFTP_OPTS[@]}" -b - "$SFTP_USER@$SFTP_HOST"
+}
+
 run_sftp_put() {
   local file=$1 sz remote_dir="/tmp/sftp_bench_$$"
   sz=$(wc -c < "$file" | tr -d ' ')
-  printf "mkdir %s\n" "$remote_dir" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1 || true
-  local t0 t1
+  printf 'mkdir %s\n' "$remote_dir" | sftp_batch >/dev/null || return
+  local t0 t1 status=0
   t0=$(now_ns)
-  printf "put %s %s/f\n" "$file" "$remote_dir" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
+  printf 'put "%s" %s/f\n' "$file" "$remote_dir" \
+    | sftp_batch >/dev/null || status=$?
   t1=$(now_ns)
-  printf "rm %s/f\nrmdir %s\n" "$remote_dir" "$remote_dir" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1 || true
+  printf -- '-rm %s/f\nrmdir %s\n' "$remote_dir" "$remote_dir" \
+    | sftp_batch >/dev/null 2>&1 || true
+  (( status == 0 )) || return "$status"
   awk "BEGIN {printf \"%.4f\", ($sz / 1048576.0) / (($t1 - $t0) / 1e9)}"
 }
 
 run_sftp_get() {
   local file=$1 sz remote_path="/tmp/sftp_src_$$"
   sz=$(wc -c < "$file" | tr -d ' ')
-  printf "put %s %s\n" "$file" "$remote_path" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
-  local t0 t1 local_out="$BENCH_ROOT/sftp_got_$$.bin"
-  t0=$(now_ns)
-  printf "get %s %s\n" "$remote_path" "$local_out" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
-  t1=$(now_ns)
-  printf "rm %s\n" "$remote_path" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1 || true
+  local t0 t1 local_out="$BENCH_ROOT/sftp_got_$$.bin" status=0
+  if printf 'put "%s" %s\n' "$file" "$remote_path" | sftp_batch >/dev/null; then
+    t0=$(now_ns)
+    printf 'get %s "%s"\n' "$remote_path" "$local_out" \
+      | sftp_batch >/dev/null || status=$?
+    t1=$(now_ns)
+  else
+    status=$?
+  fi
+  printf 'rm %s\n' "$remote_path" | sftp_batch >/dev/null 2>&1 || true
   rm -f "$local_out"
+  (( status == 0 )) || return "$status"
   awk "BEGIN {printf \"%.4f\", ($sz / 1048576.0) / (($t1 - $t0) / 1e9)}"
 }
 
@@ -270,10 +276,10 @@ for fidx in "${!FILE_SIZES[@]}"; do
   sputs=(); sgets=()
   for run in $(seq 1 "$RUNS"); do
     sp=$(run_sftp_put "$tfile")
-    sg=$(run_sftp_get "$tfile")
-    sputs+=("$sp"); sgets+=("$sg")
     echo "sftp,N/A,${flbl},put,${run},${sp}" >> "$CSV"
+    sg=$(run_sftp_get "$tfile")
     echo "sftp,N/A,${flbl},get,${run},${sg}" >> "$CSV"
+    sputs+=("$sp"); sgets+=("$sg")
   done
   SFTP_PUT[fidx]=$(median "${sputs[@]}")
   SFTP_GET[fidx]=$(median "${sgets[@]}")

@@ -132,6 +132,10 @@ int protocol_decode_block_meta(const uint8_t* payload, size_t length,
 #define NASFS_PUT_REQUEST_EXCLUSIVE 3u
 /* Cipher-byte marker in portable containers, GET_ACK and manifests. */
 #define NASFS_FILE_CIPHER_PORTABLE 0x10u
+/* On-disk flags in the container's cipher byte. */
+#define NASFS_FILE_RECORD_LENGTHS 0x80u
+#define NASFS_FILE_MANIFEST 0x40u
+#define NASFS_FILE_OWNER_SLOT_V1 0x20u
 #define NASFS_FILE_METADATA_SIZE 26
 void protocol_store_u64(uint8_t out[8], uint64_t value);
 uint64_t protocol_load_u64(const uint8_t in[8]);

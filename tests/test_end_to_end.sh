@@ -311,9 +311,26 @@ check_mput_alias() {
             "e2e-password" "" "ML-DSA-65" get "$second" "$TEST_DIR/alias-second.out"
         cmp "$second_input" "$TEST_DIR/alias-second.out"
     fi
+    if (( aliases )); then
+        expect_client_failure "$LOG_DIR/client_put_alias_$label.log" "Server could not publish" \
+            "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" put "$second_input" "$second"
+    else
+        run_client "$LOG_DIR/client_put_alias_$label.log" "ML-KEM-512" "password" \
+            "e2e-password" "" "ML-DSA-65" put "$first_input" "$second"
+        run_client "$LOG_DIR/client_get_replaced_$label.log" "ML-KEM-512" "password" \
+            "e2e-password" "" "ML-DSA-65" get "$second" "$TEST_DIR/alias-second.out"
+        cmp "$first_input" "$TEST_DIR/alias-second.out"
+    fi
     run_client "$LOG_DIR/client_alias_first_$label.log" "ML-KEM-512" "password" \
         "e2e-password" "" "ML-DSA-65" get "$first" "$TEST_DIR/alias-first.out"
     cmp "$first_input" "$TEST_DIR/alias-first.out"
+    if (( aliases )); then
+        run_client "$LOG_DIR/client_put_exact_$label.log" "ML-KEM-512" "password" \
+            "e2e-password" "" "ML-DSA-65" put "$second_input" "$first"
+        run_client "$LOG_DIR/client_get_exact_$label.log" "ML-KEM-512" "password" \
+            "e2e-password" "" "ML-DSA-65" get "$first" "$TEST_DIR/alias-first.out"
+        cmp "$second_input" "$TEST_DIR/alias-first.out"
+    fi
 }
 check_mput_alias Batch-Case.bin batch-case.bin case
 check_mput_alias $'batch-\xc3\xa9.bin' $'batch-e\xcc\x81.bin' unicode
@@ -324,6 +341,15 @@ run_client "$LOG_DIR/client_distinct_destinations.log" "ML-KEM-512" "password" \
     "$TEST_DIR/second-destination/$REMOTE_NAME"
 cmp "$TEST_INPUT" "$TEST_DIR/first-destination/$REMOTE_NAME"
 cmp "$TEST_INPUT" "$TEST_DIR/second-destination/$REMOTE_NAME"
+ln -s first-destination "$TEST_DIR/destination-link"
+for alias_dir in "$TEST_DIR/destination-link" "$TEST_DIR/second-destination/../first-destination"; do
+    expect_client_failure "$LOG_DIR/client_local_alias.log" "Duplicate batch destination" \
+        "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mget \
+        "$TEST_DIR/first-destination/$REMOTE_NAME" "$alias_dir/$REMOTE_NAME"
+    test "$(grep -Fc 'Download complete.' "$LOG_DIR/client_local_alias.log")" = 1
+    cmp "$TEST_INPUT" "$TEST_DIR/first-destination/$REMOTE_NAME"
+    test -z "$(find "$TEST_DIR/first-destination" -name '.nasfs-download.*' -print)"
+done
 too_many_files=()
 for ((i = 0; i < 513; i++)); do
     too_many_files+=("file-$i")

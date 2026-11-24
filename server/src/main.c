@@ -70,6 +70,34 @@ static int reserve_standard_descriptors(void) {
   return 0;
 }
 
+/* Anchor paths before chdir without requiring the target to exist. */
+static int resolve_daemon_paths(void) {
+  char** paths[] = {&global_config.log_file, &global_config.pid_file,
+                    &global_config.authorized_keys_file};
+  char* cwd = NULL;
+  int result = 0;
+  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    const char* relative = *paths[i];
+    if (!relative || !*relative || relative[0] == '/') continue;
+    if (!cwd) cwd = getcwd(NULL, 0);
+    if (!cwd) {
+      result = -1;
+      break;
+    }
+    size_t length = strlen(cwd) + strlen(relative) + 2;
+    char* absolute = malloc(length);
+    if (!absolute) {
+      result = -1;
+      break;
+    }
+    snprintf(absolute, length, "%s/%s", cwd, relative);
+    free(*paths[i]);
+    *paths[i] = absolute;
+  }
+  free(cwd);
+  return result;
+}
+
 /**
  * @brief The main execution loop of the NASFS server.
  *
@@ -80,6 +108,7 @@ static int reserve_standard_descriptors(void) {
 int main(int argc, char** argv) {
   const char* config_file = (argc > 1) ? argv[1] : "nasfs.conf";
   int exit_code = 0;
+  int daemon_status_fd = -1;
 
   signal(SIGPIPE, SIG_IGN);
 
@@ -92,6 +121,12 @@ int main(int argc, char** argv) {
 
   if (global_config.daemon_mode && reserve_standard_descriptors() < 0) {
     perror("Cannot reserve standard descriptors for daemon");
+    free_config(&global_config);
+    return 1;
+  }
+
+  if (global_config.daemon_mode && resolve_daemon_paths() < 0) {
+    fprintf(stderr, "Cannot resolve relative paths for daemon startup\n");
     free_config(&global_config);
     return 1;
   }
@@ -134,10 +169,19 @@ int main(int argc, char** argv) {
 
   if (global_config.daemon_mode) {
     log_all(LOG_INFO, "Daemonizing process...");
-    daemonize();
+    daemon_status_fd = daemonize(global_config.pid_file);
+    if (daemon_status_fd < 0) {
+      exit_code = 1;
+      goto close_storage;
+    }
   }
 
   loop = uv_default_loop();
+  if (!loop) {
+    log_all(LOG_ERROR, "Cannot initialize the event loop");
+    exit_code = 1;
+    goto close_storage;
+  }
 
   r = uv_signal_init(loop, &sigint_watcher);
   if (r == 0) r = uv_signal_start(&sigint_watcher, on_signal, SIGINT);
@@ -194,6 +238,16 @@ int main(int argc, char** argv) {
   log_all(LOG_INFO, "nasfs_server listening on %s:%d...", bind_addr,
           ntohs(bound_addr.sin_port));
 
+  if (daemon_status_fd >= 0) {
+    int notified = daemon_notify_ready(daemon_status_fd);
+    daemon_status_fd = -1;
+    if (notified < 0) {
+      log_all(LOG_ERROR, "Cannot report daemon startup");
+      exit_code = 1;
+      goto close_handles;
+    }
+  }
+
   uv_run(loop, UV_RUN_DEFAULT);
 
   log_all(LOG_INFO, "NASFS server shutting down cleanly...");
@@ -206,10 +260,12 @@ close_handles:
     log_all(LOG_ERROR, "Event loop close failed: %s", uv_strerror(r));
     exit_code = 1;
   }
+close_storage:
   nasfs_storage_close(&storage);
 
 cleanup:
   cleanup_pid_file();
   free_config(&global_config);
+  if (daemon_status_fd >= 0) close(daemon_status_fd);
   return exit_code;
 }

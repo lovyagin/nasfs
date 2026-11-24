@@ -14,6 +14,8 @@
 
 #include "config/config.h"
 
+#define FULL_PASSWORD_LENGTH (4096 - (sizeof("AuthPassword ") - 1))
+
 static int write_test_config(char* path, size_t path_len) {
   FILE* file;
   int fd;
@@ -38,11 +40,12 @@ static int write_test_config(char* path, size_t path_len) {
   fprintf(file, "KexAlgorithms Kyber512,ML-KEM-512\n");
   fprintf(file, "CipherAlgorithms xchacha20poly1305\n");
   fprintf(file, "AuthMethods password+publickey\n");
-  fprintf(file, "AuthPassword test-secret\n");
   fprintf(file, "AuthorizedKeysFile /srv/nasfs/authorized_keys\n");
   fprintf(file, "PubKeyAuthAlgorithms ML-DSA-65\n");
-  fclose(file);
-  return 0;
+  fputs("AuthPassword ", file);
+  for (size_t i = 0; i < FULL_PASSWORD_LENGTH; i++) fputc('x', file);
+  // The final line is exactly at the limit and has no newline.
+  return fclose(file);
 }
 
 int main(void) {
@@ -65,7 +68,9 @@ int main(void) {
       strcmp(config.kex_algorithms, "Kyber512,ML-KEM-512") != 0 ||
       strcmp(config.cipher_algorithms, "xchacha20poly1305") != 0 ||
       strcmp(config.auth_methods, "password+publickey") != 0 ||
-      strcmp(config.auth_password, "test-secret") != 0 ||
+      !config.auth_password ||
+      strspn(config.auth_password, "x") != FULL_PASSWORD_LENGTH ||
+      strlen(config.auth_password) != FULL_PASSWORD_LENGTH ||
       strcmp(config.authorized_keys_file, "/srv/nasfs/authorized_keys") != 0 ||
       strcmp(config.pubkey_auth_algorithms, "ML-DSA-65") != 0) {
     fprintf(stderr, "parsed values do not match expected configuration\n");

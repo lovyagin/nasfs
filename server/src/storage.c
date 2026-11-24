@@ -24,8 +24,12 @@
 #include <linux/magic.h>
 #include <sys/vfs.h>
 #elif defined(__APPLE__)
+#include <arpa/inet.h>
 #include <sys/acl.h>
 #include <sys/mount.h>
+
+#include "crypto_engine.h"
+#include "protocol.h"
 #endif
 
 static const char publication_lock[] = ".nasfs-publish.lock";
@@ -263,6 +267,106 @@ int nasfs_storage_begin_upload(const nasfs_storage_t* storage,
   return UV_EEXIST;
 }
 
+// A successful lookup may have matched another spelling on this volume.
+static int require_exact_name(int root, const char* name) {
+  int fd = openat(root, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) return uv_translate_sys_error(errno);
+  DIR* entries = fdopendir(fd);
+  if (!entries) {
+    int rc = uv_translate_sys_error(errno);
+    close(fd);
+    return rc;
+  }
+
+  int rc;
+  for (;;) {
+    errno = 0;
+    const struct dirent* entry = readdir(entries);
+    if (!entry) {
+      rc = errno ? uv_translate_sys_error(errno) : UV_EEXIST;
+      break;
+    }
+    if (strcmp(entry->d_name, name) == 0) {
+      rc = 0;
+      break;
+    }
+  }
+  closedir(entries);
+  return rc;
+}
+
+#ifdef __APPLE__
+static int read_existing(int fd, void* output, size_t length) {
+  uint8_t* next = output;
+  while (length > 0) {
+    ssize_t count = read(fd, next, length);
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0) return uv_translate_sys_error(errno);
+    if (count == 0) return UV_EOF;
+    next += count;
+    length -= (size_t)count;
+  }
+  return 0;
+}
+
+// HFS+ can rewrite the spelling returned by readdir. Verify the original
+// spelling against the manifest digest already stored in the container.
+// Return 1 for an object without a manifest, so its directory name is used.
+static int check_manifest_name(int fd, const char* name) {
+  uint8_t header[NASFS_FILE_METADATA_SIZE];
+  int rc = read_existing(fd, header, sizeof(header));
+  if (rc == UV_EOF) return 1;
+  if (rc < 0) return rc;
+  const size_t cipher_offset = sizeof(uint64_t) + crypto_pwhash_SALTBYTES;
+  uint8_t flags = header[cipher_offset];
+  if (!(flags & NASFS_FILE_MANIFEST)) return 1;
+  if (!(flags & NASFS_FILE_RECORD_LENGTHS)) return UV_EINVAL;
+
+  uint64_t plaintext_size;
+  if (flags & NASFS_FILE_CIPHER_PORTABLE)
+    plaintext_size = protocol_load_u64(header);
+  else
+    memcpy(&plaintext_size, header, sizeof(plaintext_size));
+  crypto_generichash_state manifest;
+  protocol_manifest_init(
+      &manifest, name, plaintext_size, header + sizeof(uint64_t),
+      flags & ~(NASFS_FILE_RECORD_LENGTHS | NASFS_FILE_MANIFEST |
+                NASFS_FILE_OWNER_SLOT_V1),
+      header[cipher_offset + 1]);
+  if (flags & NASFS_FILE_OWNER_SLOT_V1) {
+    uint8_t slot[NASFS_OWNER_SLOT_V1_SIZE];
+    rc = read_existing(fd, slot, sizeof(slot));
+    if (rc < 0) return rc;
+    protocol_manifest_owner_slot(&manifest, slot, sizeof(slot));
+  }
+  for (;;) {
+    uint32_t prefix;
+    rc = read_existing(fd, &prefix, sizeof(prefix));
+    if (rc < 0) return rc;
+    size_t length = ntohl(prefix);
+    if (length == 0) break;
+    if (length > NASFS_PROTO_MAX_FRAME) return UV_EINVAL;
+    // The on-disk length prefix is already in manifest byte order.
+    crypto_generichash_update(&manifest, (const uint8_t*)&prefix,
+                              sizeof(prefix));
+    while (length > 0) {
+      uint8_t data[8192];
+      size_t chunk = length < sizeof(data) ? length : sizeof(data);
+      rc = read_existing(fd, data, chunk);
+      if (rc < 0) return rc;
+      crypto_generichash_update(&manifest, data, chunk);
+      length -= chunk;
+    }
+  }
+  uint8_t stored[NASFS_MANIFEST_SIZE];
+  rc = read_existing(fd, stored, sizeof(stored));
+  if (rc < 0) return rc;
+  uint8_t digest[32];
+  crypto_generichash_final(&manifest, digest, sizeof(digest));
+  return sodium_memcmp(digest, stored, sizeof(digest)) == 0 ? 0 : UV_EEXIST;
+}
+#endif
+
 // Called with an exclusive publication lock. Local writers must use the
 // same lock or keep the server stopped while administering the storage.
 static int replace_upload(int root, int service, const char* temp_name,
@@ -271,15 +375,26 @@ static int replace_upload(int root, int service, const char* temp_name,
   if (fstatat(root, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
     if (!S_ISREG(st.st_mode)) return UV_EINVAL;
     if (st.st_uid != geteuid() || (st.st_mode & S_IWUSR) == 0) return UV_EACCES;
-#ifdef __APPLE__
-    int target = openat(root, name, O_EVTONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (target < 0) return uv_translate_sys_error(errno);
-    int private = has_private_permissions(target);
-    close(target);
-    if (!private) return UV_EACCES;
-#endif
     if (faccessat(root, name, W_OK, AT_EACCESS | AT_SYMLINK_NOFOLLOW) < 0)
       return uv_translate_sys_error(errno);
+    int rc = 1;
+#ifdef __APPLE__
+    struct statfs fs;
+    if (fstatfs(root, &fs) < 0) return uv_translate_sys_error(errno);
+    int verify_manifest = strcmp(fs.f_fstypename, "apfs") != 0;
+    int target =
+        verify_manifest
+            ? openat(root, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+            : openat(root, name, O_EVTONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (target < 0) return uv_translate_sys_error(errno);
+    if (!has_private_permissions(target))
+      rc = UV_EACCES;
+    else if (verify_manifest)
+      rc = check_manifest_name(target, name);
+    close(target);
+#endif
+    if (rc > 0) rc = require_exact_name(root, name);
+    if (rc < 0) return rc;
   } else if (errno != ENOENT) {
     return uv_translate_sys_error(errno);
   }
@@ -298,6 +413,18 @@ static int open_publication_lock(int root) {
   return fd;
 }
 
+static int create_upload(const nasfs_storage_t* storage, const char* temp_name,
+                         const char* name) {
+  // The filesystem resolves aliases atomically when creating the name.
+  if (linkat(storage->service_fd, temp_name, storage->root_fd, name, 0) < 0)
+    return uv_translate_sys_error(errno);
+  int rc = nasfs_storage_discard_upload(storage, temp_name);
+  if (rc < 0)
+    log_all(LOG_WARNING, "PUT: Published but could not remove staging: %s",
+            uv_strerror(rc));
+  return 0;
+}
+
 int nasfs_storage_publish_upload(const nasfs_storage_t* storage,
                                  const char* temp_name, const char* name,
                                  int exclusive) {
@@ -306,16 +433,8 @@ int nasfs_storage_publish_upload(const nasfs_storage_t* storage,
   int service = storage->service_fd;
   if (service < 0 || !is_private_directory(root)) return UV_EACCES;
 
-  if (exclusive || !can_replace_uploads(root)) {
-    // The filesystem resolves aliases atomically when creating the name.
-    if (linkat(service, temp_name, root, name, 0) < 0)
-      return uv_translate_sys_error(errno);
-    int rc = nasfs_storage_discard_upload(storage, temp_name);
-    if (rc < 0)
-      log_all(LOG_WARNING, "PUT: Published but could not remove staging: %s",
-              uv_strerror(rc));
-    return 0;
-  }
+  if (!can_replace_uploads(root))
+    return create_upload(storage, temp_name, name);
 
   int lock = open_publication_lock(service);
   if (lock < 0) return uv_translate_sys_error(errno);
@@ -328,9 +447,13 @@ int nasfs_storage_publish_upload(const nasfs_storage_t* storage,
     rc = UV_EACCES;
   }
   if (rc == 0) {
-    rc = flock(lock, LOCK_EX) < 0
-             ? uv_translate_sys_error(errno)
-             : replace_upload(root, service, temp_name, name);
+    if (flock(lock, LOCK_EX) < 0) {
+      rc = uv_translate_sys_error(errno);
+    } else if (exclusive) {
+      rc = create_upload(storage, temp_name, name);
+    } else {
+      rc = replace_upload(root, service, temp_name, name);
+    }
   }
   close(lock);
   return rc;

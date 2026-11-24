@@ -3,7 +3,9 @@
  * @brief Implementation of the modular Crypto Engine.
  */
 
-#include "crypto_engine.h"
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 
 #include <arpa/inet.h>
 #include <openssl/evp.h>
@@ -13,6 +15,7 @@
 #include <sodium.h>
 #include <string.h>
 
+#include "crypto_engine.h"
 #include "protocol.h"
 
 /* --- Custom high-speed non-crypto checksum implementations --- */

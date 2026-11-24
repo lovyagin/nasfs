@@ -3,6 +3,8 @@
 set -euo pipefail
 SERVER_BIN=${NASFS_SERVER_BIN:?}
 CLIENT_BIN=${NASFS_CLIENT_BIN:?}
+[[ $SERVER_BIN == /* ]] || SERVER_BIN="$PWD/$SERVER_BIN"
+[[ $CLIENT_BIN == /* ]] || CLIENT_BIN="$PWD/$CLIENT_BIN"
 # shellcheck source-path=SCRIPTDIR
 source "$(dirname "${BASH_SOURCE[0]}")/integration_helpers.sh"
 setup_integration
@@ -23,6 +25,7 @@ python3 - "$SERVER_BIN" "$CLIENT_BIN" "$TEST_ROOT" <<'PYTHON'
 import errno
 import os
 from pathlib import Path
+import re
 import resource
 import signal
 import socket
@@ -44,6 +47,7 @@ def server_failure(config_text, diagnostic):
     assert result.returncode == 1, result
     assert diagnostic in result.stdout + result.stderr, result
     assert not (root / "logs/server.pid").exists()
+    return result
 
 server_failure(None, b"Failed to load config file")
 server_failure(config.replace("ClientTimeout 1", "ClientTimeout 0"),
@@ -76,6 +80,11 @@ with socket.socket() as occupied:
     occupied.listen()
     server_failure(config.replace("Port 0", f"Port {occupied.getsockname()[1]}"),
                    b"Listen error")
+
+secret_prefix = "secret-that-must-not-appear"
+long_line = server_failure(config + f"AuthPassword {secret_prefix}" + "x" * 4096,
+                           f"Invalid configuration line {len(config.splitlines()) + 1}".encode())
+assert secret_prefix.encode() not in long_line.stdout + long_line.stderr
 
 # Bind the FIFO writer but withhold the configuration data. The server
 # must still be before listener initialization when the signal is delivered.
@@ -132,6 +141,90 @@ assert private.read_bytes() == old_private and public.read_bytes() == old_public
 other_private = root / "other.key"
 keygen(other_private, public)
 assert not other_private.exists() and public.read_bytes() == old_public
+
+# Launch a detached server from a directory containing relative paths.
+daemon_root = root / "daemon"
+daemon_root.mkdir()
+(daemon_root / "storage").mkdir(mode=0o700)
+(daemon_root / "authorized_keys").write_bytes(public.read_bytes())
+daemon_config = daemon_root / "server.conf"
+daemon_log = daemon_root / "daemon.log"
+daemon_pid = daemon_root / "server.pid"
+relative_config = """ListenAddr 127.0.0.1
+Port 0
+LogFile daemon.log
+LogLevel Info
+PidFile server.pid
+StorageDir storage
+AuthorizedKeysFile authorized_keys
+DaemonMode Yes
+AuthMethods publickey
+KexAlgorithms ML-KEM-512
+"""
+
+def launch_daemon(text):
+    daemon_config.write_text(text)
+    return subprocess.run([server, "server.conf"], cwd=daemon_root,
+                          capture_output=True, timeout=10)
+
+def wait_until(predicate):
+    deadline = time.monotonic() + 5
+    while not predicate():
+        assert time.monotonic() < deadline, daemon_log.read_text()
+        time.sleep(0.01)
+
+def daemon_gone(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+def assert_daemon_failure(text, diagnostic):
+    daemon_log.unlink(missing_ok=True)
+    result = launch_daemon(text)
+    assert result.returncode == 1 and b"NASFS daemon failed to start" in result.stderr, result
+    assert not daemon_pid.exists()
+    log = daemon_log.read_text()
+    match = re.search(r"\[PID=(\d+) .*" + re.escape(diagnostic), log)
+    assert match and daemon_gone(int(match[1])), log
+
+with socket.socket() as occupied:
+    occupied.bind(("127.0.0.1", 0))
+    occupied.listen()
+    assert_daemon_failure(relative_config.replace("Port 0", f"Port {occupied.getsockname()[1]}"),
+                          "Listen error")
+assert_daemon_failure(relative_config.replace("PidFile server.pid", "PidFile missing/server.pid"),
+                      "Failed to create PID file")
+assert not (daemon_root / "missing").exists()
+daemon_log.unlink()
+result = launch_daemon(relative_config)
+assert result.returncode == 0, result
+pid = int(daemon_pid.read_text())
+try:
+    match = re.search(r"nasfs_server listening on 127\.0\.0\.1:(\d+)", daemon_log.read_text())
+    assert match, daemon_log.read_text()
+    port = match[1]
+    pins = Path(os.environ["HOME"]) / ".nasfs"
+    pins.mkdir(mode=0o700, exist_ok=True)
+    pin = pins / f"server-127.0.0.1-{port}.pub"
+    pin.write_bytes((root / "server.pub").read_bytes())
+    pin.chmod(0o600)
+    env = dict(os.environ, NASFS_AUTH_METHOD="publickey",
+               NASFS_AUTH_SIG_ALGORITHM="ML-DSA-65", NASFS_IDENTITY_FILE=str(private),
+               NASFS_KEX_ALGORITHMS="ML-KEM-512", NASFS_ENCRYPTION_KEY="daemon-file-secret",
+               NASFS_SERVER_IP="127.0.0.1", NASFS_SERVER_PORT=port)
+    original = daemon_root / "original"
+    original.write_bytes(b"daemon relative paths\n")
+    for args in (("put", original, "stored"), ("get", "stored", daemon_root / "output")):
+        transfer = subprocess.run([client, *args], env=env, capture_output=True, timeout=10)
+        assert transfer.returncode == 0, (transfer, daemon_log.read_text())
+    assert (daemon_root / "storage/stored").is_file()
+    assert (daemon_root / "output").read_bytes() == original.read_bytes()
+    assert "authenticated with publickey" in daemon_log.read_text()
+finally:
+    os.kill(pid, signal.SIGTERM)
+    wait_until(lambda: not daemon_pid.exists() and "Removed PID file" in daemon_log.read_text())
 PYTHON
 
 # Inject pauses between signal registration, bind and listen on Linux.
@@ -192,6 +285,54 @@ for phase, signum, expected in (
     assert not (root / "logs/server.pid").exists()
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", port))
+
+# Kill the detached process before readiness. The launcher must fail and the
+# intermediate process must reap its child before returning that result.
+config = root / "startup-daemon.conf"
+config.write_text((root / "server.conf").read_text().replace("DaemonMode No", "DaemonMode Yes"))
+def child_pid(pid):
+    try:
+        children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+    except FileNotFoundError:
+        return None
+    return int(children[0]) if children else None
+
+pid_file = root / "logs/server.pid"
+
+def pid_written(pid):
+    try:
+        return pid_file.read_text() == f"{pid}\n"
+    except FileNotFoundError:
+        return False
+
+for phase, has_pid in (("before-listen", False), ("before-daemon-status", True)):
+    gate = root / f"daemon-startup-release-{phase}"
+    env = dict(os.environ, LD_PRELOAD=preload, NASFS_TEST_STARTUP_PHASE=phase,
+               NASFS_TEST_STARTUP_GATE=str(gate))
+    with subprocess.Popen([server, str(config)], env=env, stderr=subprocess.PIPE) as launcher:
+        daemon = None
+        try:
+            deadline = time.monotonic() + 5
+            while daemon is None or (has_pid and not pid_written(daemon)):
+                assert launcher.poll() is None and time.monotonic() < deadline
+                intermediate = child_pid(launcher.pid)
+                daemon = child_pid(intermediate) if intermediate else None
+                time.sleep(0.01)
+            if has_pid:
+                assert int(pid_file.read_text()) == daemon
+            else:
+                assert not pid_file.exists()
+            os.kill(daemon, signal.SIGKILL)
+            _, stderr = launcher.communicate(timeout=5)
+            assert launcher.returncode == 1 and b"NASFS daemon failed to start" in stderr
+            assert not Path(f"/proc/{daemon}").exists()
+            assert not pid_file.exists()
+        finally:
+            gate.touch()
+            if launcher.poll() is None:
+                if daemon and Path(f"/proc/{daemon}").exists():
+                    os.kill(daemon, signal.SIGKILL)
+                launcher.kill()
 PYTHON
 fi
 

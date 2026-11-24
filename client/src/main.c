@@ -209,6 +209,10 @@ typedef struct {
   const char* remote_name;
 } nasfs_batch_op_t;
 static nasfs_batch_op_t batch_queue[NASFS_MAX_BATCH];
+static struct {
+  dev_t device;
+  ino_t inode;
+} published_downloads[NASFS_MAX_BATCH];
 static int batch_count = 0;
 static int batch_idx = 0;
 
@@ -894,8 +898,29 @@ static void discard_download(void) {
   download_temp_path = NULL;
 }
 
+static int check_download_destination(void) {
+  struct stat destination;
+  if (lstat(local_filename, &destination) < 0) {
+    if (errno == ENOENT) return 0;
+    fprintf(stderr, "Cannot inspect download destination '%s': %s\n",
+            local_filename, strerror(errno));
+    return -1;
+  }
+  for (int i = 0; i < batch_idx - 1; i++) {
+    if (destination.st_dev == published_downloads[i].device &&
+        destination.st_ino == published_downloads[i].inode) {
+      fprintf(stderr, "Duplicate batch destination: '%s' aliases '%s'\n",
+              local_filename, batch_queue[i].local_path);
+      return -1;
+    }
+  }
+  return 0;
+}
+
 static int publish_download(void) {
+  int is_batch = batch_count > 1;
   if (close_local_file() < 0) return -1;
+  if (is_batch && check_download_destination() < 0) return -1;
   if (rename(download_temp_path, local_filename) < 0) {
     fprintf(stderr, "Cannot publish download '%s': %s\n", local_filename,
             strerror(errno));
@@ -903,6 +928,16 @@ static int publish_download(void) {
   }
   free(download_temp_path);
   download_temp_path = NULL;
+  if (is_batch) {
+    struct stat downloaded;
+    if (lstat(local_filename, &downloaded) < 0) {
+      fprintf(stderr, "Cannot identify published download '%s': %s\n",
+              local_filename, strerror(errno));
+      return -1;
+    }
+    published_downloads[batch_idx - 1].device = downloaded.st_dev;
+    published_downloads[batch_idx - 1].inode = downloaded.st_ino;
+  }
   return 0;
 }
 
