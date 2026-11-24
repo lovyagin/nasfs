@@ -282,13 +282,13 @@ void free_config(server_config_t* config) {
 void trim_string(char* str) {
   if (!str) return;
 
-  char* end = str + strlen(str) - 1;
+  char* end = strchr(str, '#');
+  if (!end) end = str + strlen(str);
+  while (end > str && isspace((unsigned char)end[-1])) end--;
 
-  while (isspace(*str)) str++;
-  while (isspace(*end)) end--;
-
-  *(end + 1) = '\0';
-
-  char* comment_start = strchr(str, '#');
-  if (comment_start) *comment_start = '\0';
+  char* start = str;
+  while (start < end && isspace((unsigned char)*start)) start++;
+  size_t length = (size_t)(end - start);
+  memmove(str, start, length);
+  str[length] = '\0';
 }

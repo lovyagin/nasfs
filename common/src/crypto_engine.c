@@ -5,12 +5,15 @@
 
 #include "crypto_engine.h"
 
+#include <arpa/inet.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
 #include <openssl/params.h>
 #include <sodium.h>
 #include <string.h>
+
+#include "protocol.h"
 
 /* --- Custom high-speed non-crypto checksum implementations --- */
 
@@ -128,6 +131,24 @@ int crypto_engine_derive_key(nasfs_kdf_algo_t algo, const char* password,
 
 /* --- Block Encryption interface --- */
 
+static void encode_block_counter(uint8_t out[8], uint64_t seq_num, int legacy) {
+  if (legacy)
+    memcpy(out, &seq_num, sizeof(seq_num));
+  else
+    protocol_store_u64(out, seq_num);
+}
+
+void crypto_engine_derive_block_key(uint8_t out[32], const uint8_t file_key[32],
+                                    const uint8_t salt[16], uint64_t seq_num,
+                                    int legacy) {
+  uint8_t input[32 + 16 + 8];
+  memcpy(input, file_key, 32);
+  memcpy(input + 32, salt, 16);
+  encode_block_counter(input + 32 + 16, seq_num, legacy);
+  crypto_generichash(out, 32, input, sizeof(input), NULL, 0);
+  sodium_memzero(input, sizeof(input));
+}
+
 int crypto_engine_encrypt_block(nasfs_cipher_algo_t algo,
                                 const uint8_t* plaintext, size_t plaintext_len,
                                 const uint8_t* key, uint64_t seq_num,
@@ -136,7 +157,7 @@ int crypto_engine_encrypt_block(nasfs_cipher_algo_t algo,
   if (!plaintext || !key || !out_ciphertext || !out_ciphertext_len) return -1;
 
   uint8_t nonce[24] = {0};  // Largest needed nonce (for XSalsa20/XChaCha20)
-  memcpy(nonce, &seq_num, sizeof(seq_num));
+  encode_block_counter(nonce, seq_num, 0);
 
   switch (algo) {
     case NASFS_CIPHER_XSALSA20_POLY1305: {
@@ -209,12 +230,13 @@ int crypto_engine_encrypt_block(nasfs_cipher_algo_t algo,
 int crypto_engine_decrypt_block(nasfs_cipher_algo_t algo,
                                 const uint8_t* ciphertext,
                                 size_t ciphertext_len, const uint8_t* key,
-                                uint64_t seq_num, uint8_t* out_plaintext,
+                                uint64_t seq_num, int legacy,
+                                uint8_t* out_plaintext,
                                 size_t* out_plaintext_len) {
   if (!ciphertext || !key || !out_plaintext || !out_plaintext_len) return -1;
 
   uint8_t nonce[24] = {0};
-  memcpy(nonce, &seq_num, sizeof(seq_num));
+  encode_block_counter(nonce, seq_num, legacy);
 
   switch (algo) {
     case NASFS_CIPHER_XSALSA20_POLY1305: {
@@ -306,16 +328,16 @@ int crypto_engine_hash(nasfs_hash_algo_t algo, const uint8_t* data,
     }
 
     case NASFS_HASH_ADLER32: {
-      uint32_t val = calc_adler32(data, data_len);
-      memcpy(out_hash, &val, sizeof(val));
-      *out_hash_len = sizeof(val);
+      uint32_t checksum = htonl(calc_adler32(data, data_len));
+      memcpy(out_hash, &checksum, sizeof(checksum));
+      *out_hash_len = sizeof(checksum);
       return 0;
     }
 
     case NASFS_HASH_CRC32: {
-      uint32_t val = calc_crc32(data, data_len);
-      memcpy(out_hash, &val, sizeof(val));
-      *out_hash_len = sizeof(val);
+      uint32_t checksum = htonl(calc_crc32(data, data_len));
+      memcpy(out_hash, &checksum, sizeof(checksum));
+      *out_hash_len = sizeof(checksum);
       return 0;
     }
   }

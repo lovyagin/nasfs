@@ -59,6 +59,11 @@ int crypto_engine_derive_key(nasfs_kdf_algo_t algo, const char* password,
                              size_t salt_len, uint8_t* out_key,
                              size_t out_key_len);
 
+/* Legacy counter encoding is used only when reading an older container. */
+void crypto_engine_derive_block_key(uint8_t out[32], const uint8_t file_key[32],
+                                    const uint8_t salt[16], uint64_t seq_num,
+                                    int legacy);
+
 /**
  * @brief Encrypt a block of data.
  * @return 0 on success, non-zero on failure.
@@ -76,11 +81,13 @@ int crypto_engine_encrypt_block(nasfs_cipher_algo_t algo,
 int crypto_engine_decrypt_block(nasfs_cipher_algo_t algo,
                                 const uint8_t* ciphertext,
                                 size_t ciphertext_len, const uint8_t* key,
-                                uint64_t seq_num, uint8_t* out_plaintext,
+                                uint64_t seq_num, int legacy,
+                                uint8_t* out_plaintext,
                                 size_t* out_plaintext_len);
 
 /**
  * @brief Compute integrity checksum/hash over a buffer.
+ * CRC32 and Adler32 are returned as four bytes in network byte order.
  */
 int crypto_engine_hash(nasfs_hash_algo_t algo, const uint8_t* data,
                        size_t data_len, uint8_t* out_hash,

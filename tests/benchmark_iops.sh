@@ -12,7 +12,7 @@
 #
 # Usage: ./benchmark_iops.sh [--sftp-host HOST] [--sftp-user USER]
 #                             [--sftp-port PORT] [--sftp-key FILE]
-#                             [--count N] [--runs R]
+#                             [--count N] [--runs R] [--no-sftp]
 
 set -euo pipefail
 export LC_ALL=C LANG=C
@@ -25,13 +25,19 @@ export LC_ALL=C LANG=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SERVER_BIN="$ROOT_DIR/build/nasfs_server"
-CLIENT_BIN="$ROOT_DIR/build/nasfs_client"
+SERVER_BIN="${NASFS_SERVER_BIN:-$ROOT_DIR/build/nasfs_server}"
+CLIENT_BIN="${NASFS_CLIENT_BIN:-$ROOT_DIR/build/nasfs_client}"
+if [[ $CLIENT_BIN != /* ]]; then
+  CLIENT_BIN="$PWD/$CLIENT_BIN"
+fi
+# shellcheck source-path=SCRIPTDIR
+source "$SCRIPT_DIR/integration_helpers.sh"
 
 SFTP_HOST="localhost"
-SFTP_USER="$USER"
+SFTP_USER="${USER:-$(id -un)}"
 SFTP_PORT="22"
 SFTP_KEY=""
+COMPARE_SFTP=1
 COUNT=20          # files per batch
 RUNS=3            # repeat each batch, take median
 
@@ -39,20 +45,18 @@ RUNS=3            # repeat each batch, take median
 FILE_SIZES=(4096 16384 65536 262144)
 FILE_LABELS=("4KB" "16KB" "64KB" "256KB")
 
-SERVER_PORT=18082
-BENCH_ROOT="/tmp/nasfs_iops_$$"
-STORAGE_DIR="$BENCH_ROOT/storage"
+SERVER_PORT=${NASFS_BENCH_PORT:-18082}
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-CSV="$ROOT_DIR/bench_iops_${TIMESTAMP}.csv"
+CSV="${NASFS_BENCH_CSV:-$ROOT_DIR/bench_iops_${TIMESTAMP}.csv}"
 
-CYAN='\033[0;36m'; BOLD='\033[1m'; RED='\033[0;31m'
-GREEN='\033[0;32m'; NC='\033[0m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sftp-host) SFTP_HOST="$2"; shift 2 ;;
     --sftp-user) SFTP_USER="$2"; shift 2 ;;
     --sftp-port) SFTP_PORT="$2"; shift 2 ;;
+    --no-sftp)  COMPARE_SFTP=0; shift ;;
     --sftp-key)  SFTP_KEY="$2";  shift 2 ;;
     --count)     COUNT="$2";     shift 2 ;;
     --runs)      RUNS="$2";      shift 2 ;;
@@ -60,26 +64,25 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-TASKSET=""
-command -v taskset &>/dev/null && TASKSET="taskset -c 0"
-THROTTLE="$TASKSET nice -n 19"
+THROTTLE=(nice -n 19)
+if command -v taskset >/dev/null && affinity=$(taskset -pc "$$" 2>/dev/null); then
+  affinity=${affinity##*: }
+  THROTTLE=(taskset -c "${affinity%%[-,]*}" "${THROTTLE[@]}")
+fi
 
 SFTP_OPTS=(-P "$SFTP_PORT" -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10)
 [[ -n "$SFTP_KEY" ]] && SFTP_OPTS+=(-i "$SFTP_KEY")
 
-cleanup() {
-  pkill -f "nasfs_server.*$SERVER_PORT" 2>/dev/null || true
-  rm -rf "$BENCH_ROOT"
-}
-trap cleanup EXIT
-cleanup
-mkdir -p "$BENCH_ROOT" "$STORAGE_DIR"
+benchmark_home=${HOME:-}
+setup_integration
+BENCH_ROOT="$TEST_ROOT"
 echo "system,file_size,direction,run,count,total_sec,files_per_sec,latency_ms,throughput_MBps" > "$CSV"
 
-now_ns() { date +%s%N; }
+now_ns() { python3 -c "import time; print(time.monotonic_ns())"; }
 
 median() {
-  local vals=("$@") n=${#vals[@]}
+  local vals=("$@")
+  local n=${#vals[@]}
   printf '%s\n' "${vals[@]}" | sort -g | awk "NR==$(( (n-1)/2 + 1 )) {printf \"%.4f\", \$1}"
 }
 
@@ -88,32 +91,24 @@ start_server() {
 ListenAddr 127.0.0.1
 Port $SERVER_PORT
 MaxConn 50
-LogFile $BENCH_ROOT/server.log
-LogLevel Error
+LogFile $LOG_DIR/server.log
+LogLevel Info
 DaemonMode No
 PidFile $BENCH_ROOT/server.pid
 StorageDir $STORAGE_DIR
-KexAlgorithms ML-KEM-512,Kyber512
+KexAlgorithms ML-KEM-512
 CipherAlgorithms xchacha20poly1305
 AuthMethods password
 AuthPassword nasfs
 BlockSize 65536
 EOF
   rm -f "$STORAGE_DIR"/*
-  $THROTTLE "$SERVER_BIN" "$BENCH_ROOT/server.conf" >> "$BENCH_ROOT/server_out.log" 2>&1 &
-  for i in $(seq 1 50); do
-    bash -c "echo >/dev/tcp/127.0.0.1/$SERVER_PORT" 2>/dev/null && return 0
-    sleep 0.1
-  done
-  echo "Server did not start" >&2; exit 1
-}
-
-stop_server() {
-  pkill -f "nasfs_server.*$SERVER_PORT" 2>/dev/null || true
-  sleep 0.2
+  : > "$LOG_DIR/server.log"
+  start_integration_server "$BENCH_ROOT/server.conf" "${THROTTLE[@]}"
 }
 
 nasfs_env() {
+  local status=0
   env \
     NASFS_KEX_ALGORITHMS="ML-KEM-512" \
     NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
@@ -125,9 +120,11 @@ nasfs_env() {
     NASFS_FILE_HASH="blake2b" \
     NASFS_KDF="argon2id" \
     NASFS_BLOCK_SIZE="65536" \
-    NASFS_SERVER_IP="127.0.0.1" \
-    NASFS_SERVER_PORT="$SERVER_PORT" \
-    "$@"
+    "${THROTTLE[@]}" "$CLIENT_BIN" "$@" >/dev/null || status=$?
+  if (( status != 0 )); then
+    printf 'NASFS client %s failed (exit %d).\n' "$1" "$status" >&2
+  fi
+  return "$status"
 }
 
 # N serial PUTs (one connection per file)
@@ -138,7 +135,7 @@ bench_nasfs_serial_put() {
   local t0 t1
   t0=$(now_ns)
   for i in $(seq 1 "$count"); do
-    $THROTTLE nasfs_env "$CLIENT_BIN" put "$tfile" "iops_${i}_$$.bin" >/dev/null 2>&1
+    nasfs_env put "$tfile" "iops_${i}_$$.bin" || return
   done
   t1=$(now_ns)
   local total_sec
@@ -153,7 +150,7 @@ bench_nasfs_serial_get() {
   local t0 t1
   t0=$(now_ns)
   for i in $(seq 1 "$count"); do
-    $THROTTLE nasfs_env "$CLIENT_BIN" get "iops_${i}_$$.bin" "$out" >/dev/null 2>&1
+    nasfs_env get "iops_${i}_$$.bin" "$out" || return
     rm -f "$out"
   done
   t1=$(now_ns)
@@ -167,11 +164,7 @@ bench_nasfs_batch_put() {
   local fsz=$1 count=$2
   local tfile="$BENCH_ROOT/src_${fsz}.bin"
   rm -f "$STORAGE_DIR"/*
-  # build args: same source file, unique remote names
-  local args=()
-  for i in $(seq 1 "$count"); do args+=("$tfile"); done
-  # mput uploads each file as basename of local path — all same name, server overwrites.
-  # Use symlinks with unique names to get unique remote filenames.
+  # Symlinks give each upload a distinct destination basename.
   local ldir="$BENCH_ROOT/mput_src_$$"
   mkdir -p "$ldir"
   for i in $(seq 1 "$count"); do
@@ -182,7 +175,7 @@ bench_nasfs_batch_put() {
 
   local t0 t1
   t0=$(now_ns)
-  $THROTTLE nasfs_env "$CLIENT_BIN" mput "${largs[@]}" >/dev/null 2>&1
+  nasfs_env mput "${largs[@]}" || return
   t1=$(now_ns)
   rm -rf "$ldir"
   local total_sec
@@ -200,7 +193,7 @@ bench_nasfs_batch_get() {
   local t0 t1
   # mget downloads each remote to cwd basename; cd to ldir
   t0=$(now_ns)
-  (cd "$ldir" && $THROTTLE nasfs_env "$CLIENT_BIN" mget "${remotes[@]}" >/dev/null 2>&1)
+  (cd "$ldir" && nasfs_env mget "${remotes[@]}") || return
   t1=$(now_ns)
   rm -rf "$ldir"
   local total_sec
@@ -225,7 +218,7 @@ bench_sftp_put_batch() {
 
   local t0 t1
   t0=$(now_ns)
-  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1
+  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
   t1=$(now_ns)
 
   # cleanup remote
@@ -254,7 +247,7 @@ bench_sftp_get_batch() {
     | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1 || true
   : > "$batchfile"
   for i in $(seq 1 "$count"); do echo "put $file $remote_dir/f_${i}" >> "$batchfile"; done
-  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1
+  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
 
   # time the batch GET in one session
   : > "$batchfile"
@@ -262,7 +255,7 @@ bench_sftp_get_batch() {
 
   local t0 t1
   t0=$(now_ns)
-  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1
+  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
   t1=$(now_ns)
 
   rm -rf "$local_dir"
@@ -283,7 +276,7 @@ bench_sftp_get_batch() {
 # ---- Header ----
 echo ""
 echo -e "${BOLD}NASFS small-file IOPS benchmark vs SFTP — $(date)${NC}"
-echo -e "Throttle: $THROTTLE"
+echo -e "Throttle: ${THROTTLE[*]}"
 echo -e "Files per batch: $COUNT   Runs: $RUNS (median)\n"
 echo -e "${CYAN}Note: NASFS = new PQC connection per file | SFTP = single session for all files${NC}\n"
 
@@ -295,16 +288,19 @@ done
 
 start_server
 
-declare -A SER_FPS_PUT SER_FPS_GET SER_LAT_PUT SER_LAT_GET
-declare -A BAT_FPS_PUT BAT_FPS_GET BAT_LAT_PUT BAT_LAT_GET
-
-hdr="%-8s  %-5s  %8s  %8s  %9s  %9s\n"
-row="%-8s  %-5s  %6.2f/s  %6.2f/s  %6.0f ms  %6.0f ms\n"
+SER_FPS_PUT=()
+SER_FPS_GET=()
+SER_LAT_PUT=()
+SER_LAT_GET=()
+BAT_FPS_PUT=()
+BAT_FPS_GET=()
+BAT_LAT_PUT=()
+BAT_LAT_GET=()
 
 # ---- NASFS serial (one connection per file) ----
 echo -e "${CYAN}=== NASFS serial (new PQC connection per file) ===${NC}"
-printf "$hdr" "FileSize" "Dir" "Files/s" "Files/s" "Lat/file" "Lat/file"
-printf "$hdr" "--------" "---" "[serial]" "[batch]" "[serial]" "[batch]"
+printf '%-8s  %-5s  %8s  %8s  %9s  %9s\n' "FileSize" "Dir" "Files/s" "Files/s" "Lat/file" "Lat/file"
+printf '%-8s  %-5s  %8s  %8s  %9s  %9s\n' "--------" "---" "[serial]" "[batch]" "[serial]" "[batch]"
 
 for fidx in "${!FILE_SIZES[@]}"; do
   fsz="${FILE_SIZES[$fidx]}"
@@ -312,54 +308,65 @@ for fidx in "${!FILE_SIZES[@]}"; do
 
   # --- serial PUT ---
   ser_put_fps=(); ser_put_lat=()
-  for run in $(seq 1 $RUNS); do
-    read -r total fps lat tput <<< "$(bench_nasfs_serial_put "$fsz" "$COUNT")"
+  for run in $(seq 1 "$RUNS"); do
+    measurement=$(bench_nasfs_serial_put "$fsz" "$COUNT")
+    read -r total fps lat tput <<< "$measurement"
     ser_put_fps+=("$fps"); ser_put_lat+=("$lat")
     echo "nasfs_serial,${fsz},put,${run},${COUNT},${total},${fps},${lat},${tput}" >> "$CSV"
   done
-  SER_FPS_PUT["$flbl"]=$(median "${ser_put_fps[@]}")
-  SER_LAT_PUT["$flbl"]=$(median "${ser_put_lat[@]}")
+  SER_FPS_PUT[fidx]=$(median "${ser_put_fps[@]}")
+  SER_LAT_PUT[fidx]=$(median "${ser_put_lat[@]}")
 
   # --- batch PUT (mput) ---
   bat_put_fps=(); bat_put_lat=()
-  for run in $(seq 1 $RUNS); do
-    read -r total fps lat tput <<< "$(bench_nasfs_batch_put "$fsz" "$COUNT")"
+  for run in $(seq 1 "$RUNS"); do
+    measurement=$(bench_nasfs_batch_put "$fsz" "$COUNT")
+    read -r total fps lat tput <<< "$measurement"
     bat_put_fps+=("$fps"); bat_put_lat+=("$lat")
     echo "nasfs_batch,${fsz},put,${run},${COUNT},${total},${fps},${lat},${tput}" >> "$CSV"
   done
-  BAT_FPS_PUT["$flbl"]=$(median "${bat_put_fps[@]}")
-  BAT_LAT_PUT["$flbl"]=$(median "${bat_put_lat[@]}")
+  BAT_FPS_PUT[fidx]=$(median "${bat_put_fps[@]}")
+  BAT_LAT_PUT[fidx]=$(median "${bat_put_lat[@]}")
 
-  printf "$row" "$flbl" "PUT" \
-    "${SER_FPS_PUT[$flbl]}" "${BAT_FPS_PUT[$flbl]}" \
-    "${SER_LAT_PUT[$flbl]}" "${BAT_LAT_PUT[$flbl]}"
+  printf '%-8s  %-5s  %6.2f/s  %6.2f/s  %6.0f ms  %6.0f ms\n' "$flbl" "PUT" \
+    "${SER_FPS_PUT[fidx]}" "${BAT_FPS_PUT[fidx]}" \
+    "${SER_LAT_PUT[fidx]}" "${BAT_LAT_PUT[fidx]}"
 
   # --- serial GET ---
   ser_get_fps=(); ser_get_lat=()
-  for run in $(seq 1 $RUNS); do
-    read -r total fps lat tput <<< "$(bench_nasfs_serial_get "$fsz" "$COUNT")"
+  for run in $(seq 1 "$RUNS"); do
+    measurement=$(bench_nasfs_serial_get "$fsz" "$COUNT")
+    read -r total fps lat tput <<< "$measurement"
     ser_get_fps+=("$fps"); ser_get_lat+=("$lat")
     echo "nasfs_serial,${fsz},get,${run},${COUNT},${total},${fps},${lat},${tput}" >> "$CSV"
   done
-  SER_FPS_GET["$flbl"]=$(median "${ser_get_fps[@]}")
-  SER_LAT_GET["$flbl"]=$(median "${ser_get_lat[@]}")
+  SER_FPS_GET[fidx]=$(median "${ser_get_fps[@]}")
+  SER_LAT_GET[fidx]=$(median "${ser_get_lat[@]}")
 
   # --- batch GET (mget) ---
   bat_get_fps=(); bat_get_lat=()
-  for run in $(seq 1 $RUNS); do
-    read -r total fps lat tput <<< "$(bench_nasfs_batch_get "$fsz" "$COUNT")"
+  for run in $(seq 1 "$RUNS"); do
+    measurement=$(bench_nasfs_batch_get "$fsz" "$COUNT")
+    read -r total fps lat tput <<< "$measurement"
     bat_get_fps+=("$fps"); bat_get_lat+=("$lat")
     echo "nasfs_batch,${fsz},get,${run},${COUNT},${total},${fps},${lat},${tput}" >> "$CSV"
   done
-  BAT_FPS_GET["$flbl"]=$(median "${bat_get_fps[@]}")
-  BAT_LAT_GET["$flbl"]=$(median "${bat_get_lat[@]}")
+  BAT_FPS_GET[fidx]=$(median "${bat_get_fps[@]}")
+  BAT_LAT_GET[fidx]=$(median "${bat_get_lat[@]}")
 
-  printf "$row" "$flbl" "GET" \
-    "${SER_FPS_GET[$flbl]}" "${BAT_FPS_GET[$flbl]}" \
-    "${SER_LAT_GET[$flbl]}" "${BAT_LAT_GET[$flbl]}"
+  printf '%-8s  %-5s  %6.2f/s  %6.2f/s  %6.0f ms  %6.0f ms\n' "$flbl" "GET" \
+    "${SER_FPS_GET[fidx]}" "${BAT_FPS_GET[fidx]}" \
+    "${SER_LAT_GET[fidx]}" "${BAT_LAT_GET[fidx]}"
 done
 
-stop_server
+stop_integration_server
+
+if (( ! COMPARE_SFTP )); then
+  printf 'CSV: %s\n' "$CSV"
+  exit 0
+fi
+
+export HOME="$benchmark_home"
 
 # ---- SFTP IOPS ----
 echo ""
@@ -369,7 +376,10 @@ printf "%-8s  %-5s  %-8s  %-10s  %-12s  %-12s\n" \
 printf "%-8s  %-5s  %-8s  %-10s  %-12s  %-12s\n" \
   "--------" "---" "-------" "-------" "----------" "------------"
 
-declare -A S_FPS_PUT S_FPS_GET S_LAT_PUT S_LAT_GET S_TPUT_PUT S_TPUT_GET
+S_FPS_PUT=()
+S_FPS_GET=()
+S_LAT_PUT=()
+S_LAT_GET=()
 
 for fidx in "${!FILE_SIZES[@]}"; do
   fsz="${FILE_SIZES[$fidx]}"
@@ -377,8 +387,9 @@ for fidx in "${!FILE_SIZES[@]}"; do
   tfile="$BENCH_ROOT/src_${fsz}.bin"
 
   put_fps=(); put_lat=(); put_tput=(); put_total=()
-  for run in $(seq 1 $RUNS); do
-    read -r total fps lat tput <<< "$(bench_sftp_put_batch "$tfile" "$COUNT" "$fsz")"
+  for run in $(seq 1 "$RUNS"); do
+    measurement=$(bench_sftp_put_batch "$tfile" "$COUNT" "$fsz")
+    read -r total fps lat tput <<< "$measurement"
     put_fps+=("$fps"); put_lat+=("$lat"); put_tput+=("$tput"); put_total+=("$total")
     echo "sftp,${fsz},put,${run},${COUNT},${total},${fps},${lat},${tput}" >> "$CSV"
   done
@@ -386,14 +397,15 @@ for fidx in "${!FILE_SIZES[@]}"; do
   mlat=$(median "${put_lat[@]}")
   mtput=$(median "${put_tput[@]}")
   mtotal=$(median "${put_total[@]}")
-  S_FPS_PUT["$flbl"]="$mfps"; S_LAT_PUT["$flbl"]="$mlat"; S_TPUT_PUT["$flbl"]="$mtput"
+  S_FPS_PUT[fidx]="$mfps"; S_LAT_PUT[fidx]="$mlat"
 
   printf "%-8s  %-5s  %6.2f/s   %6.0f ms    %6.2f MB/s    %.1f s\n" \
     "$flbl" "PUT" "$mfps" "$mlat" "$mtput" "$mtotal"
 
   get_fps=(); get_lat=(); get_tput=(); get_total=()
-  for run in $(seq 1 $RUNS); do
-    read -r total fps lat tput <<< "$(bench_sftp_get_batch "$tfile" "$COUNT" "$fsz")"
+  for run in $(seq 1 "$RUNS"); do
+    measurement=$(bench_sftp_get_batch "$tfile" "$COUNT" "$fsz")
+    read -r total fps lat tput <<< "$measurement"
     get_fps+=("$fps"); get_lat+=("$lat"); get_tput+=("$tput"); get_total+=("$total")
     echo "sftp,${fsz},get,${run},${COUNT},${total},${fps},${lat},${tput}" >> "$CSV"
   done
@@ -401,7 +413,7 @@ for fidx in "${!FILE_SIZES[@]}"; do
   mlat=$(median "${get_lat[@]}")
   mtput=$(median "${get_tput[@]}")
   mtotal=$(median "${get_total[@]}")
-  S_FPS_GET["$flbl"]="$mfps"; S_LAT_GET["$flbl"]="$mlat"; S_TPUT_GET["$flbl"]="$mtput"
+  S_FPS_GET[fidx]="$mfps"; S_LAT_GET[fidx]="$mlat"
 
   printf "%-8s  %-5s  %6.2f/s   %6.0f ms    %6.2f MB/s    %.1f s\n" \
     "$flbl" "GET" "$mfps" "$mlat" "$mtput" "$mtotal"
@@ -415,14 +427,15 @@ printf "%-8s  %-5s  %9s  %9s  %9s  %9s  %9s  %9s\n" \
 printf "%-8s  %-5s  %9s  %9s  %9s  %9s  %9s  %9s\n" \
   "-----" "---" "-------" "-------" "--------" "-------" "-------" "--------"
 
-for flbl in "${FILE_LABELS[@]}"; do
+for fidx in "${!FILE_LABELS[@]}"; do
+  flbl="${FILE_LABELS[$fidx]}"
   for dir in PUT GET; do
     if [[ "$dir" == "PUT" ]]; then
-      ser_fps="${SER_FPS_PUT[$flbl]:-0}"; bat_fps="${BAT_FPS_PUT[$flbl]:-0}"; sftp_fps="${S_FPS_PUT[$flbl]:-0}"
-      ser_lat="${SER_LAT_PUT[$flbl]:-0}"; bat_lat="${BAT_LAT_PUT[$flbl]:-0}"; sftp_lat="${S_LAT_PUT[$flbl]:-0}"
+      ser_fps="${SER_FPS_PUT[fidx]:-0}"; bat_fps="${BAT_FPS_PUT[fidx]:-0}"; sftp_fps="${S_FPS_PUT[fidx]:-0}"
+      ser_lat="${SER_LAT_PUT[fidx]:-0}"; bat_lat="${BAT_LAT_PUT[fidx]:-0}"; sftp_lat="${S_LAT_PUT[fidx]:-0}"
     else
-      ser_fps="${SER_FPS_GET[$flbl]:-0}"; bat_fps="${BAT_FPS_GET[$flbl]:-0}"; sftp_fps="${S_FPS_GET[$flbl]:-0}"
-      ser_lat="${SER_LAT_GET[$flbl]:-0}"; bat_lat="${BAT_LAT_GET[$flbl]:-0}"; sftp_lat="${S_LAT_GET[$flbl]:-0}"
+      ser_fps="${SER_FPS_GET[fidx]:-0}"; bat_fps="${BAT_FPS_GET[fidx]:-0}"; sftp_fps="${S_FPS_GET[fidx]:-0}"
+      ser_lat="${SER_LAT_GET[fidx]:-0}"; bat_lat="${BAT_LAT_GET[fidx]:-0}"; sftp_lat="${S_LAT_GET[fidx]:-0}"
     fi
     speedup=$(awk "BEGIN {printf \"%.2f\", $bat_fps / ($ser_fps > 0 ? $ser_fps : 1)}")
     printf "%-8s  %-5s  %7.2f/s  %7.2f/s  %7.2f/s  %6.0f ms  %6.0f ms  %6.0f ms  batch %sx vs serial\n" \

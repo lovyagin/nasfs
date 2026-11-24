@@ -240,6 +240,8 @@ static uint8_t author_secret[crypto_sign_SECRETKEYBYTES];
 static uint8_t author_public[crypto_sign_PUBLICKEYBYTES];
 static int allow_unsigned_reads;
 static int download_has_owner_slot;
+static int batch_upload_exclusive;
+static int download_legacy_counter;
 static int require_manifest_digest;
 static uint8_t manifest_digest[32];
 
@@ -790,7 +792,8 @@ static void send_put_req(uv_stream_t* stream) {
       close_connection((uv_handle_t*)stream);
       return;
     }
-    req_payload[0] = 1;
+    req_payload[0] = batch_upload_exclusive ? NASFS_PUT_REQUEST_EXCLUSIVE
+                                            : NASFS_FILE_REQUEST_PORTABLE;
     randombytes_buf(file_salt, crypto_pwhash_SALTBYTES);
     uint8_t owner_slot[NASFS_OWNER_SLOT_V1_SIZE];
     if (crypto_engine_create_owner_slot(owner_slot, encryption_key, master_key,
@@ -803,15 +806,16 @@ static void send_put_req(uv_stream_t* stream) {
     size_t off = 1;
     memcpy(req_payload + off, file_salt, crypto_pwhash_SALTBYTES);
     off += crypto_pwhash_SALTBYTES;
-    memcpy(req_payload + off, &put_plaintext_size, sizeof(uint64_t));
+    protocol_store_u64(req_payload + off, put_plaintext_size);
     off += sizeof(uint64_t);
     req_payload[off++] = (uint8_t)file_cipher_algo;
     req_payload[off++] = (uint8_t)file_hash_algo;
     memcpy(req_payload + off, owner_slot, sizeof(owner_slot));
     off += sizeof(owner_slot);
     memcpy(req_payload + off, (const uint8_t*)remote_filename, fn_len + 1);
-    protocol_manifest_init(&file_manifest, remote_filename, put_plaintext_size,
-                           file_salt, file_cipher_algo, file_hash_algo);
+    protocol_manifest_init(
+        &file_manifest, remote_filename, put_plaintext_size, file_salt,
+        file_cipher_algo | NASFS_FILE_CIPHER_PORTABLE, file_hash_algo);
     protocol_manifest_owner_slot(&file_manifest, owner_slot,
                                  sizeof(owner_slot));
     send_command(stream, NASFS_CMD_PUT_REQ, req_payload, payload_len, 1);
@@ -839,7 +843,7 @@ static void send_get_req(uv_stream_t* stream) {
     close_connection((uv_handle_t*)stream);
     return;
   }
-  req_payload[0] = file_encryption_enabled ? 1 : 0;
+  req_payload[0] = file_encryption_enabled ? NASFS_FILE_REQUEST_PORTABLE : 0;
   memcpy(req_payload + 1, (const uint8_t*)remote_filename, fn_len + 1);
   send_command(stream, NASFS_CMD_GET_REQ, req_payload, payload_len, 1);
   free(req_payload);
@@ -1079,17 +1083,9 @@ void on_local_read(uv_fs_t* req) {
         goto cleanup;
       }
 
-      /* Derive a per-block key: BLAKE2b(encryption_key || file_salt || seq) */
       uint8_t block_key[crypto_secretbox_KEYBYTES];
-      uint8_t key_input[crypto_secretbox_KEYBYTES + crypto_pwhash_SALTBYTES +
-                        sizeof(client_block_seq)];
-      memcpy(key_input, encryption_key, crypto_secretbox_KEYBYTES);
-      memcpy(key_input + crypto_secretbox_KEYBYTES, file_salt,
-             crypto_pwhash_SALTBYTES);
-      memcpy(key_input + crypto_secretbox_KEYBYTES + crypto_pwhash_SALTBYTES,
-             &client_block_seq, sizeof(client_block_seq));
-      crypto_generichash(block_key, sizeof(block_key), key_input,
-                         sizeof(key_input), NULL, 0);
+      crypto_engine_derive_block_key(block_key, encryption_key, file_salt,
+                                     client_block_seq, 0);
 
       size_t actual_ciphertext_len = 0;
       if (crypto_engine_encrypt_block(file_cipher_algo,
@@ -1388,8 +1384,10 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
+              uint8_t manifest_cipher = file_cipher_algo;
               if (file_encryption_enabled) {
-                /* GET_ACK payload: [16 salt][8 size][1 cipher][1 hash] */
+                /* GET_ACK: [16 salt][8 size][1 cipher][1 hash][optional slot]
+                 */
                 download_has_owner_slot =
                     plain_frame.payload_len ==
                     NASFS_FILE_METADATA_SIZE + NASFS_OWNER_SLOT_V1_SIZE;
@@ -1403,12 +1401,15 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                   return;
                 }
                 memcpy(file_salt, plain_frame.payload, crypto_pwhash_SALTBYTES);
-                memcpy(&expected_plaintext_size,
-                       plain_frame.payload + crypto_pwhash_SALTBYTES,
-                       sizeof(uint64_t));
-                file_cipher_algo =
-                    (nasfs_cipher_algo_t)plain_frame
+                expected_plaintext_size = protocol_load_u64(
+                    plain_frame.payload + crypto_pwhash_SALTBYTES);
+                manifest_cipher =
+                    plain_frame
                         .payload[crypto_pwhash_SALTBYTES + sizeof(uint64_t)];
+                download_legacy_counter =
+                    (manifest_cipher & NASFS_FILE_CIPHER_PORTABLE) == 0;
+                file_cipher_algo =
+                    manifest_cipher & ~NASFS_FILE_CIPHER_PORTABLE;
                 file_hash_algo =
                     (nasfs_hash_algo_t)
                         plain_frame.payload[crypto_pwhash_SALTBYTES +
@@ -1444,7 +1445,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
 
               protocol_manifest_init(&file_manifest, remote_filename,
                                      expected_plaintext_size, file_salt,
-                                     file_cipher_algo, file_hash_algo);
+                                     manifest_cipher, file_hash_algo);
               if (download_has_owner_slot) {
                 protocol_manifest_owner_slot(
                     &file_manifest,
@@ -1557,25 +1558,17 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                   return;
                 }
 
-                /* Derive per-block key: BLAKE2b(encryption_key||salt||seq) */
                 uint8_t block_key[crypto_secretbox_KEYBYTES];
-                uint8_t key_input[crypto_secretbox_KEYBYTES +
-                                  crypto_pwhash_SALTBYTES +
-                                  sizeof(client_block_seq)];
-                memcpy(key_input, encryption_key, crypto_secretbox_KEYBYTES);
-                memcpy(key_input + crypto_secretbox_KEYBYTES, file_salt,
-                       crypto_pwhash_SALTBYTES);
-                memcpy(key_input + crypto_secretbox_KEYBYTES +
-                           crypto_pwhash_SALTBYTES,
-                       &client_block_seq, sizeof(client_block_seq));
-                crypto_generichash(block_key, sizeof(block_key), key_input,
-                                   sizeof(key_input), NULL, 0);
+                crypto_engine_derive_block_key(block_key, encryption_key,
+                                               file_salt, client_block_seq,
+                                               download_legacy_counter);
 
                 size_t plaintext_len = 0;
                 if (crypto_engine_decrypt_block(
                         file_cipher_algo, plain_frame.payload,
                         plain_frame.payload_len, block_key, client_block_seq,
-                        decrypted_buf, &plaintext_len) != 0) {
+                        download_legacy_counter, decrypted_buf,
+                        &plaintext_len) != 0) {
                   fprintf(stderr,
                           "\nError: Decryption failed. Wrong key or corrupted "
                           "data on block %llu.\n",
@@ -1762,16 +1755,16 @@ int main(int argc, char** argv) {
   }
 
   if (argc < 3) {
-    fprintf(stderr,
-            "Usage:\n"
-            "  %s put  <local_file> [remote_name]   -- single upload\n"
-            "  %s get  <remote_file> [local_file]   -- single download\n"
-            "  %s mput <file1> <file2> ...           -- batch upload (one "
-            "session)\n"
-            "  %s mget <remote1> <remote2> ...       -- batch download (one "
-            "session)\n"
-            "  %s keygen <private_key> <authorized_keys> [sig_algo]\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0]);
+    fprintf(
+        stderr,
+        "Usage:\n"
+        "  %s put  <local_file> [remote_name]   -- single upload\n"
+        "  %s get  <remote_file> [local_file]   -- single download\n"
+        "  %s mput <file1> <file2> ...           -- batch upload, create only\n"
+        "  %s mget <remote1> <remote2> ...       -- batch download (one "
+        "session)\n"
+        "  %s keygen <private_key> <authorized_keys> [sig_algo]\n",
+        argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 1;
   }
 
@@ -1910,6 +1903,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     int uploading = strcmp(argv[1], "mput") == 0;
+    batch_upload_exclusive = uploading;
     for (int i = 2; i < argc; i++) {
       const char* name = get_basename(argv[i]);
       const char* requested_dest = uploading ? name : argv[i];

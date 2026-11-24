@@ -97,6 +97,7 @@ typedef struct {
   uint64_t expected_plaintext_size; /**< Plaintext file size announced by the
                                        client on PUT; returned on GET so the
                                        client can verify no truncation. */
+  int upload_exclusive;     /**< Publish only if the name does not exist. */
   uint8_t file_cipher_algo; /**< nasfs_cipher_algo_t for this file's blocks. */
   uint8_t file_hash_algo;   /**< nasfs_hash_algo_t for block integrity. */
 

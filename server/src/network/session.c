@@ -560,7 +560,8 @@ static void publish_upload(uv_work_t* req) {
   if (rc == 0 && written != (int)sizeof(trailer)) rc = UV_EIO;
   if (rc == 0) {
     rc = nasfs_storage_publish_upload(
-        session->storage, session->upload_temp_name, session->upload_name);
+        session->storage, session->upload_temp_name, session->upload_name,
+        session->upload_exclusive);
   }
   ctx->result = rc;
 }
@@ -673,10 +674,11 @@ static void on_put_fs_open(client_session_t* session, int result,
         return;
       }
       session->file_offset = header_size;
-      protocol_manifest_init(&session->manifest, session->upload_name,
-                             session->expected_plaintext_size,
-                             session->file_salt, session->file_cipher_algo,
-                             session->file_hash_algo);
+      protocol_manifest_init(
+          &session->manifest, session->upload_name,
+          session->expected_plaintext_size, session->file_salt,
+          session->file_cipher_algo | NASFS_FILE_CIPHER_PORTABLE,
+          session->file_hash_algo);
       protocol_manifest_owner_slot(&session->manifest, session->owner_slot,
                                    sizeof(session->owner_slot));
     } else {
@@ -861,11 +863,13 @@ static void on_get_fs_open(client_session_t* session, int result,
           (disk_cipher & FILE_HEADER_RECORD_LENGTHS) != 0;
       session->has_manifest = (disk_cipher & FILE_HEADER_MANIFEST) != 0;
       int has_slot = (disk_cipher & FILE_HEADER_OWNER_SLOT_V1) != 0;
+      uint8_t portable = disk_cipher & NASFS_FILE_CIPHER_PORTABLE;
       session->file_cipher_algo =
-          disk_cipher & ~(FILE_HEADER_RECORD_LENGTHS | FILE_HEADER_MANIFEST |
-                          FILE_HEADER_OWNER_SLOT_V1);
+          disk_cipher &
+          ~(FILE_HEADER_RECORD_LENGTHS | FILE_HEADER_MANIFEST |
+            FILE_HEADER_OWNER_SLOT_V1 | NASFS_FILE_CIPHER_PORTABLE);
       if ((session->has_manifest && !session->has_record_lengths) ||
-          (has_slot && !session->has_manifest)) {
+          (has_slot && !session->has_manifest) || (portable && !has_slot)) {
         session_close((uv_handle_t*)&session->handle);
         return;
       }
@@ -893,10 +897,14 @@ static void on_get_fs_open(client_session_t* session, int result,
       }
       memcpy(ack_payload, file_header + sizeof(uint64_t),
              crypto_pwhash_SALTBYTES);
-      memcpy(ack_payload + crypto_pwhash_SALTBYTES, file_header,
-             sizeof(uint64_t));
+      uint64_t plaintext_size;
+      if (portable)
+        plaintext_size = protocol_load_u64(file_header);
+      else
+        memcpy(&plaintext_size, file_header, sizeof(plaintext_size));
+      protocol_store_u64(ack_payload + crypto_pwhash_SALTBYTES, plaintext_size);
       ack_payload[crypto_pwhash_SALTBYTES + sizeof(uint64_t)] =
-          session->file_cipher_algo;
+          session->file_cipher_algo | portable;
       ack_payload[crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 1] =
           session->file_hash_algo;
       session_send_frame(session, NASFS_CMD_GET_ACK, ack_payload, ack_size, 1);
@@ -995,12 +1003,13 @@ static void submit_file_open(client_session_t* session, const uint8_t* name,
   ctx->uploading = uploading;
   if (uploading && session->file_encryption_enabled) {
     uint8_t* header = ctx->header;
-    memcpy(header, &session->expected_plaintext_size, sizeof(uint64_t));
+    protocol_store_u64(header, session->expected_plaintext_size);
     memcpy(header + sizeof(uint64_t), session->file_salt,
            crypto_pwhash_SALTBYTES);
     header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES] =
         session->file_cipher_algo | FILE_HEADER_RECORD_LENGTHS |
-        FILE_HEADER_MANIFEST | FILE_HEADER_OWNER_SLOT_V1;
+        FILE_HEADER_MANIFEST | FILE_HEADER_OWNER_SLOT_V1 |
+        NASFS_FILE_CIPHER_PORTABLE;
     header[sizeof(uint64_t) + crypto_pwhash_SALTBYTES + 1] =
         session->file_hash_algo;
     memcpy(header + FILE_HEADER_SIZE, session->owner_slot,
@@ -1318,67 +1327,45 @@ static void session_dispatch_frame(client_session_t* session,
         session_close((uv_handle_t*)&session->handle);
         break;
       }
-      int is_enc = 0;
-      const uint8_t* filename_ptr = plain_frame.payload;
-      size_t filename_len = plain_frame.payload_len;
-      session->expected_plaintext_size = 0;
-      session->upload_plaintext_bytes = 0;
-      session->file_cipher_algo = NASFS_CIPHER_XSALSA20_POLY1305;
-      session->file_hash_algo = NASFS_HASH_BLAKE2B;
-      if (plain_frame.payload_len > 1 &&
-          (plain_frame.payload[0] == 0 || plain_frame.payload[0] == 1)) {
-        is_enc = plain_frame.payload[0];
-        /* Encrypted PUT_REQ: [1 enc][16 salt][8 size][1 cipher][1 hash][name]
-         */
-        if (is_enc) {
-          size_t name_offset = 1 + FILE_HEADER_SIZE + NASFS_OWNER_SLOT_V1_SIZE;
-          if (plain_frame.payload_len <= name_offset) {
-            session_close((uv_handle_t*)&session->handle);
-            break;
-          }
-          memcpy(session->file_salt, plain_frame.payload + 1,
-                 crypto_pwhash_SALTBYTES);
-          memcpy(&session->expected_plaintext_size,
-                 plain_frame.payload + 1 + crypto_pwhash_SALTBYTES,
-                 sizeof(uint64_t));
-          uint8_t req_cipher =
-              plain_frame
-                  .payload[1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t)];
-          uint8_t req_hash =
-              plain_frame
-                  .payload[1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 1];
-          /* Validate algo values against enum ranges */
-          if (req_cipher > NASFS_CIPHER_AES_256_GCM ||
-              req_hash > NASFS_HASH_CRC32) {
-            log_all(LOG_ERROR, "PUT: Unknown cipher or hash algo requested.");
-            session_send_frame(session, NASFS_CMD_ERROR,
-                               (const uint8_t*)"Unknown crypto algo", 19, 1);
-            session_close((uv_handle_t*)&session->handle);
-            if (decrypted_payload) free(decrypted_payload);
-            return;
-          }
-          session->file_cipher_algo = req_cipher;
-          session->file_hash_algo = req_hash;
-          memcpy(session->owner_slot,
-                 plain_frame.payload + 1 + FILE_HEADER_SIZE,
-                 sizeof(session->owner_slot));
-          filename_ptr = plain_frame.payload + name_offset;
-          filename_len = plain_frame.payload_len - name_offset;
-        } else {
-          filename_ptr = plain_frame.payload + 1;
-          filename_len = plain_frame.payload_len - 1;
-        }
-      }
-      if (!is_enc) {
+      const size_t name_offset =
+          1 + FILE_HEADER_SIZE + NASFS_OWNER_SLOT_V1_SIZE;
+      if (plain_frame.payload_len <= name_offset ||
+          (plain_frame.payload[0] != NASFS_FILE_REQUEST_PORTABLE &&
+           plain_frame.payload[0] != NASFS_PUT_REQUEST_EXCLUSIVE)) {
         session_close((uv_handle_t*)&session->handle);
         break;
       }
-      session->file_encryption_enabled = is_enc;
+      session->upload_exclusive =
+          plain_frame.payload[0] == NASFS_PUT_REQUEST_EXCLUSIVE;
+      session->upload_plaintext_bytes = 0;
+      memcpy(session->file_salt, plain_frame.payload + 1,
+             crypto_pwhash_SALTBYTES);
+      session->expected_plaintext_size =
+          protocol_load_u64(plain_frame.payload + 1 + crypto_pwhash_SALTBYTES);
+      uint8_t req_cipher =
+          plain_frame.payload[1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t)];
+      uint8_t req_hash =
+          plain_frame
+              .payload[1 + crypto_pwhash_SALTBYTES + sizeof(uint64_t) + 1];
+      if (req_cipher > NASFS_CIPHER_AES_256_GCM ||
+          req_hash > NASFS_HASH_CRC32) {
+        log_all(LOG_ERROR, "PUT: Unknown cipher or hash algo requested.");
+        session_send_frame(session, NASFS_CMD_ERROR,
+                           (const uint8_t*)"Unknown crypto algo", 19, 1);
+        session_close((uv_handle_t*)&session->handle);
+        break;
+      }
+      session->file_cipher_algo = req_cipher;
+      session->file_hash_algo = req_hash;
+      memcpy(session->owner_slot, plain_frame.payload + 1 + FILE_HEADER_SIZE,
+             sizeof(session->owner_slot));
+      session->file_encryption_enabled = 1;
       session->has_pending_block_meta = 0;
       session->server_block_seq = 0;
 
       session->state = SESSION_STATE_RECEIVING_FILE;
-      submit_file_open(session, filename_ptr, filename_len, 1);
+      submit_file_open(session, plain_frame.payload + name_offset,
+                       plain_frame.payload_len - name_offset, 1);
       break;
     }
 
@@ -1559,25 +1546,18 @@ static void session_dispatch_frame(client_session_t* session,
         session_close((uv_handle_t*)&session->handle);
         break;
       }
-      int is_enc = 0;
-      const uint8_t* filename_ptr = plain_frame.payload;
-      size_t filename_len = plain_frame.payload_len;
-      if (plain_frame.payload_len > 1 &&
-          (plain_frame.payload[0] == 0 || plain_frame.payload[0] == 1)) {
-        is_enc = plain_frame.payload[0];
-        filename_ptr = plain_frame.payload + 1;
-        filename_len = plain_frame.payload_len - 1;
-      }
-      if (!is_enc) {
+      if (plain_frame.payload_len <= 1 ||
+          plain_frame.payload[0] != NASFS_FILE_REQUEST_PORTABLE) {
         session_close((uv_handle_t*)&session->handle);
         break;
       }
-      session->file_encryption_enabled = is_enc;
+      session->file_encryption_enabled = 1;
       session->has_pending_block_meta = 0;
       session->server_block_seq = 0;
 
       session->state = SESSION_STATE_SENDING_FILE;
-      submit_file_open(session, filename_ptr, filename_len, 0);
+      submit_file_open(session, plain_frame.payload + 1,
+                       plain_frame.payload_len - 1, 0);
       break;
     }
     default:

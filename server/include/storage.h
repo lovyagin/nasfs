@@ -28,7 +28,8 @@ int nasfs_storage_open_object(const nasfs_storage_t* storage, const char* name);
 int nasfs_storage_begin_upload(const nasfs_storage_t* storage,
                                char temp_name[NASFS_UPLOAD_TEMP_SIZE]);
 int nasfs_storage_publish_upload(const nasfs_storage_t* storage,
-                                 const char* temp_name, const char* name);
+                                 const char* temp_name, const char* name,
+                                 int exclusive);
 int nasfs_storage_discard_upload(const nasfs_storage_t* storage,
                                  const char* temp_name);
 

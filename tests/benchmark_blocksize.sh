@@ -8,31 +8,32 @@
 # Usage: ./benchmark_blocksize.sh [--sftp-host HOST] [--sftp-user USER]
 #                                  [--sftp-port PORT] [--sftp-key FILE]
 #                                  [--runs N] [--sizes SZ,SZ,...]
-#                                  [--ciphers xchacha20poly1305,aes256gcm]
+#                                  [--ciphers xchacha20poly1305,aes256gcm] [--no-sftp]
 
 set -euo pipefail
 export LC_ALL=C LANG=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SERVER_BIN="$ROOT_DIR/build/nasfs_server"
-CLIENT_BIN="$ROOT_DIR/build/nasfs_client"
+SERVER_BIN="${NASFS_SERVER_BIN:-$ROOT_DIR/build/nasfs_server}"
+CLIENT_BIN="${NASFS_CLIENT_BIN:-$ROOT_DIR/build/nasfs_client}"
+# shellcheck source-path=SCRIPTDIR
+source "$SCRIPT_DIR/integration_helpers.sh"
 
 SFTP_HOST="localhost"
-SFTP_USER="$USER"
+SFTP_USER="${USER:-$(id -un)}"
 SFTP_PORT="22"
 SFTP_KEY=""
+COMPARE_SFTP=1
 RUNS=5
 BLOCK_SIZES=(32768 65536 131072 262144 524288 1048576)
 FILE_SIZES=(1048576 10485760 104857600)
 FILE_LABELS=("1MB" "10MB" "100MB")
 CIPHERS=("xchacha20poly1305" "aes256gcm")
 
-SERVER_PORT=18081
-BENCH_ROOT="/tmp/nasfs_bench_$$"
-STORAGE_DIR="$BENCH_ROOT/storage"
+SERVER_PORT=${NASFS_BENCH_PORT:-18081}
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-CSV="$ROOT_DIR/bench_${TIMESTAMP}.csv"
+CSV="${NASFS_BENCH_CSV:-$ROOT_DIR/bench_${TIMESTAMP}.csv}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
@@ -41,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     --sftp-host)  SFTP_HOST="$2";  shift 2 ;;
     --sftp-user)  SFTP_USER="$2";  shift 2 ;;
     --sftp-port)  SFTP_PORT="$2";  shift 2 ;;
+    --no-sftp)  COMPARE_SFTP=0; shift ;;
     --sftp-key)   SFTP_KEY="$2";   shift 2 ;;
     --runs)       RUNS="$2";        shift 2 ;;
     --sizes)      IFS=',' read -ra BLOCK_SIZES <<< "$2"; shift 2 ;;
@@ -49,20 +51,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-TASKSET=""
-command -v taskset &>/dev/null && TASKSET="taskset -c 0"
-THROTTLE="$TASKSET nice -n 19"
+THROTTLE=(nice -n 19)
+if command -v taskset >/dev/null && affinity=$(taskset -pc "$$" 2>/dev/null); then
+  affinity=${affinity##*: }
+  THROTTLE=(taskset -c "${affinity%%[-,]*}" "${THROTTLE[@]}")
+fi
 
 SFTP_OPTS=(-P "$SFTP_PORT" -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10)
 [[ -n "$SFTP_KEY" ]] && SFTP_OPTS+=(-i "$SFTP_KEY")
 
-cleanup() {
-  pkill -f "nasfs_server.*$SERVER_PORT" 2>/dev/null || true
-  rm -rf "$BENCH_ROOT"
-}
-trap cleanup EXIT
-cleanup
-mkdir -p "$BENCH_ROOT" "$STORAGE_DIR"
+benchmark_home=${HOME:-}
+setup_integration
+BENCH_ROOT="$TEST_ROOT"
 echo "cipher,block_bytes,file_size,direction,run,throughput_MBps" > "$CSV"
 
 # ---- float helpers using awk (no bc needed) ----
@@ -70,25 +70,17 @@ fgt() { awk "BEGIN {exit (($1) > ($2)) ? 0 : 1}"; }
 fge() { awk "BEGIN {exit (($1) >= ($2)) ? 0 : 1}"; }
 fmt() { awk "BEGIN {printf \"%7.2f\", $1}"; }
 
-# average of all values passed as args
-avg() {
-  local vals=("$@") sum=0 n=${#vals[@]}
-  for v in "${vals[@]}"; do
-    sum=$(awk "BEGIN {printf \"%.6f\", $sum + $v}")
-  done
-  awk "BEGIN {printf \"%.4f\", $sum / $n}"
-}
-
 # median of N values (sort, pick middle)
 median() {
-  local vals=("$@") n=${#vals[@]}
+  local vals=("$@")
+  local n=${#vals[@]}
   local sorted
   sorted=$(printf '%s\n' "${vals[@]}" | sort -g)
   local mid=$(( (n - 1) / 2 ))
   echo "$sorted" | awk "NR==$(( mid + 1 )) {printf \"%.4f\", \$1}"
 }
 
-now_ns() { date +%s%N; }
+now_ns() { python3 -c "import time; print(time.monotonic_ns())"; }
 
 block_label() {
   local bs=$1
@@ -103,29 +95,20 @@ start_server() {
 ListenAddr 127.0.0.1
 Port $SERVER_PORT
 MaxConn 20
-LogFile $BENCH_ROOT/server.log
-LogLevel Error
+LogFile $LOG_DIR/server.log
+LogLevel Info
 DaemonMode No
 PidFile $BENCH_ROOT/server.pid
 StorageDir $STORAGE_DIR
-KexAlgorithms ML-KEM-512,Kyber512
+KexAlgorithms ML-KEM-512
 CipherAlgorithms xchacha20poly1305
 AuthMethods password
 AuthPassword nasfs
 BlockSize $block_size
 EOF
   rm -f "$STORAGE_DIR"/*
-  $THROTTLE "$SERVER_BIN" "$BENCH_ROOT/server.conf" >> "$BENCH_ROOT/server_out.log" 2>&1 &
-  for i in $(seq 1 50); do
-    bash -c "echo >/dev/tcp/127.0.0.1/$SERVER_PORT" 2>/dev/null && return 0
-    sleep 0.1
-  done
-  echo "Server did not start on port $SERVER_PORT" >&2; exit 1
-}
-
-stop_server() {
-  pkill -f "nasfs_server.*$SERVER_PORT" 2>/dev/null || true
-  sleep 0.3
+  : > "$LOG_DIR/server.log"
+  start_integration_server "$BENCH_ROOT/server.conf" "${THROTTLE[@]}"
 }
 
 run_nasfs_put() {
@@ -133,7 +116,7 @@ run_nasfs_put() {
   local sz t0 t1
   sz=$(wc -c < "$file" | tr -d ' ')
   t0=$(now_ns)
-  $THROTTLE env \
+  env \
     NASFS_KEX_ALGORITHMS="ML-KEM-512" \
     NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
     NASFS_AUTH_METHOD="password" \
@@ -144,9 +127,7 @@ run_nasfs_put() {
     NASFS_FILE_HASH="blake2b" \
     NASFS_KDF="argon2id" \
     NASFS_BLOCK_SIZE="$block_size" \
-    NASFS_SERVER_IP="127.0.0.1" \
-    NASFS_SERVER_PORT="$SERVER_PORT" \
-    "$CLIENT_BIN" put "$file" "bench_$$.bin" >/dev/null 2>&1
+    "${THROTTLE[@]}" "$CLIENT_BIN" put "$file" "bench_$$.bin" >/dev/null || return
   t1=$(now_ns)
   awk "BEGIN {printf \"%.4f\", ($sz / 1048576.0) / (($t1 - $t0) / 1e9)}"
 }
@@ -155,7 +136,7 @@ run_nasfs_get() {
   local cipher=$1 block_size=$2 fsz=$3
   local local_out="$BENCH_ROOT/got_$$.bin" t0 t1
   t0=$(now_ns)
-  $THROTTLE env \
+  env \
     NASFS_KEX_ALGORITHMS="ML-KEM-512" \
     NASFS_CIPHER_ALGORITHMS="xchacha20poly1305" \
     NASFS_AUTH_METHOD="password" \
@@ -166,9 +147,7 @@ run_nasfs_get() {
     NASFS_FILE_HASH="blake2b" \
     NASFS_KDF="argon2id" \
     NASFS_BLOCK_SIZE="$block_size" \
-    NASFS_SERVER_IP="127.0.0.1" \
-    NASFS_SERVER_PORT="$SERVER_PORT" \
-    "$CLIENT_BIN" get "bench_$$.bin" "$local_out" >/dev/null 2>&1
+    "${THROTTLE[@]}" "$CLIENT_BIN" get "bench_$$.bin" "$local_out" >/dev/null || return
   t1=$(now_ns)
   rm -f "$local_out"
   awk "BEGIN {printf \"%.4f\", ($fsz / 1048576.0) / (($t1 - $t0) / 1e9)}"
@@ -182,7 +161,7 @@ run_sftp_put() {
   local t0 t1
   t0=$(now_ns)
   printf "put %s %s/f\n" "$file" "$remote_dir" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1
+    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
   t1=$(now_ns)
   printf "rm %s/f\nrmdir %s\n" "$remote_dir" "$remote_dir" \
     | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1 || true
@@ -193,11 +172,11 @@ run_sftp_get() {
   local file=$1 sz remote_path="/tmp/sftp_src_$$"
   sz=$(wc -c < "$file" | tr -d ' ')
   printf "put %s %s\n" "$file" "$remote_path" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1
+    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
   local t0 t1 local_out="$BENCH_ROOT/sftp_got_$$.bin"
   t0=$(now_ns)
   printf "get %s %s\n" "$remote_path" "$local_out" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1
+    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
   t1=$(now_ns)
   printf "rm %s\n" "$remote_path" \
     | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1 || true
@@ -215,13 +194,14 @@ done
 # ---- Header ----
 echo ""
 echo -e "${BOLD}NASFS cipher+block sweep vs SFTP — $(date)${NC}"
-echo -e "Throttle: $THROTTLE   Runs per point: $RUNS (median reported)"
+echo -e "Throttle: ${THROTTLE[*]}   Runs per point: $RUNS (median reported)"
 echo ""
 
-declare -A BEST_PUT BEST_GET  # [cipher_bs_flbl] -> mbps
+BEST_PUT=()
+BEST_GET=()
 
-for cipher in "${CIPHERS[@]}"; do
-  short="${cipher%%poly1305}"; short="${short%%256gcm}256gcm"; short="${short%_}"
+for cidx in "${!CIPHERS[@]}"; do
+  cipher="${CIPHERS[$cidx]}"
   # prettier label
   [[ "$cipher" == "aes256gcm" ]] && clabel="AES-256-GCM" || clabel="XChaCha20-Poly1305"
 
@@ -235,7 +215,8 @@ for cipher in "${CIPHERS[@]}"; do
   for _ in "${FILE_LABELS[@]}"; do printf "  %-12s  %-12s" "------------" "------------"; done
   printf "\n"
 
-  for bs in "${BLOCK_SIZES[@]}"; do
+  for bidx in "${!BLOCK_SIZES[@]}"; do
+    bs="${BLOCK_SIZES[$bidx]}"
     lbl=$(block_label "$bs")
     start_server "$bs"
     printf "%-10s" "$lbl"
@@ -246,7 +227,7 @@ for cipher in "${CIPHERS[@]}"; do
       tfile="$BENCH_ROOT/test_${fsz}.bin"
 
       puts=(); gets=()
-      for run in $(seq 1 $RUNS); do
+      for run in $(seq 1 "$RUNS"); do
         rm -f "$STORAGE_DIR"/bench_*.bin
         p=$(run_nasfs_put "$cipher" "$bs" "$tfile")
         g=$(run_nasfs_get "$cipher" "$bs" "$fsz")
@@ -257,37 +238,46 @@ for cipher in "${CIPHERS[@]}"; do
 
       mp=$(median "${puts[@]}")
       mg=$(median "${gets[@]}")
-      BEST_PUT["${cipher}_${bs}_${flbl}"]="$mp"
-      BEST_GET["${cipher}_${bs}_${flbl}"]="$mg"
+      idx=$(( (cidx * ${#BLOCK_SIZES[@]} + bidx) * ${#FILE_SIZES[@]} + fidx ))
+      BEST_PUT[idx]="$mp"
+      BEST_GET[idx]="$mg"
 
       printf "  %s MB/s  %s MB/s" "$(fmt "$mp")" "$(fmt "$mg")"
     done
     printf "\n"
-    stop_server
+    stop_integration_server
   done
   echo ""
 done
 
+if (( ! COMPARE_SFTP )); then
+  printf 'CSV: %s\n' "$CSV"
+  exit 0
+fi
+
+export HOME="$benchmark_home"
+
 # ---- SFTP baseline ----
 echo -e "${CYAN}=== SFTP (${SFTP_USER}@${SFTP_HOST}:${SFTP_PORT}) ===${NC}"
 printf "%-10s" "SFTP"
-declare -A SFTP_PUT SFTP_GET
+SFTP_PUT=()
+SFTP_GET=()
 for fidx in "${!FILE_SIZES[@]}"; do
   fsz="${FILE_SIZES[$fidx]}"
   flbl="${FILE_LABELS[$fidx]}"
   tfile="$BENCH_ROOT/test_${fsz}.bin"
 
   sputs=(); sgets=()
-  for run in $(seq 1 $RUNS); do
+  for run in $(seq 1 "$RUNS"); do
     sp=$(run_sftp_put "$tfile")
     sg=$(run_sftp_get "$tfile")
     sputs+=("$sp"); sgets+=("$sg")
     echo "sftp,N/A,${flbl},put,${run},${sp}" >> "$CSV"
     echo "sftp,N/A,${flbl},get,${run},${sg}" >> "$CSV"
   done
-  SFTP_PUT["$flbl"]=$(median "${sputs[@]}")
-  SFTP_GET["$flbl"]=$(median "${sgets[@]}")
-  printf "  %s MB/s  %s MB/s" "$(fmt "${SFTP_PUT[$flbl]}")" "$(fmt "${SFTP_GET[$flbl]}")"
+  SFTP_PUT[fidx]=$(median "${sputs[@]}")
+  SFTP_GET[fidx]=$(median "${sgets[@]}")
+  printf "  %s MB/s  %s MB/s" "$(fmt "${SFTP_PUT[fidx]}")" "$(fmt "${SFTP_GET[fidx]}")"
 done
 printf "\n\n"
 
@@ -298,17 +288,21 @@ printf "%-10s  %-5s  %-22s  %-22s  %-12s  %s\n" \
 printf "%-10s  %-5s  %-22s  %-22s  %-12s  %s\n" \
   "--------" "---" "----------" "----" "-----" "------"
 
-for flbl in "${FILE_LABELS[@]}"; do
-  sftp_p="${SFTP_PUT[$flbl]}"
-  sftp_g="${SFTP_GET[$flbl]}"
+for fidx in "${!FILE_LABELS[@]}"; do
+  flbl="${FILE_LABELS[$fidx]}"
+  sftp_p="${SFTP_PUT[fidx]}"
+  sftp_g="${SFTP_GET[fidx]}"
 
   best_p=0; best_p_label=""; best_g=0; best_g_label=""
-  for cipher in "${CIPHERS[@]}"; do
+  for cidx in "${!CIPHERS[@]}"; do
+    cipher="${CIPHERS[$cidx]}"
     [[ "$cipher" == "aes256gcm" ]] && clabel="AES" || clabel="XCH"
-    for bs in "${BLOCK_SIZES[@]}"; do
+    for bidx in "${!BLOCK_SIZES[@]}"; do
+      bs="${BLOCK_SIZES[$bidx]}"
       lbl=$(block_label "$bs")
-      p="${BEST_PUT["${cipher}_${bs}_${flbl}"]:-0}"
-      g="${BEST_GET["${cipher}_${bs}_${flbl}"]:-0}"
+      idx=$(( (cidx * ${#BLOCK_SIZES[@]} + bidx) * ${#FILE_SIZES[@]} + fidx ))
+      p="${BEST_PUT[idx]}"
+      g="${BEST_GET[idx]}"
       fgt "$p" "$best_p" && { best_p="$p"; best_p_label="${clabel}@${lbl}"; } || true
       fgt "$g" "$best_g" && { best_g="$g"; best_g_label="${clabel}@${lbl}"; } || true
     done

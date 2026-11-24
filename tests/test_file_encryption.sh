@@ -524,16 +524,17 @@ cmp "$TEST_INPUT" "$TEST_ROOT/records.bin"
 
 # Damaged records and a valid container for a different object must never
 # replace a local destination. Keep the requested remote name constant.
-python3 - "$STORAGE_DIR" "$TEST_ROOT" <<'PYTHON'
+python3 - "$STORAGE_DIR" "$TEST_ROOT" "$TEST_INPUT" <<'PYTHON'
 from pathlib import Path
 import sys
 
-storage, root = map(Path, sys.argv[1:])
+storage, root, source = map(Path, sys.argv[1:])
 original = (storage / "encrypted_remote.bin").read_bytes()
 other = (storage / "concurrent-a.bin").read_bytes()
+assert original[:8] == source.stat().st_size.to_bytes(8, "big")
 
 def records(container):
-    assert container[24] & 0xe0 == 0xe0
+    assert container[24] & 0xf0 == 0xf0
     cursor = 26 + 72
     output = []
     while True:

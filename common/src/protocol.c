@@ -90,11 +90,23 @@ uint8_t* protocol_pack_frame(nasfs_cmd_type_t type, const uint8_t* payload,
   return buffer;
 }
 
+void protocol_store_u64(uint8_t out[8], uint64_t value) {
+  for (size_t i = 0; i < 8; i++) {
+    out[i] = (uint8_t)(value >> (56 - 8 * i));
+  }
+}
+
+uint64_t protocol_load_u64(const uint8_t in[8]) {
+  uint64_t value = 0;
+  for (size_t i = 0; i < 8; i++) {
+    value = (value << 8u) | in[i];
+  }
+  return value;
+}
+
 void protocol_encode_block_meta(uint8_t out[NASFS_BLOCK_META_SIZE],
                                 const nasfs_block_meta_t* meta) {
-  for (size_t i = 0; i < 8; i++) {
-    out[i] = (uint8_t)(meta->seq_num >> (56 - 8 * i));
-  }
+  protocol_store_u64(out, meta->seq_num);
   uint32_t size = htonl(meta->size);
   memcpy(out + 8, &size, sizeof(size));
   memcpy(out + 12, meta->hash, sizeof(meta->hash));
@@ -103,10 +115,7 @@ void protocol_encode_block_meta(uint8_t out[NASFS_BLOCK_META_SIZE],
 int protocol_decode_block_meta(const uint8_t* payload, size_t length,
                                nasfs_block_meta_t* meta) {
   if (!payload || !meta || length != NASFS_BLOCK_META_SIZE) return -1;
-  meta->seq_num = 0;
-  for (size_t i = 0; i < 8; i++) {
-    meta->seq_num = (meta->seq_num << 8u) | payload[i];
-  }
+  meta->seq_num = protocol_load_u64(payload);
   uint32_t size;
   memcpy(&size, payload + 8, sizeof(size));
   meta->size = ntohl(size);
@@ -120,9 +129,7 @@ void protocol_manifest_init(crypto_generichash_state* state, const char* object,
                             uint8_t cipher, uint8_t hash) {
   const uint8_t domain[] = "NASFS ciphertext manifest/1";
   uint8_t header[10] = {cipher, hash};
-  for (size_t i = 0; i < 8; i++) {
-    header[2 + i] = (uint8_t)(plaintext_size >> (56 - 8 * i));
-  }
+  protocol_store_u64(header + 2, plaintext_size);
   crypto_generichash_init(state, NULL, 0, 32);
   crypto_generichash_update(state, domain, sizeof(domain));
   crypto_generichash_update(state, header, sizeof(header));

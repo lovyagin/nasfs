@@ -32,7 +32,8 @@ static int write_test_config(char* path, size_t path_len) {
   }
 
   fprintf(file, "ListenAddr 10.0.0.1\n");
-  fprintf(file, "Port 4242\n");
+  fprintf(file, " \t  \t\n");
+  fprintf(file, "\t Port 4242 \t # comment\n");
   fprintf(file, "StorageDir /srv/nasfs\n");
   fprintf(file, "KexAlgorithms Kyber512,ML-KEM-512\n");
   fprintf(file, "CipherAlgorithms xchacha20poly1305\n");

@@ -153,6 +153,22 @@ start_integration_server "$TEST_DIR/test_server.conf"
 printf "${YELLOW}%s${NC}\n" "[3/4] Testing PUT (Upload)..."
 REMOTE_NAME="e2e_test_upload.bin"
 
+if [[ $(uname -s) == Darwin ]]; then
+    pin="$HOME/.nasfs/server-$NASFS_SERVER_IP-$NASFS_SERVER_PORT.pub"
+    chmod +a "everyone allow write" "$pin"
+    expect_client_failure "$LOG_DIR/client_pin_acl.log" "Missing or invalid server pin" \
+        "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
+        put "$TEST_INPUT" "bad-pin.bin"
+    chmod -N "$pin"
+    chmod +a "everyone allow read" "$NASFS_AUTHOR_SIGNING_SEED"
+    expect_client_failure "$LOG_DIR/client_seed_acl.log" "Expected a private NASFS_AUTHOR_SIGNING_SEED" \
+        "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
+        put "$TEST_INPUT" "bad-seed.bin"
+    chmod -N "$NASFS_AUTHOR_SIGNING_SEED"
+    test ! -e "$STORAGE_DIR/bad-pin.bin"
+    test ! -e "$STORAGE_DIR/bad-seed.bin"
+fi
+
 expect_client_failure "$LOG_DIR/client_bad_auth.log" "PQC Handshake successful" \
     "ML-KEM-512" "password" "wrong-password" "" "ML-DSA-65" \
     put "$TEST_INPUT" "bad-auth.bin"
@@ -273,6 +289,35 @@ expect_client_failure "$LOG_DIR/client_duplicate_destination.log" "Duplicate bat
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mget x/file x/file
 expect_client_failure "$LOG_DIR/client_duplicate_upload.log" "Duplicate batch destination" \
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mput x/file y/file
+# Let the server volume determine whether each pair names the same entry.
+mkdir "$TEST_DIR/alias-first" "$TEST_DIR/alias-second"
+check_mput_alias() {
+    local first=$1 second=$2 label=$3
+    local first_input="$TEST_DIR/alias-first/$1"
+    local second_input="$TEST_DIR/alias-second/$2"
+    printf 'First batch entry\n' > "$first_input"
+    printf 'Second batch entry\n' > "$second_input"
+    touch "$STORAGE_DIR/$first"
+    local aliases=0
+    if [[ -e "$STORAGE_DIR/$second" ]]; then aliases=1; fi
+    rm "$STORAGE_DIR/$first"
+    if (( aliases )); then
+        expect_client_failure "$LOG_DIR/client_alias_$label.log" "Server could not publish" \
+            "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mput "$first_input" "$second_input"
+    else
+        run_client "$LOG_DIR/client_alias_$label.log" "ML-KEM-512" "password" \
+            "e2e-password" "" "ML-DSA-65" mput "$first_input" "$second_input"
+        run_client "$LOG_DIR/client_alias_second_$label.log" "ML-KEM-512" "password" \
+            "e2e-password" "" "ML-DSA-65" get "$second" "$TEST_DIR/alias-second.out"
+        cmp "$second_input" "$TEST_DIR/alias-second.out"
+    fi
+    run_client "$LOG_DIR/client_alias_first_$label.log" "ML-KEM-512" "password" \
+        "e2e-password" "" "ML-DSA-65" get "$first" "$TEST_DIR/alias-first.out"
+    cmp "$first_input" "$TEST_DIR/alias-first.out"
+}
+check_mput_alias Batch-Case.bin batch-case.bin case
+check_mput_alias $'batch-\xc3\xa9.bin' $'batch-e\xcc\x81.bin' unicode
+
 mkdir "$TEST_DIR/first-destination" "$TEST_DIR/second-destination"
 run_client "$LOG_DIR/client_distinct_destinations.log" "ML-KEM-512" "password" \
     "e2e-password" "" "ML-DSA-65" mget "$TEST_DIR/first-destination/$REMOTE_NAME" \

@@ -127,7 +127,14 @@ void protocol_encode_block_meta(uint8_t out[NASFS_BLOCK_META_SIZE],
 int protocol_decode_block_meta(const uint8_t* payload, size_t length,
                                nasfs_block_meta_t* meta);
 
+/* Encrypted file requests using the portable format. */
+#define NASFS_FILE_REQUEST_PORTABLE 2u
+#define NASFS_PUT_REQUEST_EXCLUSIVE 3u
+/* Cipher-byte marker in portable containers, GET_ACK and manifests. */
+#define NASFS_FILE_CIPHER_PORTABLE 0x10u
 #define NASFS_FILE_METADATA_SIZE 26
+void protocol_store_u64(uint8_t out[8], uint64_t value);
+uint64_t protocol_load_u64(const uint8_t in[8]);
 #define NASFS_MANIFEST_SIZE (32 + crypto_sign_BYTES)
 void protocol_manifest_init(crypto_generichash_state* state, const char* object,
                             uint64_t plaintext_size,

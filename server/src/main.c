@@ -10,12 +10,15 @@
 #include "config.h"
 #endif
 
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sodium.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <uv.h>
 
 #include "config/config.h"
@@ -58,6 +61,15 @@ static void close_server_handle(uv_handle_t* handle, void* arg) {
   }
 }
 
+/* Keep long-lived descriptors out of the range daemonize() reopens. */
+static int reserve_standard_descriptors(void) {
+  for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+    if (fcntl(fd, F_GETFD) >= 0) continue;
+    if (errno != EBADF || open("/dev/null", O_RDWR) < 0) return -1;
+  }
+  return 0;
+}
+
 /**
  * @brief The main execution loop of the NASFS server.
  *
@@ -71,14 +83,21 @@ int main(int argc, char** argv) {
 
   signal(SIGPIPE, SIG_IGN);
 
-  if (sodium_init() < 0) {
-    fprintf(stderr, "Failed to initialize libsodium\n");
-    return 1;
-  }
-
   memset(&global_config, 0, sizeof(global_config));
   if (load_config(config_file, &global_config) != 0) {
     fprintf(stderr, "Failed to load config file '%s'.\n", config_file);
+    free_config(&global_config);
+    return 1;
+  }
+
+  if (global_config.daemon_mode && reserve_standard_descriptors() < 0) {
+    perror("Cannot reserve standard descriptors for daemon");
+    free_config(&global_config);
+    return 1;
+  }
+
+  if (sodium_init() < 0) {
+    fprintf(stderr, "Failed to initialize libsodium\n");
     free_config(&global_config);
     return 1;
   }
@@ -102,11 +121,6 @@ int main(int argc, char** argv) {
   }
   log_all(LOG_INFO, "Starting NASFS server...");
 
-  if (global_config.daemon_mode) {
-    log_all(LOG_INFO, "Daemonizing process...");
-    daemonize();
-  }
-
   nasfs_storage_t storage;
   const char* storage_dir =
       global_config.storage_dir ? global_config.storage_dir : ".";
@@ -116,6 +130,11 @@ int main(int argc, char** argv) {
             uv_strerror(r));
     exit_code = 1;
     goto cleanup;
+  }
+
+  if (global_config.daemon_mode) {
+    log_all(LOG_INFO, "Daemonizing process...");
+    daemonize();
   }
 
   loop = uv_default_loop();

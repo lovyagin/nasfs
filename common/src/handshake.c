@@ -21,6 +21,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <sys/acl.h>
+#endif
+
 #include "handshake.h"
 
 /**
@@ -279,16 +283,32 @@ int nasfs_handshake_finished(uint8_t out[32], const uint8_t key[32],
   return crypto_generichash(out, 32, fields, sizeof(fields), key, 32);
 }
 
+static int key_has_private_permissions(int fd, mode_t mode, int secret) {
+  if ((mode & 022u) != 0 || (secret && (mode & 077u) != 0)) return 0;
+#ifdef __APPLE__
+  acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+  if (!acl) return errno == ENOENT;
+  acl_entry_t entry;
+  int rc = acl_get_entry(acl, ACL_FIRST_ENTRY, &entry);
+  int empty = rc < 0 && errno == EINVAL;
+  acl_free(acl);
+  return empty;
+#else
+  (void)fd;
+  return 1;
+#endif
+}
+
 int nasfs_handshake_read_key(const char* path, uint8_t out[32], int secret) {
   if (!path || !*path) return -1;
   int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   if (fd < 0) return -1;
   struct stat st;
   uint8_t bytes[33];
-  size_t used = 0;
   int result = -1;
   if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == geteuid() &&
-      (st.st_mode & 022u) == 0 && (!secret || (st.st_mode & 077u) == 0)) {
+      key_has_private_permissions(fd, st.st_mode, secret)) {
+    size_t used = 0;
     while (used < sizeof(bytes)) {
       ssize_t count = read(fd, bytes + used, sizeof(bytes) - used);
       if (count < 0 && errno == EINTR) continue;

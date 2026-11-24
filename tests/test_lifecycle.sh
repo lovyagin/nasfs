@@ -39,7 +39,8 @@ def server_failure(config_text, diagnostic):
     path = root / "failure.conf"
     if config_text is not None:
         path.write_text(config_text)
-    result = subprocess.run([server, str(path)], capture_output=True, timeout=5)
+    result = subprocess.run([server, str(path)], cwd=root,
+                            capture_output=True, timeout=5)
     assert result.returncode == 1, result
     assert diagnostic in result.stdout + result.stderr, result
     assert not (root / "logs/server.pid").exists()
@@ -55,6 +56,16 @@ def option(name, value):
 
 server_failure(option("StorageDir", root / "missing"),
                b"Cannot open storage directory")
+server_failure(option("StorageDir", "missing-relative").replace(
+                   "DaemonMode No", "DaemonMode Yes"),
+               b"Cannot open storage directory")
+if sys.platform == "darwin":
+    seed = os.environ["NASFS_SERVER_SIGNING_SEED"]
+    subprocess.run(["chmod", "+a", "everyone allow read", seed], check=True)
+    try:
+        server_failure(config, b"Expected ServerSigningSeed and AuthorPublicKey")
+    finally:
+        subprocess.run(["chmod", "-N", seed], check=True)
 server_failure(option("PidFile", root / "missing/server.pid"),
                b"Failed to create PID file")
 server_failure(option("LogFile", root / "missing/server.log"),

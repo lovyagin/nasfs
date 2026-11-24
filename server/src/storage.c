@@ -299,14 +299,15 @@ static int open_publication_lock(int root) {
 }
 
 int nasfs_storage_publish_upload(const nasfs_storage_t* storage,
-                                 const char* temp_name, const char* name) {
+                                 const char* temp_name, const char* name,
+                                 int exclusive) {
   if (!is_flat_name((const uint8_t*)name, strlen(name))) return UV_EINVAL;
   int root = storage->root_fd;
   int service = storage->service_fd;
   if (service < 0 || !is_private_directory(root)) return UV_EACCES;
 
-  if (!can_replace_uploads(root)) {
-    // On shared filesystems, atomically create the name without overwriting.
+  if (exclusive || !can_replace_uploads(root)) {
+    // The filesystem resolves aliases atomically when creating the name.
     if (linkat(service, temp_name, root, name, 0) < 0)
       return uv_translate_sys_error(errno);
     int rc = nasfs_storage_discard_upload(storage, temp_name);

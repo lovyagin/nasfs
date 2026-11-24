@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "crypto_engine.h"
 #include "protocol.h"
 
 static int test_key_derivation_and_encryption_round_trip(void) {
@@ -175,6 +176,41 @@ static int test_block_metadata_integrity(void) {
   return 0;
 }
 
+static int test_block_checksum_encoding(void) {
+  const uint8_t input[] = "123456789";
+  const struct {
+    nasfs_hash_algo_t algorithm;
+    const char* name;
+    uint8_t expected[4];
+  } cases[] = {
+      {NASFS_HASH_CRC32, "CRC32", {0xcb, 0xf4, 0x39, 0x26}},
+      {NASFS_HASH_ADLER32, "Adler32", {0x09, 0x1e, 0x01, 0xde}},
+  };
+  int result = 0;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    nasfs_block_meta_t meta = {0};
+    size_t hash_len;
+    if (crypto_engine_hash(cases[i].algorithm, input, sizeof(input) - 1,
+                           meta.hash, &hash_len) != 0 ||
+        hash_len != sizeof(cases[i].expected)) {
+      fprintf(stderr, "%s produced an invalid checksum length\n",
+              cases[i].name);
+      result = 1;
+      continue;
+    }
+
+    uint8_t encoded[NASFS_BLOCK_META_SIZE];
+    protocol_encode_block_meta(encoded, &meta);
+    if (memcmp(encoded + 12, cases[i].expected, sizeof(cases[i].expected)) !=
+        0) {
+      fprintf(stderr, "%s block metadata checksum is not in big-endian order\n",
+              cases[i].name);
+      result = 1;
+    }
+  }
+  return result;
+}
+
 static int test_frame_codec(void) {
   nasfs_frame_t frame;
   const uint8_t zero_length[] = {0, 0, 0, 0, NASFS_CMD_HELLO};
@@ -199,6 +235,45 @@ static int test_frame_codec(void) {
   return result;
 }
 
+static int test_portable_file_encoding(void) {
+  const uint64_t value = UINT64_C(0x0102030405060708);
+  const uint8_t expected[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  uint8_t encoded[8];
+  protocol_store_u64(encoded, value);
+  if (memcmp(encoded, expected, sizeof(expected)) != 0 ||
+      protocol_load_u64(expected) != value) {
+    return 1;
+  }
+
+  const uint8_t file_key[32] = {0x42};
+  const uint8_t salt[16] = {0x24};
+  uint8_t input[sizeof(file_key) + sizeof(salt) + sizeof(expected)];
+  memcpy(input, file_key, sizeof(file_key));
+  memcpy(input + sizeof(file_key), salt, sizeof(salt));
+  memcpy(input + sizeof(file_key) + sizeof(salt), expected, sizeof(expected));
+  uint8_t expected_key[32];
+  uint8_t block_key[32];
+  if (crypto_generichash(expected_key, sizeof(expected_key), input,
+                         sizeof(input), NULL, 0) != 0) {
+    return 1;
+  }
+  crypto_engine_derive_block_key(block_key, file_key, salt, value, 0);
+  if (memcmp(block_key, expected_key, sizeof(block_key)) != 0) return 1;
+
+  const uint8_t nonce[crypto_secretbox_NONCEBYTES] = {1, 2, 3, 4, 5, 6, 7, 8};
+  const uint8_t plaintext[] = {9, 10, 11};
+  uint8_t ciphertext[sizeof(plaintext) + crypto_secretbox_MACBYTES];
+  uint8_t expected_ciphertext[sizeof(ciphertext)];
+  size_t ciphertext_len;
+  return crypto_secretbox_easy(expected_ciphertext, plaintext,
+                               sizeof(plaintext), nonce, expected_key) != 0 ||
+         crypto_engine_encrypt_block(NASFS_CIPHER_XSALSA20_POLY1305, plaintext,
+                                     sizeof(plaintext), block_key, value,
+                                     ciphertext, &ciphertext_len) != 0 ||
+         ciphertext_len != sizeof(ciphertext) ||
+         memcmp(ciphertext, expected_ciphertext, sizeof(ciphertext)) != 0;
+}
+
 int main(void) {
   if (sodium_init() < 0) {
     fprintf(stderr, "libsodium initialization failed\n");
@@ -220,8 +295,15 @@ int main(void) {
     return 1;
   }
 
+  if (test_block_checksum_encoding() != 0) return 1;
+
   if (test_frame_codec() != 0) {
     fprintf(stderr, "test_frame_codec failed\n");
+    return 1;
+  }
+
+  if (test_portable_file_encoding() != 0) {
+    fprintf(stderr, "test_portable_file_encoding failed\n");
     return 1;
   }
 

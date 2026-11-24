@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 
-cleanup_integration() {
-    local status=$? log
+stop_integration_server() {
     if [[ -n $SERVER_PID ]]; then
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
+        SERVER_PID=
     fi
+}
+
+cleanup_integration() {
+    local status=$? log
+    stop_integration_server
     if (( status != 0 )); then
         for log in "$LOG_DIR"/*.log; do
             [[ -f $log ]] || continue
@@ -57,7 +62,7 @@ start_integration_server() {
 
     while (( SECONDS < deadline )) && kill -0 "$SERVER_PID" 2>/dev/null; do
         if [[ -f $LOG_DIR/server.log ]]; then
-            port=$(sed -n 's/.*nasfs_server listening on 127\.0\.0\.1:\([0-9][0-9]*\)\.\.\.$/\1/p' "$LOG_DIR/server.log")
+            port=$(sed -n "s/^\[PID=$SERVER_PID .*nasfs_server listening on 127\.0\.0\.1:\([0-9][0-9]*\)\.\.\.$/\1/p" "$LOG_DIR/server.log")
             if [[ -n $port && $port != 0 ]]; then
                 export NASFS_SERVER_IP=127.0.0.1 NASFS_SERVER_PORT="$port"
                 (umask 077; mkdir -p "$HOME/.nasfs")
