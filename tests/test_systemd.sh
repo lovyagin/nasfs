@@ -39,11 +39,11 @@ trap cleanup_systemd EXIT
 
 pid_file=$(sed -n 's/^PIDFile=//p' "$installed_unit")
 test -n "$pid_file"
-test "$pid_file" = "$(awk '$1 == "PidFile" {print $2}' "$installed_config")"
+test "$pid_file" = "$(sed -n 's/^PidFile "\([^"]*\)".*/\1/p' "$installed_config")"
 grep -Fx "PID_FILE=\"$pid_file\"" "$prefix/bin/nasfsctl"
-storage_dir=$(awk '$1 == "StorageDir" {print $2}' "$installed_config")
+storage_dir=$(sed -n 's/^StorageDir "\([^"]*\)".*/\1/p' "$installed_config")
 [[ $storage_dir == "$prefix/"* && -d $storage_dir ]]
-grep -Fx "ExecStart=$SERVER_BIN $installed_config" "$installed_unit"
+grep -Fx "ExecStart=\"$SERVER_BIN\" \"$installed_config\"" "$installed_unit"
 mkdir -p "$systemd_user_dir/$unit.d"
 cp "$installed_unit" "$systemd_user_dir/$unit"
 cat > "$systemd_user_dir/$unit.d/keys.conf" <<KEYS

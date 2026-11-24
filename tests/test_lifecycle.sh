@@ -142,6 +142,14 @@ other_private = root / "other.key"
 keygen(other_private, public)
 assert not other_private.exists() and public.read_bytes() == old_public
 
+oversized = subprocess.run([client, "keygen", str(other_private), str(root / "oversized.pub"),
+                            "OV-Is"], capture_output=True, timeout=5)
+assert oversized.returncode == 1, oversized
+assert (b"exceeds NASFS key size limits" in oversized.stderr or
+        b"Unsupported signature algorithm" in oversized.stderr), oversized
+assert not other_private.exists() and not (root / "oversized.pub").exists()
+assert not list(root.glob("*.nasfs-key.*"))
+
 # Launch a detached server from a directory containing relative paths.
 daemon_root = root / "daemon"
 daemon_root.mkdir()
@@ -165,7 +173,7 @@ KexAlgorithms ML-KEM-512
 def launch_daemon(text):
     daemon_config.write_text(text)
     return subprocess.run([server, "server.conf"], cwd=daemon_root,
-                          capture_output=True, timeout=10)
+                          capture_output=True, timeout=10, preexec_fn=lambda: os.umask(0))
 
 def wait_until(predicate):
     deadline = time.monotonic() + 5
@@ -222,6 +230,10 @@ try:
     assert (daemon_root / "storage/stored").is_file()
     assert (daemon_root / "output").read_bytes() == original.read_bytes()
     assert "authenticated with publickey" in daemon_log.read_text()
+    daemon_log.rename(daemon_root / "daemon.log.old")
+    with socket.create_connection(("127.0.0.1", int(port)), timeout=5):
+        wait_until(lambda: daemon_log.is_file() and "Accepted new client" in daemon_log.read_text())
+    assert stat.S_IMODE(daemon_log.stat().st_mode) & 0o022 == 0
 finally:
     os.kill(pid, signal.SIGTERM)
     wait_until(lambda: not daemon_pid.exists() and "Removed PID file" in daemon_log.read_text())
@@ -432,3 +444,68 @@ ctl status
 ctl stop
 ctl stop
 if ctl status; then exit 1; fi
+
+sed 's/^DaemonMode No$/DaemonMode Yes/' "$control_root/etc/nasfs/nasfs.conf" \
+    > "$control_root/etc/nasfs/daemon.conf"
+mv "$control_root/etc/nasfs/daemon.conf" "$control_root/etc/nasfs/nasfs.conf"
+ctl start
+ctl status
+ctl stop
+
+if [[ $(uname -s) == Linux ]]; then
+    python3 - "$control_root" "$TEST_ROOT/startup.so" "$server_path" <<'PYTHON'
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+root = Path(sys.argv[1])
+preload, server = sys.argv[2:]
+asan = re.search(r"libasan\S* => (\S+)", subprocess.check_output(["ldd", server], text=True))
+if asan:
+    preload = f"{asan[1]}:{preload}"
+pid_path = root / "var/run/nasfs/nasfs-server.pid"
+ctl = ["sh", str(root / "bin/nasfsctl")]
+
+for outcome in ("slow", "killed"):
+    gate = root / f"release-{outcome}"
+    env = dict(os.environ, LD_PRELOAD=preload,
+               NASFS_TEST_STARTUP_PHASE="before-daemon-status",
+               NASFS_TEST_STARTUP_GATE=str(gate))
+    with subprocess.Popen([*ctl, "start"], env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE) as launcher:
+        pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while pid is None:
+                assert launcher.poll() is None and time.monotonic() < deadline
+                if pid_path.is_file():
+                    value = pid_path.read_text().strip()
+                    if value:
+                        pid = int(value)
+                time.sleep(0.01)
+            if outcome == "slow":
+                time.sleep(5.25)
+                assert launcher.poll() is None, launcher.communicate()
+                gate.touch()
+                assert launcher.wait(timeout=5) == 0, launcher.communicate()
+                subprocess.run([*ctl, "status"], check=True, timeout=5)
+                subprocess.run([*ctl, "stop"], check=True, timeout=5)
+            else:
+                os.kill(pid, signal.SIGKILL)
+                out, err = launcher.communicate(timeout=5)
+                assert launcher.returncode == 1 and b"Failed to start" in err, (out, err)
+                assert b"NASFS server started" not in out
+                assert not Path(f"/proc/{pid}").exists()
+            assert not pid_path.exists()
+        finally:
+            gate.touch()
+            if launcher.poll() is None:
+                if pid is not None:
+                    os.kill(pid, signal.SIGTERM)
+                launcher.kill()
+PYTHON
+fi

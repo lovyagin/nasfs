@@ -133,6 +133,28 @@ static int test_auth_message_shape(void) {
   return rc;
 }
 
+static int test_key_policy_and_line_boundaries(void) {
+  if (!nasfs_auth_keys_fit("ML-DSA-65", 1952, 4032) ||
+      nasfs_auth_keys_fit("OV-Is", NASFS_AUTH_PUBLIC_KEY_MAX + 1, 4032) ||
+      nasfs_auth_keys_fit("oversized-secret", 1952,
+                          NASFS_AUTH_SECRET_KEY_MAX + 1))
+    return 1;
+
+  FILE* file = tmpfile();
+  if (!file) return 1;
+  int result = 1;
+  char line[8] = {0};
+  if (fputs("long-key-fragment\nabcdefg", file) >= 0 &&
+      fseek(file, 0, SEEK_SET) == 0 &&
+      nasfs_auth_read_line(file, line, sizeof(line)) == -1 &&
+      nasfs_auth_read_line(file, line, sizeof(line)) == 1 &&
+      strcmp(line, "abcdefg") == 0 &&
+      nasfs_auth_read_line(file, line, sizeof(line)) == 0)
+    result = 0;
+  fclose(file);
+  return result;
+}
+
 int main(void) {
   if (test_password_payload_round_trip() != 0) {
     fprintf(stderr, "password auth payload round-trip failed\n");
@@ -152,6 +174,10 @@ int main(void) {
   }
   if (test_auth_message_shape() != 0) {
     fprintf(stderr, "auth message shape test failed\n");
+    return 1;
+  }
+  if (test_key_policy_and_line_boundaries() != 0) {
+    fprintf(stderr, "authentication key limits or line reader failed\n");
     return 1;
   }
   return 0;

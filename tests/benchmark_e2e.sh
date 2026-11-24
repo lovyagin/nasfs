@@ -147,10 +147,10 @@ else
     HOME="$TEST_ROOT/home" start_integration_server "$BENCH_DIR/bench_server.conf"
 fi
 
-printf "\n${Y}══════════════════════════════════════════════════════════════════${NC}\n"
-printf "${Y}   NASFS End-to-End Transfer Benchmark${NC}\n"
+printf '\n%b══════════════════════════════════════════════════════════════════%b\n' "$Y" "$NC"
+printf '%b   NASFS End-to-End Transfer Benchmark%b\n' "$Y" "$NC"
 printf "${Y}   Mode: %s${NC}\n" "$MODE_LABEL"
-printf "${Y}══════════════════════════════════════════════════════════════════${NC}\n\n"
+printf '%b══════════════════════════════════════════════════════════════════%b\n\n' "$Y" "$NC"
 
 # ── CSV header ─────────────────────────────────────────────────────────────────
 echo "mode,tool,cipher,file_size,direction,throughput_mbs,elapsed_s" > "$CSV_OUT"
@@ -174,8 +174,8 @@ bench_nasfs() {
     fi
 
     # 3 timed runs
-    local elapsed_arr=()
-    for run in 1 2 3; do
+    local elapsed_arr=() _run
+    for _run in 1 2 3; do
         rm -f "$out_file" "$STORAGE_DIR/$remote_name"
         if [[ "$direction" == "put" ]]; then
             t0=$(ts)
@@ -223,26 +223,30 @@ bench_sftp() {
     local remote="$SFTP_DIR/${filepath##*/}"
     local local_out="$BENCH_DIR/sftp_got_${size_label// /_}.bin"
 
-    local elapsed_arr=()
-    for run in 1 2 3; do
+    local elapsed_arr=() _run
+    for _run in 1 2 3; do
         local t0 t1
         rm -f "$local_out"
         if [[ "$direction" == "put" ]]; then
             t0=$(ts)
             sftp -c "$cipher_flag" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-                -b - "${SFTP_USER}@${SFTP_HOST}" <<< "put $filepath $remote" \
-                >/dev/null 2>&1
+                -b - "${SFTP_USER}@${SFTP_HOST}" <<< "put \"$filepath\" \"$remote\"" \
+                >/dev/null || return
             t1=$(ts)
         else
-            # ensure remote file exists
+            # Require a fresh upload before starting the GET timer.
             sftp -c "$cipher_flag" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-                -b - "${SFTP_USER}@${SFTP_HOST}" <<< "put $filepath $remote" \
-                >/dev/null 2>&1 || true
+                -b - "${SFTP_USER}@${SFTP_HOST}" <<< "put \"$filepath\" \"$remote\"" \
+                >/dev/null || return
             t0=$(ts)
             sftp -c "$cipher_flag" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-                -b - "${SFTP_USER}@${SFTP_HOST}" <<< "get $remote $local_out" \
-                >/dev/null 2>&1
+                -b - "${SFTP_USER}@${SFTP_HOST}" <<< "get \"$remote\" \"$local_out\"" \
+                >/dev/null || return
             t1=$(ts)
+            if ! cmp -s "$filepath" "$local_out"; then
+                printf 'SFTP GET content mismatch for %s\n' "$filepath" >&2
+                return 1
+            fi
         fi
         elapsed_arr+=("$(elapsed "$t0" "$t1")")
     done
@@ -258,7 +262,7 @@ bench_sftp() {
 }
 
 # ── Run NASFS benchmarks ───────────────────────────────────────────────────────
-printf "${B}Running NASFS benchmarks...${NC}\n"
+printf '%bRunning NASFS benchmarks...%b\n' "$B" "$NC"
 for size_label in "${FILE_ORDER[@]}"; do
     filepath="${FILE_PATHS[$size_label]}"
     printf "  %-10s " "$size_label"
@@ -274,7 +278,7 @@ done
 printf "${B}Checking SFTP availability on %s...${NC}\n" "$SFTP_HOST"
 check_sftp
 if [[ $SFTP_OK -eq 1 ]]; then
-    printf "${G}SFTP available. Running comparison...${NC}\n"
+    printf '%bSFTP available. Running comparison...%b\n' "$G" "$NC"
     for size_label in "${FILE_ORDER[@]}"; do
         filepath="${FILE_PATHS[$size_label]}"
         printf "  %-10s " "$size_label"
@@ -292,13 +296,13 @@ if [[ $SFTP_OK -eq 1 ]]; then
     ssh -o BatchMode=yes "${SFTP_USER}@${SFTP_HOST}" "rm -rf $SFTP_DIR" 2>/dev/null || true
 else
     printf "${Y}[skip] SSH not available on %s — SFTP columns will show '---'${NC}\n" "$SFTP_HOST"
-    printf "${Y}       Enable Remote Login (macOS) or pass --sftp-host to compare.${NC}\n"
+    printf '%b       Enable Remote Login (macOS) or pass --sftp-host to compare.%b\n' "$Y" "$NC"
 fi
 
 # ── Print results table ────────────────────────────────────────────────────────
-printf "\n${Y}══════════════════════════════════════════════════════════════════════════════════${NC}\n"
+printf '\n%b══════════════════════════════════════════════════════════════════════════════════%b\n' "$Y" "$NC"
 printf "${Y}  Throughput in MB/s  (median of 3 runs)  —  mode: %s${NC}\n" "$MODE_LABEL"
-printf "${Y}══════════════════════════════════════════════════════════════════════════════════${NC}\n"
+printf '%b══════════════════════════════════════════════════════════════════════════════════%b\n' "$Y" "$NC"
 
 # Header row
 printf "\n%-12s │ %s │ %s │ %s │ %s │ %s │ %s │ %s\n" \

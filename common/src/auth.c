@@ -11,6 +11,34 @@
 #include <stdlib.h>
 #include <string.h>
 
+int nasfs_auth_keys_fit(const char* algorithm, size_t public_len,
+                        size_t secret_len) {
+  return algorithm && *algorithm &&
+         strlen(algorithm) <= NASFS_AUTH_ALGORITHM_MAX && public_len > 0 &&
+         public_len <= NASFS_AUTH_PUBLIC_KEY_MAX && secret_len > 0 &&
+         secret_len <= NASFS_AUTH_SECRET_KEY_MAX;
+}
+
+int nasfs_auth_read_line(FILE* file, char* line, size_t capacity) {
+  if (capacity == 0) return 0;
+  size_t length = 0;
+  int valid = 1;
+  int ch;
+  while (!feof(file) && (ch = fgetc(file)) != EOF) {
+    if (ch == '\n') {
+      line[length] = '\0';
+      return valid ? 1 : -1;
+    }
+    if (!ch || length == capacity - 1)
+      valid = 0;
+    else if (valid)
+      line[length++] = (char)ch;
+  }
+  if (ferror(file) || (length == 0 && valid)) return 0;
+  line[length] = '\0';
+  return valid ? 1 : -1;
+}
+
 static int append_field(uint8_t* out, size_t out_size, size_t* offset,
                         const uint8_t* data, size_t data_len) {
   uint32_t field_len;

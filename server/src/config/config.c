@@ -41,6 +41,47 @@ static int parse_config_int(const char* value, int* out_value) {
   return 0;
 }
 
+/* Double-quoted values can contain whitespace and #. Backslash can
+   escape a quote or a backslash inside a quoted value. */
+static int parse_config_line(char* line, char** key, char** value) {
+  *key = line + strspn(line, " \t\r\v\f");
+  *value = NULL;
+  if (!**key || **key == '#') {
+    *key = NULL;
+    return 0;
+  }
+
+  char* cursor = *key + strcspn(*key, " \t\r\v\f#");
+  if (!*cursor) return 0;
+  char separator = *cursor;
+  *cursor++ = '\0';
+  if (separator == '#') return 0;
+  cursor += strspn(cursor, " \t\r\v\f");
+  if (!*cursor || *cursor == '#') return 0;
+
+  if (*cursor != '"') {
+    trim_string(cursor);
+    *value = cursor;
+    cursor[strcspn(cursor, " \t\r\v\f#")] = '\0';
+    return 0;
+  }
+
+  *value = ++cursor;
+  char* out = cursor;
+  while (*cursor && *cursor != '"') {
+    if (*cursor == '\\') {
+      cursor++;
+      if (*cursor != '\\' && *cursor != '"') return -1;
+    }
+    *out++ = *cursor++;
+  }
+  if (*cursor != '"') return -1;
+  *out = '\0';
+  cursor++;
+  cursor += strspn(cursor, " \t\r\v\f");
+  return !*cursor || *cursor == '#' ? 0 : -1;
+}
+
 /* Load configuration from a file.
    Reads configuration settings from FILENAME and stores them in CONFIG.
    Default values are set first, then overridden by values in the file.
@@ -76,12 +117,16 @@ int load_config(const char* filename, server_config_t* config) {
     }
     line[length] = '\0';
 
-    trim_string(line);
-
-    char* key = strtok(line, " \t");
+    char* key;
+    char* value;
+    if (parse_config_line(line, &key, &value) < 0) {
+      fprintf(stderr, "Invalid quoted value on configuration line %zu\n",
+              line_number);
+      fclose(file);
+      return -1;
+    }
     if (!key) continue;
 
-    char* value = strtok(NULL, " \t#");
     if (!value) {
       if (strcmp(key, "AuthPassword") == 0) {
         free(config->auth_password);

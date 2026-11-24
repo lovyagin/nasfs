@@ -272,6 +272,19 @@ expect_client_failure "$LOG_DIR/client_publish_failure.log" "Cannot publish down
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
     get "$REMOTE_NAME" "$TEST_DIR/get_destination_directory"
 test -d "$TEST_DIR/get_destination_directory"
+printf 'Existing destination\n' > "$TEST_DIR/get_protected"
+chmod 444 "$TEST_DIR/get_protected"
+mkfifo "$TEST_DIR/get_fifo"
+ln -s get_protected "$TEST_DIR/get_symlink"
+for destination in get_protected get_fifo get_symlink; do
+    expect_client_failure "$LOG_DIR/client_$destination.log" "Cannot publish download" \
+        "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
+        get "$REMOTE_NAME" "$TEST_DIR/$destination"
+done
+test "$(cat "$TEST_DIR/get_protected")" = 'Existing destination'
+test -p "$TEST_DIR/get_fifo"
+test -L "$TEST_DIR/get_symlink"
+test "$(readlink "$TEST_DIR/get_symlink")" = get_protected
 if compgen -G "$TEST_DIR/.nasfs-download.*" > /dev/null; then
     printf "Temporary download was not removed.\n" >&2
     exit 1

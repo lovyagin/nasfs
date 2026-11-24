@@ -8,12 +8,22 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define NASFS_AUTH_METHOD_PASSWORD "password"
 #define NASFS_AUTH_METHOD_PUBLICKEY "publickey"
 #define NASFS_AUTH_METHOD_PASSWORD_PUBLICKEY "password+publickey"
 #define NASFS_AUTH_METHOD_PAKE "pake"
 #define NASFS_AUTH_DEFAULT_SIG_ALGORITHM "ML-DSA-65"
+#define NASFS_AUTH_ALGORITHM_MAX 127
+#define NASFS_AUTH_PUBLIC_KEY_MAX 4096
+#define NASFS_AUTH_SECRET_KEY_MAX 4999
+
+int nasfs_auth_keys_fit(const char* algorithm, size_t public_len,
+                        size_t secret_len);
+/* Return 1 for a complete line, 0 for EOF or I/O error, -1 for invalid data.
+   Invalid lines are consumed in full. The newline is omitted. */
+int nasfs_auth_read_line(FILE* file, char* line, size_t capacity);
 
 typedef struct {
   char* method;

@@ -43,6 +43,25 @@ start_server() {
 
     echo "Starting NASFS server..."
     run_with_sudo mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")" || return 1
+    mode=$(run_with_sudo "$BINARY" --daemon-mode "$CONFIG") || return 1
+    if [ "$mode" = yes ]; then
+        # The daemon launcher reports readiness after listening and writing its PID.
+        result=0
+        if needs_sudo; then
+            # shellcheck disable=SC2016
+            sudo sh -c 'unset NASFS_SERVER_SIGNING_SEED NASFS_AUTHOR_PUBLIC_KEY; exec "$1" "$2" >>"$3" 2>&1' \
+                nasfsctl "$BINARY" "$CONFIG" "$LOG_FILE" || result=$?
+        else
+            "$BINARY" "$CONFIG" >>"$LOG_FILE" 2>&1 || result=$?
+        fi
+        if [ "$result" -ne 0 ]; then
+            echo "Failed to start NASFS server" >&2
+            return "$result"
+        fi
+        echo "NASFS server started"
+        return 0
+    fi
+
     # The positional parameters belong to the inner shell.
     if needs_sudo; then
         # shellcheck disable=SC2016

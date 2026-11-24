@@ -104,7 +104,7 @@ static int authorized_key_matches(const char* path, const char* alg,
                                   const uint8_t* public_key,
                                   size_t public_key_len) {
   FILE* file;
-  char line[8192];
+  char line[NASFS_AUTH_ALGORITHM_MAX + 1 + 2 * NASFS_AUTH_PUBLIC_KEY_MAX + 2];
 
   if (!path || !alg || !public_key) {
     return 0;
@@ -115,7 +115,9 @@ static int authorized_key_matches(const char* path, const char* alg,
     return 0;
   }
 
-  while (fgets(line, sizeof(line), file)) {
+  int line_status;
+  while ((line_status = nasfs_auth_read_line(file, line, sizeof(line))) != 0) {
+    if (line_status < 0) continue;
     char* key_alg;
     char* key_hex;
     uint8_t* decoded;
@@ -160,15 +162,17 @@ static int verify_publickey_auth(client_session_t* session,
   if (!auth->sig_algorithm || !auth->public_key || !auth->signature ||
       !nasfs_handshake_offer_contains(global_config.pubkey_auth_algorithms,
                                       auth->sig_algorithm) ||
-      !OQS_SIG_alg_is_enabled(auth->sig_algorithm) ||
-      !authorized_key_matches(global_config.authorized_keys_file,
-                              auth->sig_algorithm, auth->public_key,
-                              auth->public_key_len)) {
+      !OQS_SIG_alg_is_enabled(auth->sig_algorithm)) {
     return 0;
   }
 
   sig = OQS_SIG_new(auth->sig_algorithm);
-  if (!sig || auth->public_key_len != sig->length_public_key) {
+  if (!sig || auth->public_key_len != sig->length_public_key ||
+      !nasfs_auth_keys_fit(auth->sig_algorithm, sig->length_public_key,
+                           sig->length_secret_key) ||
+      !authorized_key_matches(global_config.authorized_keys_file,
+                              auth->sig_algorithm, auth->public_key,
+                              auth->public_key_len)) {
     if (sig) {
       OQS_SIG_free(sig);
     }

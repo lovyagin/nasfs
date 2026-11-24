@@ -8,6 +8,7 @@
 #include "config.h"
 #endif
 
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,12 +22,20 @@
 static char* log_path_saved;
 static log_level_t min_level_saved;
 
+static FILE* open_log(const char* path) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+  if (fd < 0) return NULL;
+  FILE* stream = fdopen(fd, "a");
+  if (!stream) close(fd);
+  return stream;
+}
+
 /* Initialize the logging module.
    Opens the log file at LOG_PATH and sets the minimum log level to MIN_LEVEL.
    Returns an error if the log file cannot be opened. */
 int log_init(const char* log_path, log_level_t min_level) {
   if (!log_path) return -1;
-  FILE* log_file = fopen(log_path, "a");
+  FILE* log_file = open_log(log_path);
   if (!log_file) return -1;
   if (fclose(log_file) != 0) return -1;
   log_path_saved = strdup(log_path);
@@ -90,7 +99,7 @@ void log_stream_v(void* stream, log_level_t level, const char* format,
    Formats and writes a message with the specified LEVEL and FORMAT
    to the configured log file.  */
 void log_file(log_level_t level, const char* format, ...) {
-  FILE* log_file = fopen(log_path_saved, "a");
+  FILE* log_file = open_log(log_path_saved);
   if (log_file == NULL) return;
   va_list args;
   va_start(args, format);
@@ -121,7 +130,7 @@ void log_all(log_level_t level, const char* format, ...) {
 
   log_stream_v(stdout, level, format, args_stdout);
 
-  FILE* log_file = fopen(log_path_saved, "a");
+  FILE* log_file = open_log(log_path_saved);
   if (log_file != NULL) {
     log_stream_v(log_file, level, format, args_file);
     fclose(log_file);

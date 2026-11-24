@@ -205,20 +205,6 @@ int uv_fs_write(uv_loop_t* loop, uv_fs_t* request, uv_file fd,
   return result;
 }
 
-int rename(const char* oldpath, const char* newpath) {
-  typedef int (*rename_fn)(const char*, const char*);
-  rename_fn actual = (rename_fn)dlsym(RTLD_NEXT, "rename");
-  if (!actual) abort();
-  int result = actual(oldpath, newpath);
-  const char* name = strrchr(oldpath, '/');
-  name = name ? name + 1 : oldpath;
-  if (result == 0 && getenv("NASFS_TEST_CRASH_AFTER_DOWNLOAD") &&
-      strncmp(name, ".nasfs-download.", sizeof(".nasfs-download.") - 1) == 0) {
-    kill(getpid(), SIGKILL);
-  }
-  return result;
-}
-
 int fclose(FILE* stream) {
   typedef int (*fclose_fn)(FILE*);
   fclose_fn actual = (fclose_fn)dlsym(RTLD_NEXT, "fclose");
@@ -333,7 +319,13 @@ int renameat(int olddir, const char* oldpath, int newdir, const char* newpath) {
     const struct timespec pause = {.tv_nsec = 10000000};
     while (access(gate, F_OK) != 0) nanosleep(&pause, NULL);
   }
-  return actual(olddir, oldpath, newdir, newpath);
+  int result = actual(olddir, oldpath, newdir, newpath);
+  if (result == 0 && getenv("NASFS_TEST_CRASH_AFTER_DOWNLOAD") &&
+      strncmp(oldpath, ".nasfs-download.", sizeof(".nasfs-download.") - 1) ==
+          0) {
+    kill(getpid(), SIGKILL);
+  }
+  return result;
 }
 
 static void wait_startup_checkpoint(const char* phase) {

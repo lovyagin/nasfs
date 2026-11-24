@@ -497,6 +497,56 @@ def main():
         await_cleanup(root, ".nasfs-download.*")
         assert destination.read_bytes() == b"Previous destination"
 
+    for change in ("move", "retarget", "cancel-after-move"):
+        original = root / f"{change}-original"
+        original.mkdir()
+        substitute = root / f"{change}-substitute"
+        original_target = original / "local.bin"
+        original_target.write_bytes(b"Previous destination")
+        if change == "retarget":
+            parent = root / "retarget-link"
+            parent.symlink_to(original, target_is_directory=True)
+            substitute.mkdir()
+        else:
+            parent = original
+
+        def change_parent():
+            assert list(original.glob(".nasfs-download.*")), change
+            if change == "retarget":
+                parent.unlink()
+                parent.symlink_to(substitute, target_is_directory=True)
+            else:
+                original.rename(substitute)
+                original.mkdir()
+
+        args = ["get", remote, str(parent / "local.bin")]
+        if change == "cancel-after-move":
+            interrupt_transfer(client, args, upstream_port, "get", GET_DONE,
+                               signal.SIGTERM, on_pause=change_parent)
+        else:
+            stderr = interrupt_transfer(client, args, upstream_port, "get", GET_DONE,
+                                        None, before_forward=change_parent)
+            assert b"Download destination directory changed" in stderr, stderr
+        expected_parent = original if change == "retarget" else substitute
+        assert (expected_parent / "local.bin").read_bytes() == b"Previous destination"
+        unexpected_parent = substitute if change == "retarget" else original
+        assert not (unexpected_parent / "local.bin").exists()
+        await_cleanup(expected_parent, ".nasfs-download.*")
+        await_cleanup(unexpected_parent, ".nasfs-download.*")
+
+    for initially_present in (False, True):
+        target = root / f"changed-during-download-{initially_present}.bin"
+        other = root / "substitute.bin"
+        other.write_bytes(b"Replacement from another writer")
+        if initially_present:
+            target.write_bytes(b"Previous destination")
+        stderr = interrupt_transfer(client, ["get", remote, str(target)],
+                                    upstream_port, "get", GET_DONE, None,
+                                    before_forward=lambda: other.replace(target))
+        assert b"Cannot publish download" in stderr, stderr
+        assert target.read_bytes() == b"Replacement from another writer"
+        await_cleanup(root, ".nasfs-download.*")
+
     interrupt_transfer(client, get, upstream_port, "get", GET_DONE, signal.SIGKILL)
     assert destination.read_bytes() == b"Previous destination"
     orphans = list(root.glob(".nasfs-download.*"))

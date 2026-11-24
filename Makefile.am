@@ -48,7 +48,7 @@ endif
 
 install-data-local:
 	$(MKDIR_P) -m 755 "$(DESTDIR)$(datadir)/nasfs/storage"
-	$(MKDIR_P) $(DESTDIR)$(localstatedir)/run/nasfs
-	$(MKDIR_P) $(DESTDIR)$(localstatedir)/log/nasfs
-	chmod 755 $(DESTDIR)$(localstatedir)/run/nasfs
-	chmod 755 $(DESTDIR)$(localstatedir)/log/nasfs
+	$(MKDIR_P) "$(DESTDIR)$(localstatedir)/run/nasfs"
+	$(MKDIR_P) "$(DESTDIR)$(localstatedir)/log/nasfs"
+	chmod 755 "$(DESTDIR)$(localstatedir)/run/nasfs"
+	chmod 755 "$(DESTDIR)$(localstatedir)/log/nasfs"

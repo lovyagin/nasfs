@@ -80,7 +80,6 @@ int daemonize(const char* pid_path) {
   }
   close(status_pipe[0]);
 
-  umask(0);
   if (chdir("/") < 0) {
     log_all(LOG_ERROR, "Failed to change directory");
     _exit(EXIT_FAILURE);

@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <uv.h>
@@ -222,7 +223,12 @@ client_op_t current_op = OP_NONE;
 const char* local_filename = NULL;
 const char* remote_filename = NULL;
 uv_file local_fd = -1;
-static char* download_temp_path;
+static int download_directory = -1;
+static char* download_parent;
+static char download_temp_name[sizeof(".nasfs-download.") + 32];
+static const char* download_name;
+static struct stat download_initial_destination;
+static int download_had_destination;
 static int put_ack_pending;
 static int put_result_pending;
 uint64_t file_offset = 0;
@@ -398,6 +404,12 @@ static int write_keypair_files(const char* private_path,
     fprintf(stderr, "Unsupported signature algorithm: %s\n", algorithm);
     return 1;
   }
+  if (!nasfs_auth_keys_fit(algorithm, sig->length_public_key,
+                           sig->length_secret_key)) {
+    fprintf(stderr, "Signature algorithm exceeds NASFS key size limits: %s\n",
+            algorithm);
+    goto out;
+  }
 
   public_key = malloc(sig->length_public_key);
   secret_key = malloc(sig->length_secret_key);
@@ -481,9 +493,9 @@ static int load_identity_file(const char* path, const char* expected_algorithm,
                               size_t* secret_key_len) {
   FILE* file;
   char header[128];
-  char alg_line[128];
-  char public_hex[10000];
-  char secret_hex[10000];
+  char alg_line[NASFS_AUTH_ALGORITHM_MAX + 2];
+  char public_hex[2 * NASFS_AUTH_PUBLIC_KEY_MAX + 2];
+  char secret_hex[2 * NASFS_AUTH_SECRET_KEY_MAX + 2];
 
   if (!path || !algorithm || !public_key || !public_key_len || !secret_key ||
       !secret_key_len) {
@@ -496,9 +508,10 @@ static int load_identity_file(const char* path, const char* expected_algorithm,
     return -1;
   }
 
-  if (!fgets(header, sizeof(header), file) ||
-      !fgets(alg_line, sizeof(alg_line), file) ||
-      !fgets(public_hex, 10000, file) || !fgets(secret_hex, 10000, file)) {
+  if (nasfs_auth_read_line(file, header, sizeof(header)) != 1 ||
+      nasfs_auth_read_line(file, alg_line, sizeof(alg_line)) != 1 ||
+      nasfs_auth_read_line(file, public_hex, sizeof(public_hex)) != 1 ||
+      nasfs_auth_read_line(file, secret_hex, sizeof(secret_hex)) != 1) {
     fclose(file);
     return -1;
   }
@@ -510,6 +523,8 @@ static int load_identity_file(const char* path, const char* expected_algorithm,
   trim_line(secret_hex);
 
   if (strcmp(header, "NASFS-MLDSA-PRIVATE-v1") != 0 ||
+      !nasfs_auth_keys_fit(alg_line, strlen(public_hex) / 2,
+                           strlen(secret_hex) / 2) ||
       (expected_algorithm && expected_algorithm[0] != '\0' &&
        strcmp(expected_algorithm, alg_line) != 0)) {
     return -1;
@@ -867,43 +882,106 @@ static int close_local_file(void) {
   return rc;
 }
 
-static int open_download_file(void) {
-  static const char pattern[] = ".nasfs-download.XXXXXX";
-  const char* slash = strrchr(local_filename, '/');
-  size_t prefix_len = slash ? (size_t)(slash - local_filename) + 1 : 0;
-  char* path = malloc(prefix_len + sizeof(pattern));
-  if (!path) return -1;
+static void discard_download(void) {
+  if (download_directory >= 0) {
+    if (download_temp_name[0] &&
+        unlinkat(download_directory, download_temp_name, 0) < 0 &&
+        errno != ENOENT) {
+      fprintf(stderr, "Cannot remove temporary download '%s': %s\n",
+              download_temp_name, strerror(errno));
+    }
+    close(download_directory);
+    download_directory = -1;
+    download_temp_name[0] = '\0';
+  }
+  free(download_parent);
+  download_parent = NULL;
+}
 
-  memcpy(path, local_filename, prefix_len);
-  memcpy(path + prefix_len, pattern, sizeof(pattern));
-  int fd = mkstemp(path);
-  if (fd < 0) {
-    int saved_errno = errno;
-    free(path);
-    errno = saved_errno;
+static int prepare_download(void) {
+  const char* slash = strrchr(local_filename, '/');
+  const char* name = slash ? slash + 1 : local_filename;
+  if (!*name) {
+    errno = EINVAL;
     return -1;
   }
-  local_fd = fd;
-  download_temp_path = path;
+  download_parent =
+      slash ? strndup(local_filename, (size_t)(name - local_filename))
+            : strdup(".");
+  if (!download_parent) return -1;
+  download_directory =
+      open(download_parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (download_directory < 0) return -1;
+  download_name = name;
+  download_had_destination =
+      fstatat(download_directory, download_name, &download_initial_destination,
+              AT_SYMLINK_NOFOLLOW) == 0;
+  if (!download_had_destination && errno != ENOENT) return -1;
   return 0;
 }
 
-static void discard_download(void) {
-  if (!download_temp_path) return;
-  if (unlink(download_temp_path) < 0 && errno != ENOENT) {
-    fprintf(stderr, "Cannot remove temporary download '%s': %s\n",
-            download_temp_path, strerror(errno));
+static int open_download_file(void) {
+  static const char prefix[] = ".nasfs-download.";
+  char candidate[sizeof(download_temp_name)] = ".nasfs-download.";
+  for (int attempt = 0; attempt < 8; attempt++) {
+    unsigned char random_id[16];
+    randombytes_buf(random_id, sizeof(random_id));
+    sodium_bin2hex(candidate + sizeof(prefix) - 1,
+                   sizeof(candidate) - sizeof(prefix) + 1, random_id,
+                   sizeof(random_id));
+    int fd = openat(download_directory, candidate,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+      memcpy(download_temp_name, candidate, sizeof(candidate));
+      local_fd = fd;
+      return 0;
+    }
+    if (errno != EEXIST) return -1;
   }
-  free(download_temp_path);
-  download_temp_path = NULL;
+  return -1;
 }
 
-static int check_download_destination(void) {
+static int same_download_entry(const struct stat* first,
+                               const struct stat* second) {
+  return first->st_dev == second->st_dev && first->st_ino == second->st_ino;
+}
+
+static int check_download_parent(void) {
+  struct stat opened;
+  struct stat named;
+  if (fstat(download_directory, &opened) == 0 &&
+      stat(download_parent, &named) == 0 &&
+      same_download_entry(&opened, &named))
+    return 0;
+  fprintf(stderr, "Download destination directory changed: '%s'\n",
+          download_parent);
+  return -1;
+}
+
+static int replace_download(void) {
   struct stat destination;
-  if (lstat(local_filename, &destination) < 0) {
-    if (errno == ENOENT) return 0;
-    fprintf(stderr, "Cannot inspect download destination '%s': %s\n",
-            local_filename, strerror(errno));
+  if (fstatat(download_directory, download_name, &destination,
+              AT_SYMLINK_NOFOLLOW) < 0) {
+    if (errno != ENOENT) return -1;
+    if (download_had_destination) {
+      errno = EAGAIN;
+      return -1;
+    }
+    // If the name is created concurrently, leave that new entry intact.
+    return linkat(download_directory, download_temp_name, download_directory,
+                  download_name, 0);
+  }
+  if (!download_had_destination ||
+      !same_download_entry(&destination, &download_initial_destination)) {
+    errno = EAGAIN;
+    return -1;
+  }
+  if (!S_ISREG(destination.st_mode)) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (!(destination.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) {
+    errno = EACCES;
     return -1;
   }
   for (int i = 0; i < batch_idx - 1; i++) {
@@ -911,26 +989,53 @@ static int check_download_destination(void) {
         destination.st_ino == published_downloads[i].inode) {
       fprintf(stderr, "Duplicate batch destination: '%s' aliases '%s'\n",
               local_filename, batch_queue[i].local_path);
+      errno = EEXIST;
       return -1;
     }
   }
+  if (faccessat(download_directory, download_name, W_OK,
+                AT_EACCESS | AT_SYMLINK_NOFOLLOW) < 0)
+    return -1;
+
+  struct stat current;
+  if (fstatat(download_directory, download_name, &current,
+              AT_SYMLINK_NOFOLLOW) < 0)
+    return -1;
+  if (!same_download_entry(&destination, &current) ||
+      destination.st_mode != current.st_mode ||
+      destination.st_uid != current.st_uid ||
+      destination.st_gid != current.st_gid) {
+    errno = EAGAIN;
+    return -1;
+  }
+  if (renameat(download_directory, download_temp_name, download_directory,
+               download_name) < 0)
+    return -1;
+  download_temp_name[0] = '\0';
   return 0;
 }
 
 static int publish_download(void) {
-  int is_batch = batch_count > 1;
   if (close_local_file() < 0) return -1;
-  if (is_batch && check_download_destination() < 0) return -1;
-  if (rename(download_temp_path, local_filename) < 0) {
-    fprintf(stderr, "Cannot publish download '%s': %s\n", local_filename,
-            strerror(errno));
+  // Serialize NASFS publishers in this directory. POSIX renameat cannot
+  // compare the target against an inode when other writers ignore the lock.
+  if (flock(download_directory, LOCK_EX) < 0) {
+    fprintf(stderr, "Cannot lock download directory '%s': %s\n",
+            download_parent, strerror(errno));
     return -1;
   }
-  free(download_temp_path);
-  download_temp_path = NULL;
-  if (is_batch) {
+  if (check_download_parent() < 0) return -1;
+  if (replace_download() < 0) {
+    const char* reason = errno == EAGAIN ? "destination changed during transfer"
+                                         : strerror(errno);
+    fprintf(stderr, "Cannot publish download '%s': %s\n", local_filename,
+            reason);
+    return -1;
+  }
+  if (batch_count > 1) {
     struct stat downloaded;
-    if (lstat(local_filename, &downloaded) < 0) {
+    if (fstatat(download_directory, download_name, &downloaded,
+                AT_SYMLINK_NOFOLLOW) < 0) {
       fprintf(stderr, "Cannot identify published download '%s': %s\n",
               local_filename, strerror(errno));
       return -1;
@@ -938,6 +1043,7 @@ static int publish_download(void) {
     published_downloads[batch_idx - 1].device = downloaded.st_dev;
     published_downloads[batch_idx - 1].inode = downloaded.st_ino;
   }
+  discard_download();
   return 0;
 }
 
@@ -971,6 +1077,12 @@ static void start_next_operation(uv_stream_t* stream) {
   if (current_op == OP_PUT) {
     send_put_req(stream);
   } else {
+    if (prepare_download() < 0) {
+      fprintf(stderr, "Cannot prepare download '%s': %s\n", local_filename,
+              strerror(errno));
+      close_connection((uv_handle_t*)stream);
+      return;
+    }
     send_get_req(stream);
   }
 }

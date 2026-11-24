@@ -106,7 +106,9 @@ static int resolve_daemon_paths(void) {
  * @return Exit status code.
  */
 int main(int argc, char** argv) {
-  const char* config_file = (argc > 1) ? argv[1] : "nasfs.conf";
+  int query_daemon_mode = argc > 1 && strcmp(argv[1], "--daemon-mode") == 0;
+  int config_arg = query_daemon_mode ? 2 : 1;
+  const char* config_file = argc > config_arg ? argv[config_arg] : "nasfs.conf";
   int exit_code = 0;
   int daemon_status_fd = -1;
 
@@ -117,6 +119,12 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Failed to load config file '%s'.\n", config_file);
     free_config(&global_config);
     return 1;
+  }
+
+  if (query_daemon_mode) {
+    puts(global_config.daemon_mode ? "yes" : "no");
+    free_config(&global_config);
+    return 0;
   }
 
   if (global_config.daemon_mode && reserve_standard_descriptors() < 0) {
