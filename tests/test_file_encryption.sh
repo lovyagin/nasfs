@@ -43,7 +43,11 @@ status=0
 wait "$SERVER_PID" 2>/dev/null || status=$?
 test "$status" -eq 137
 SERVER_PID=
+# Older installations keep their original catalog location.
+catalog="$STORAGE_DIR/.nasfs-v2"
+mv "$STORAGE_DIR/.nasfs-versions" "$catalog"
 start_integration_server "$config"
+test ! -e "$STORAGE_DIR/.nasfs-versions"
 "$CLIENT_BIN" put-resume "$TEST_ROOT/crash.checkpoint" "$TEST_ROOT/missing-after-crash" crash.bin
 "$CLIENT_BIN" get crash.bin "$TEST_ROOT/crash-output"
 cmp "$TEST_ROOT/crash-source" "$TEST_ROOT/crash-output"
@@ -78,4 +82,4 @@ if "$CLIENT_BIN" resolve too-large > "$LOG_DIR/quota-resolve.log" 2>&1; then
     exit 1
 fi
 grep -Fq 'version unavailable' "$LOG_DIR/quota-resolve.log"
-test -z "$(find "$STORAGE_DIR/.nasfs-v2" -name '.attempt.*' -print)"
+test -z "$(find "$catalog" -name '.attempt.*' -print)"

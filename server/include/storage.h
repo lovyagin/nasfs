@@ -6,6 +6,8 @@
 
 #define NASFS_STORAGE_NAME_MAX 255
 #define NASFS_STORAGE_SERVICE_DIR ".nasfs"
+#define NASFS_STORAGE_VERSIONS_DIR ".nasfs-versions"
+#define NASFS_STORAGE_PREVIOUS_VERSIONS_DIR ".nasfs-v2"
 
 /* The wire name may have a single trailing NUL. */
 int nasfs_storage_parse_name(const uint8_t* wire_name, size_t length,

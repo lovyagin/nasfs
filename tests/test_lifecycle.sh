@@ -229,7 +229,7 @@ try:
     for args in (("put", original, "stored"), ("get", "stored", daemon_root / "output")):
         transfer = subprocess.run([client, *args], env=env, capture_output=True, timeout=10)
         assert transfer.returncode == 0, (transfer, daemon_log.read_text())
-    assert len(list((daemon_root / "storage/.nasfs-v2").glob("v-*"))) == 1
+    assert len(list((daemon_root / "storage/.nasfs-versions").glob("v-*"))) == 1
     assert (daemon_root / "output").read_bytes() == original.read_bytes()
     assert "authenticated with publickey" in daemon_log.read_text()
     daemon_log.rename(daemon_root / "daemon.log.old")

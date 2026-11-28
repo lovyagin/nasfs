@@ -19,11 +19,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "storage.h"
+
 #ifdef __APPLE__
 #include <sys/acl.h>
 #endif
 
-static const char version_directory[] = ".nasfs-v2";
 static const char staging_prefix[] = ".attempt.";
 static const char version_prefix[] = "v-";
 
@@ -151,6 +152,25 @@ static int sweep_orphans(nasfs_version_store_t* store) {
   return rc;
 }
 
+/* Continue opening an existing catalog at its original location. */
+static int select_version_directory(int root_fd, const char** directory) {
+  *directory = NASFS_STORAGE_VERSIONS_DIR;
+  struct stat st;
+  if (fstatat(root_fd, NASFS_STORAGE_PREVIOUS_VERSIONS_DIR, &st,
+              AT_SYMLINK_NOFOLLOW) == 0) {
+    if (fstatat(root_fd, NASFS_STORAGE_VERSIONS_DIR, &st,
+                AT_SYMLINK_NOFOLLOW) == 0)
+      return UV_EEXIST;
+    if (errno != ENOENT) return uv_translate_sys_error(errno);
+    *directory = NASFS_STORAGE_PREVIOUS_VERSIONS_DIR;
+    return 0;
+  }
+  if (errno != ENOENT) return uv_translate_sys_error(errno);
+  if (mkdirat(root_fd, *directory, 0700) < 0 && errno != EEXIST)
+    return uv_translate_sys_error(errno);
+  return 0;
+}
+
 int nasfs_version_store_open(nasfs_version_store_t* store, const char* root,
                              int64_t quota, int64_t retention,
                              int64_t attempt_retention) {
@@ -167,8 +187,10 @@ int nasfs_version_store_open(nasfs_version_store_t* store, const char* root,
       path ? open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
   rc = UV_EACCES;
   if (root_fd < 0 || !private_directory(root_fd, 0)) goto cleanup;
-  if (mkdirat(root_fd, version_directory, 0700) < 0 && errno != EEXIST)
-    goto cleanup;
+  const char* version_directory;
+  rc = select_version_directory(root_fd, &version_directory);
+  if (rc < 0) goto cleanup;
+  rc = UV_EACCES;
   store->directory = openat(root_fd, version_directory,
                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (store->directory < 0 || !private_directory(store->directory, 1))

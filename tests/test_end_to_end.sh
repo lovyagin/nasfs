@@ -189,7 +189,7 @@ fi
 # The stored file is E2EE ciphertext so its hash intentionally differs from
 # the plaintext hash; only verify presence here.
 published=$(sed -n 's/^Upload published. Manifest digest: //p' "$LOG_DIR/client_put.log")
-if [ ! -f "$STORAGE_DIR/.nasfs-v2/v-$published" ]; then
+if [ ! -f "$STORAGE_DIR/.nasfs-versions/v-$published" ]; then
     printf "${RED}%s${NC}\n" "FAIL: Uploaded file not found in storage directory."
     exit 1
 fi
@@ -249,13 +249,13 @@ fi
 printf "${GREEN}%s${NC}\n" "      Negotiated suite verified in server logs."
 
 ln -s "$REMOTE_NAME" "$STORAGE_DIR/storage-link.bin"
-STORED_HASH=$(hash_file "$STORAGE_DIR/.nasfs-v2/v-$published")
+STORED_HASH=$(hash_file "$STORAGE_DIR/.nasfs-versions/v-$published")
 expect_client_failure "$LOG_DIR/client_storage_link.log" "Server error:" \
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
     get "storage-link.bin" "$TEST_DIR/storage-link.bin"
 test ! -e "$TEST_DIR/storage-link.bin"
 test -L "$STORAGE_DIR/storage-link.bin"
-test "$(hash_file "$STORAGE_DIR/.nasfs-v2/v-$published")" = "$STORED_HASH"
+test "$(hash_file "$STORAGE_DIR/.nasfs-versions/v-$published")" = "$STORED_HASH"
 
 expect_client_failure "$LOG_DIR/client_missing_source.log" "Cannot open PUT source" \
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
@@ -383,7 +383,7 @@ expect_client_failure "$LOG_DIR/client_batch_last.log" "version unavailable" \
 run_client "$LOG_DIR/client_batch_first_get.log" "ML-KEM-512" "password" \
     "e2e-password" "" "ML-DSA-65" get "batch_first.bin" "$TEST_DIR/batch_first_get.bin"
 verify_download_hash "$INPUT_HASH" "$TEST_DIR/batch_first_get.bin"
-if compgen -G "$STORAGE_DIR/.nasfs-v2/.attempt.*" > /dev/null; then
+if compgen -G "$STORAGE_DIR/.nasfs-versions/.attempt.*" > /dev/null; then
     printf "Temporary upload was not removed.\n" >&2
     exit 1
 fi

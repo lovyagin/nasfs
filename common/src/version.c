@@ -5,6 +5,7 @@
 
 #include "blake3.h"
 
+// Persisted identifier and hash domains are part of the signed format.
 static const uint8_t format_id[8] = {'N', 'A', 'S', 'F', 'S', 'V', '2', 0};
 static const unsigned record_overhead =
     NASFS_BLOCK_META_SIZE + NASFS_VERSION_BLOCK_TAG;

@@ -1,4 +1,4 @@
-"""Integration coverage for the signed NASFS-V2 catalog and transfer paths."""
+"""Integration coverage for the signed NASFS catalog and transfer paths."""
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,7 +18,7 @@ CLIENT = os.path.abspath(sys.argv[1])
 ROOT = Path(os.environ["NASFS_VERSION_TEST_ROOT"])
 STORAGE = Path(os.environ["NASFS_VERSION_TEST_STORAGE"])
 PORT = int(os.environ["NASFS_SERVER_PORT"])
-CATALOG = STORAGE / ".nasfs-v2"
+CATALOG = STORAGE / ".nasfs-versions"
 
 
 def run(*args, expected=0, env=None):

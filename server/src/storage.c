@@ -5,7 +5,6 @@
 
 static const char publication_lock[] = ".nasfs-publish.lock";
 static const char upload_prefix[] = ".nasfs-upload.";
-static const char version_directory[] = ".nasfs-v2";
 
 static int has_ascii_prefix(const uint8_t* name, size_t length,
                             const char* prefix) {
@@ -26,8 +25,11 @@ static int is_flat_name(const uint8_t* name, size_t length) {
            has_ascii_prefix(name, length, NASFS_STORAGE_SERVICE_DIR)) &&
          !(length == sizeof(publication_lock) - 1 &&
            has_ascii_prefix(name, length, publication_lock)) &&
-         !(length == sizeof(version_directory) - 1 &&
-           has_ascii_prefix(name, length, version_directory)) &&
+         !(length == sizeof(NASFS_STORAGE_VERSIONS_DIR) - 1 &&
+           has_ascii_prefix(name, length, NASFS_STORAGE_VERSIONS_DIR)) &&
+         !(length == sizeof(NASFS_STORAGE_PREVIOUS_VERSIONS_DIR) - 1 &&
+           has_ascii_prefix(name, length,
+                            NASFS_STORAGE_PREVIOUS_VERSIONS_DIR)) &&
          !has_ascii_prefix(name, length, upload_prefix) &&
          !memchr(name, '/', length) && !memchr(name, '\\', length) &&
          !memchr(name, '\0', length);
