@@ -47,8 +47,6 @@
 #define CLIENT_INITIAL_BUFFER 16384
 #define CLIENT_MAX_RECV_BUFFER (64 * 1024 * 1024)
 
-enum { OP_NONE = 0 };
-
 typedef struct {
   uv_write_t req;
   uv_buf_t buf;
@@ -1565,8 +1563,7 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               break;
 
             case NASFS_CMD_AUTH_ACK:
-              if (transfer->current_op != OP_NONE ||
-                  plain_frame.payload_len != 0) {
+              if (client->batch_idx != 0 || plain_frame.payload_len != 0) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
