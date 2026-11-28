@@ -2,6 +2,10 @@
 #define _DARWIN_C_SOURCE
 #endif
 
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+
 #include "version_store.h"
 
 #include <dirent.h>
@@ -531,17 +535,14 @@ int nasfs_version_attempt_open(nasfs_version_store_t* store,
              : check_quota(store, size + store->reserved_bytes, NULL);
     if (rc == 0) {
       int fd = nasfs_version_stage(store, staging);
-      if (fd < 0) {
-        rc = fd;
-      } else if (flock(fd, LOCK_EX | LOCK_NB) < 0 ||
-                 fsync(store->directory) < 0 ||
-                 record_attempt(store, attempt, header, name, staging) < 0) {
+      rc = fd;
+      if (fd >= 0 &&
+          (flock(fd, LOCK_EX | LOCK_NB) < 0 || fsync(store->directory) < 0 ||
+           record_attempt(store, attempt, header, name, staging) < 0)) {
         close(fd);
         nasfs_version_discard(store, staging);
         staging[0] = '\0';
         rc = UV_EIO;
-      } else {
-        rc = fd;
       }
     }
   } else if (rc == 0 && !*result) {

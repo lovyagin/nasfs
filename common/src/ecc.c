@@ -99,7 +99,8 @@ void nasfs_ecc_accumulate(uint8_t* p, uint8_t* q, const uint8_t* data,
 int nasfs_ecc_restore(uint8_t* const* data, unsigned count, const uint8_t* p,
                       const uint8_t* q, unsigned target, size_t length,
                       uint8_t* output) {
-  if (count > NASFS_ECC_MAX_DATA || target >= count) return -1;
+  if (!data || !output || count > NASFS_ECC_MAX_DATA || target >= count)
+    return -1;
   if (data[target]) {
     memcpy(output, data[target], length);
     return 0;
@@ -120,6 +121,8 @@ int nasfs_ecc_restore(uint8_t* const* data, unsigned count, const uint8_t* p,
     }
     return 0;
   }
+
+  if (!q || (missing == 2 && !p)) return -1;
 
   /* Reduce the Q equation and, for two erasures, eliminate the other block. */
   unsigned other_factor = other + 1u;
