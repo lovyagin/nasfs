@@ -3,6 +3,7 @@ noinst_LIBRARIES = libnasfs_common.a
 noinst_HEADERS = \
     include/auth.h \
     include/crypto_engine.h \
+    include/ecc.h \
     include/defaults.h \
     include/handshake.h \
     include/pake.h \
@@ -17,6 +18,7 @@ libnasfs_common_a_SOURCES = \
     src/handshake.c \
     src/auth.c \
     src/crypto_engine.c \
+    src/ecc.c \
     src/pake.c \
     ../vendor/blake3/blake3.c \
     ../vendor/blake3/blake3_dispatch.c \

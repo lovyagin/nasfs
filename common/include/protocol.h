@@ -61,6 +61,11 @@ typedef enum {
   NASFS_CMD_GET_INDEX = 0x1F,
   NASFS_CMD_COLLECT = 0x22,
   NASFS_CMD_COLLECTED = 0x23,
+  NASFS_CMD_GET_ADVANCE = 0x24,
+  NASFS_CMD_GET_REPAIR = 0x25,
+  NASFS_CMD_GET_REPAIR_DONE = 0x26,
+  NASFS_CMD_PUT_PARITY = 0x27,
+  NASFS_CMD_GET_REPAIR_DATA = 0x28,
 
   /* Data Transfer Commands (Unencrypted Payload) */
   NASFS_CMD_PUT_DATA = 0x20, /**< C->S: Data chunk for file upload. */
@@ -80,7 +85,7 @@ typedef enum {
 
 static inline int nasfs_control_command(nasfs_cmd_type_t type) {
   return (type >= NASFS_CMD_AUTH && type <= NASFS_CMD_GET_INDEX) ||
-         type == NASFS_CMD_COLLECT || type == NASFS_CMD_COLLECTED ||
+         (type >= NASFS_CMD_COLLECT && type <= NASFS_CMD_GET_REPAIR_DONE) ||
          type == NASFS_CMD_ERROR;
 }
 

@@ -783,6 +783,9 @@ static void session_dispatch_frame(client_session_t* session,
     case NASFS_CMD_GET_REQ:
     case NASFS_CMD_RESOLVE:
     case NASFS_CMD_COLLECT:
+    case NASFS_CMD_GET_ADVANCE:
+    case NASFS_CMD_GET_REPAIR:
+    case NASFS_CMD_PUT_PARITY:
       nasfs_file_service_dispatch(session, plain_frame);
       break;
     default:
@@ -802,7 +805,10 @@ static void on_socket_write_done(uv_write_t* req, int status) {
   } else {
     session->last_activity = uv_now(req->handle->loop);
     if (session->state == SESSION_STATE_SENDING_FILE &&
-        (ctx->type == NASFS_CMD_GET_DATA || ctx->type == NASFS_CMD_GET_INDEX)) {
+        (ctx->type == NASFS_CMD_GET_INDEX ||
+         ctx->type == NASFS_CMD_GET_REPAIR_DATA ||
+         (ctx->type == NASFS_CMD_GET_DATA &&
+          session->files.header.ecc == NASFS_ECC_OFF))) {
       nasfs_file_service_get_next(session);
     }
   }

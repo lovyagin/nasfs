@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "crypto_engine.h"
+#include "ecc.h"
 #include "protocol.h"
 
 #define NASFS_OBJECT_ID_SIZE 16u
@@ -36,6 +37,7 @@ typedef struct {
   uint8_t salt[crypto_pwhash_SALTBYTES];
   uint8_t cipher;
   uint8_t hash;
+  uint8_t ecc;
   uint8_t slot[NASFS_OWNER_SLOT_V1_SIZE];
 } nasfs_version_header_t;
 
@@ -45,6 +47,13 @@ void nasfs_version_encode(uint8_t out[NASFS_VERSION_HEADER_SIZE],
 int nasfs_version_decode(nasfs_version_header_t* header, const uint8_t* wire,
                          size_t length);
 uint64_t nasfs_version_block_count(const nasfs_version_header_t* header);
+uint64_t nasfs_version_record_count(const nasfs_version_header_t* header);
+uint64_t nasfs_version_data_sequence(const nasfs_version_header_t* header,
+                                     uint64_t data_index);
+int nasfs_version_group(const nasfs_version_header_t* header,
+                        uint64_t data_index, uint64_t* start, unsigned* data,
+                        unsigned* parity);
+int nasfs_version_is_parity(const nasfs_version_header_t* header, uint64_t seq);
 int nasfs_version_record(const nasfs_version_header_t* header, uint64_t seq,
                          int64_t* offset, uint32_t* length);
 int64_t nasfs_version_file_size(const nasfs_version_header_t* header);

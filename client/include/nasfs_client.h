@@ -79,6 +79,7 @@ typedef struct {
   const char* author_key;
   nasfs_cipher_algo_t file_cipher;
   nasfs_version_hash_t file_hash;
+  nasfs_ecc_profile_t ecc;
   size_t block_size;
   const uint8_t* expected_digest;
   int watch_signals;

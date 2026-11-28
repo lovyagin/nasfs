@@ -67,9 +67,13 @@ typedef struct {
   const char* remote_filename;
   char* download_parent;
   const char* download_name;
+  FILE* index_file;
+  uint8_t* parity[NASFS_ECC_MAX_PARITY];
+  uint8_t* repair_rows[NASFS_ECC_MAX_DATA + NASFS_ECC_MAX_PARITY];
   uint64_t file_offset;
   uint64_t sequence;
   uint64_t index_position;
+  uint64_t repair_start;
   uint64_t start;
   uint64_t length;
   uint64_t first;
@@ -90,6 +94,11 @@ typedef struct {
   int has_pending_block_meta;
   int partial;
   int index_verified;
+  int repair_active;
+  unsigned repair_data;
+  unsigned repair_parity;
+  unsigned repair_target;
+  unsigned repair_position;
   uint8_t encryption_key[crypto_secretbox_KEYBYTES];
   uint8_t index_root[32];
   char download_temp_name[sizeof(".nasfs-download.") + 32];
@@ -678,6 +687,20 @@ static void send_put_req(uv_stream_t* stream) {
   header->block_size = (uint32_t)client->options->block_size;
   header->cipher = (uint8_t)client->options->file_cipher;
   header->hash = (uint8_t)client->options->file_hash;
+  header->ecc = (uint8_t)client->options->ecc;
+  unsigned data, parity;
+  if (nasfs_ecc_group(header->ecc, &data, &parity) < 0) {
+    close_connection((uv_handle_t*)stream);
+    return;
+  }
+  for (unsigned i = 0; i < parity; i++) {
+    transfer->parity[i] =
+        calloc(1, header->block_size + NASFS_VERSION_BLOCK_TAG);
+    if (!transfer->parity[i]) {
+      close_connection((uv_handle_t*)stream);
+      return;
+    }
+  }
   randombytes_buf(header->salt, sizeof(header->salt));
   if (nasfs_version_file_size(header) < 0 ||
       crypto_engine_create_owner_slot(header->slot, transfer->encryption_key,
@@ -1005,6 +1028,90 @@ static int publish_download(nasfs_client_t* client) {
   return 0;
 }
 
+static void clear_repair(client_transfer_t* transfer) {
+  for (size_t i = 0; i < NASFS_ECC_MAX_DATA + NASFS_ECC_MAX_PARITY; i++) {
+    free(transfer->repair_rows[i]);
+    transfer->repair_rows[i] = NULL;
+  }
+  transfer->repair_active = 0;
+}
+
+static void close_ecc(client_transfer_t* transfer) {
+  clear_repair(transfer);
+  if (transfer->index_file) fclose(transfer->index_file);
+  transfer->index_file = NULL;
+  for (size_t i = 0; i < NASFS_ECC_MAX_PARITY; i++) {
+    free(transfer->parity[i]);
+    transfer->parity[i] = NULL;
+  }
+}
+
+static int load_index_row(client_transfer_t* transfer, uint64_t seq,
+                          uint8_t row[NASFS_BLOCK_META_SIZE]) {
+  if (!transfer->index_file ||
+      fseeko(transfer->index_file, (off_t)(seq * NASFS_BLOCK_META_SIZE),
+             SEEK_SET) != 0)
+    return -1;
+  return fread(row, 1, NASFS_BLOCK_META_SIZE, transfer->index_file) ==
+                 NASFS_BLOCK_META_SIZE
+             ? 0
+             : -1;
+}
+
+static int request_repair(uv_stream_t* stream) {
+  nasfs_client_t* client = stream->data;
+  client_transfer_t* transfer = &client->transfer;
+  uint64_t start;
+  if (transfer->repair_active ||
+      nasfs_version_group(&transfer->header, transfer->sequence, &start,
+                          &transfer->repair_data,
+                          &transfer->repair_parity) < 0 ||
+      !transfer->repair_parity)
+    return -1;
+  transfer->repair_start =
+      nasfs_version_data_sequence(&transfer->header, start);
+  transfer->repair_target = (unsigned)(transfer->sequence - start);
+  transfer->repair_position = 0;
+  transfer->repair_active = 1;
+  send_command(stream, NASFS_CMD_GET_REPAIR, NULL, 0, 1);
+  return 0;
+}
+
+static int receive_repair_row(client_transfer_t* transfer,
+                              const nasfs_frame_t* frame) {
+  if (!transfer->repair_active ||
+      transfer->repair_position >=
+          transfer->repair_data + transfer->repair_parity)
+    return -1;
+  uint8_t trusted[NASFS_BLOCK_META_SIZE];
+  uint64_t seq = transfer->repair_start + transfer->repair_position;
+  nasfs_block_meta_t meta;
+  if (frame->payload_len <= NASFS_BLOCK_META_SIZE ||
+      load_index_row(transfer, seq, trusted) < 0 ||
+      sodium_memcmp(trusted, frame->payload, sizeof(trusted)) != 0 ||
+      protocol_decode_block_meta(trusted, sizeof(trusted), &meta) < 0 ||
+      frame->payload_len != sizeof(trusted) + meta.size)
+    return -1;
+
+  const uint8_t* bytes = frame->payload + sizeof(trusted);
+  uint8_t hash[32];
+  if (nasfs_version_hash_block(transfer->header.hash, bytes, meta.size, hash) !=
+      0)
+    return -1;
+  if (sodium_memcmp(hash, meta.hash, sizeof(hash)) == 0) {
+    size_t padded = transfer->header.block_size + NASFS_VERSION_BLOCK_TAG;
+    uint8_t* row = calloc(1, padded);
+    if (!row || meta.size > padded) {
+      free(row);
+      return -1;
+    }
+    memcpy(row, bytes, meta.size);
+    transfer->repair_rows[transfer->repair_position] = row;
+  }
+  transfer->repair_position++;
+  return 0;
+}
+
 static int begin_download(nasfs_client_t* client, const nasfs_frame_t* frame) {
   client_transfer_t* transfer = &client->transfer;
   nasfs_version_header_t* header = &transfer->header;
@@ -1038,7 +1145,14 @@ static int begin_download(nasfs_client_t* client, const nasfs_frame_t* frame) {
                                          (end % header->block_size != 0)
                                    : first;
   transfer->sequence = first;
-  transfer->partial = transfer->start != 0 || transfer->length != header->size;
+  transfer->partial =
+      nasfs_version_record_count(header) &&
+      (transfer->start != 0 || transfer->length != header->size ||
+       header->ecc != NASFS_ECC_OFF);
+  if (transfer->partial && header->ecc != NASFS_ECC_OFF) {
+    transfer->index_file = tmpfile();
+    if (!transfer->index_file) return -1;
+  }
   transfer->index_position = 0;
   nasfs_version_index_init(&transfer->index);
   nasfs_version_index_init(&transfer->index_selection);
@@ -1079,14 +1193,23 @@ static int receive_index(client_transfer_t* transfer,
   if (!transfer->partial || transfer->index_verified ||
       read_index_row(transfer, frame, transfer->index_position, &meta) < 0)
     return -1;
-  if (meta.seq_num >= transfer->first && meta.seq_num < transfer->end)
+  if (transfer->index_file &&
+      fwrite(frame->payload, 1, NASFS_BLOCK_META_SIZE, transfer->index_file) !=
+          NASFS_BLOCK_META_SIZE)
+    return -1;
+  uint64_t first =
+      nasfs_version_data_sequence(&transfer->header, transfer->first);
+  uint64_t end = nasfs_version_data_sequence(&transfer->header, transfer->end);
+  if (meta.seq_num >= first && meta.seq_num < end &&
+      !nasfs_version_is_parity(&transfer->header, meta.seq_num))
     nasfs_version_index_add(&transfer->index_selection, &meta);
   nasfs_version_index_add(&transfer->index, &meta);
   if (++transfer->index_position ==
-      nasfs_version_block_count(&transfer->header)) {
+      nasfs_version_record_count(&transfer->header)) {
     uint8_t root[32];
     nasfs_version_index_final(&transfer->index, root);
     if (sodium_memcmp(root, transfer->index_root, sizeof(root)) != 0) return -1;
+    if (transfer->index_file && fflush(transfer->index_file) != 0) return -1;
     nasfs_version_index_final(&transfer->index_selection, transfer->index_root);
     nasfs_version_index_init(&transfer->index);
     transfer->index_verified = 1;
@@ -1096,29 +1219,26 @@ static int receive_index(client_transfer_t* transfer,
 
 static int receive_block_meta(client_transfer_t* transfer,
                               const nasfs_frame_t* frame) {
+  uint64_t sequence =
+      nasfs_version_data_sequence(&transfer->header, transfer->sequence);
   if (transfer->has_pending_block_meta || transfer->sequence >= transfer->end ||
       (transfer->partial && !transfer->index_verified) ||
-      read_index_row(transfer, frame, transfer->sequence, &transfer->expected) <
-          0)
+      read_index_row(transfer, frame, sequence, &transfer->expected) < 0)
     return -1;
+  if (transfer->index_file) {
+    uint8_t trusted[NASFS_BLOCK_META_SIZE];
+    if (load_index_row(transfer, sequence, trusted) < 0 ||
+        sodium_memcmp(trusted, frame->payload, sizeof(trusted)) != 0)
+      return -1;
+  }
   transfer->has_pending_block_meta = 1;
   return 0;
 }
 
-static int receive_block(nasfs_client_t* client, const nasfs_frame_t* frame) {
+static int store_verified_block(uv_stream_t* stream,
+                                const nasfs_frame_t* frame) {
+  nasfs_client_t* client = stream->data;
   client_transfer_t* transfer = &client->transfer;
-  if (!transfer->has_pending_block_meta ||
-      frame->payload_len != transfer->expected.size)
-    return -1;
-  uint8_t digest[32];
-  if (nasfs_version_hash_block(transfer->header.hash, frame->payload,
-                               frame->payload_len, digest) < 0 ||
-      sodium_memcmp(digest, transfer->expected.hash, sizeof(digest)) != 0) {
-    client_message(client, NASFS_CLIENT_ERROR,
-                   "Integrity check failed (hash mismatch)\n");
-    return -1;
-  }
-
   uint8_t* data = malloc(frame->payload_len);
   if (!data) return -1;
   uint8_t key[crypto_secretbox_KEYBYTES];
@@ -1159,7 +1279,65 @@ static int receive_block(nasfs_client_t* client, const nasfs_frame_t* frame) {
   transfer->sequence++;
   transfer->has_pending_block_meta = 0;
   report_event(client, NASFS_CLIENT_PROGRESS, transfer->file_offset);
+  if (transfer->header.ecc != NASFS_ECC_OFF)
+    send_command(stream, NASFS_CMD_GET_ADVANCE, NULL, 0, 1);
   return 0;
+}
+
+static int receive_block(uv_stream_t* stream, const nasfs_frame_t* frame) {
+  nasfs_client_t* client = stream->data;
+  client_transfer_t* transfer = &client->transfer;
+  if (!transfer->has_pending_block_meta || transfer->repair_active ||
+      frame->payload_len != transfer->expected.size)
+    return -1;
+  uint8_t digest[32];
+  if (nasfs_version_hash_block(transfer->header.hash, frame->payload,
+                               frame->payload_len, digest) < 0)
+    return -1;
+  if (sodium_memcmp(digest, transfer->expected.hash, sizeof(digest)) == 0)
+    return store_verified_block(stream, frame);
+  if (transfer->header.ecc != NASFS_ECC_OFF) return request_repair(stream);
+  client_message(client, NASFS_CLIENT_ERROR,
+                 "Integrity check failed (hash mismatch)\n");
+  return -1;
+}
+
+static int complete_repair(uv_stream_t* stream, const nasfs_frame_t* done) {
+  nasfs_client_t* client = stream->data;
+  client_transfer_t* transfer = &client->transfer;
+  if (!transfer->repair_active || done->payload_len ||
+      transfer->repair_position !=
+          transfer->repair_data + transfer->repair_parity)
+    return -1;
+  size_t padded = transfer->header.block_size + NASFS_VERSION_BLOCK_TAG;
+  uint8_t* bytes = malloc(padded);
+  if (!bytes) return -1;
+  const uint8_t* p = transfer->repair_rows[transfer->repair_data];
+  const uint8_t* q = transfer->repair_parity == 2
+                         ? transfer->repair_rows[transfer->repair_data + 1]
+                         : NULL;
+  int rc = nasfs_ecc_restore(transfer->repair_rows, transfer->repair_data, p, q,
+                             transfer->repair_target, padded, bytes);
+  clear_repair(transfer);
+  if (!rc) {
+    uint8_t digest[32];
+    size_t length = transfer->expected.size;
+    if (nasfs_version_hash_block(transfer->header.hash, bytes, length,
+                                 digest) != 0 ||
+        sodium_memcmp(digest, transfer->expected.hash, sizeof(digest)) != 0) {
+      rc = -1;
+    } else {
+      nasfs_frame_t repaired = {.payload = bytes, .payload_len = length};
+      rc = store_verified_block(stream, &repaired);
+    }
+  }
+  free(bytes);
+  if (rc < 0)
+    client_message(client, NASFS_CLIENT_ERROR, "ECC recovery failed\n");
+  else
+    client_message(client, NASFS_CLIENT_INFO,
+                   "\nRecovered ciphertext with ECC.\n");
+  return rc;
 }
 
 static int verify_download(nasfs_client_t* client, const nasfs_frame_t* frame) {
@@ -1250,6 +1428,7 @@ static void start_next_operation(uv_stream_t* stream) {
     close_connection((uv_handle_t*)stream);
     return;
   }
+  close_ecc(transfer);
   sodium_memzero(transfer, sizeof(*transfer));
   transfer->local_fd = -1;
   transfer->download_directory = -1;
@@ -1318,6 +1497,7 @@ static void close_connection(uv_handle_t* handle) {
     uv_close((uv_handle_t*)&client->idle_timer, NULL);
   if (!client->local_read_pending) close_local_file(client);
   discard_download(client);
+  close_ecc(&client->transfer);
   client_message(client, NASFS_CLIENT_INFO, "\nConnection closed.\n");
 }
 
@@ -1426,6 +1606,28 @@ fail:
   close_connection((uv_handle_t*)stream);
 }
 
+static void send_parity(uv_stream_t* stream, uint64_t first, unsigned count,
+                        uint32_t length) {
+  nasfs_client_t* client = stream->data;
+  client_transfer_t* transfer = &client->transfer;
+  for (unsigned i = 0; i < count && !uv_is_closing((uv_handle_t*)stream); i++) {
+    nasfs_block_meta_t meta = {.seq_num = first + i, .size = length};
+    if (nasfs_version_hash_block(transfer->header.hash, transfer->parity[i],
+                                 length, meta.hash) != 0) {
+      close_connection((uv_handle_t*)stream);
+      return;
+    }
+    uint8_t row[NASFS_BLOCK_META_SIZE];
+    protocol_encode_block_meta(row, &meta);
+    nasfs_version_index_add(&transfer->index, &meta);
+    send_command(stream, NASFS_CMD_PUT_BLOCK_META, row, sizeof(row), 1);
+    if (uv_is_closing((uv_handle_t*)stream)) return;
+    send_command(stream, NASFS_CMD_PUT_PARITY, transfer->parity[i], length, 0);
+    if (uv_is_closing((uv_handle_t*)stream)) return;
+    memset(transfer->parity[i], 0, length);
+  }
+}
+
 static void on_local_read(uv_fs_t* req) {
   nasfs_fs_ctx_t* ctx = req->data;
   uv_stream_t* stream = ctx->stream;
@@ -1459,8 +1661,10 @@ static void on_local_read(uv_fs_t* req) {
   } else {
     int64_t record_offset;
     uint32_t cipher_len;
-    if (nasfs_version_record(&transfer->header, transfer->sequence,
-                             &record_offset, &cipher_len) < 0 ||
+    uint64_t physical =
+        nasfs_version_data_sequence(&transfer->header, transfer->sequence);
+    if (nasfs_version_record(&transfer->header, physical, &record_offset,
+                             &cipher_len) < 0 ||
         req->result != (ssize_t)(cipher_len - NASFS_VERSION_BLOCK_TAG)) {
       client_message(client, NASFS_CLIENT_ERROR,
                      "PUT source size changed during upload: %s\n",
@@ -1482,8 +1686,7 @@ static void on_local_read(uv_fs_t* req) {
         transfer->header.cipher, (const uint8_t*)ctx->buf.base, req->result,
         key, transfer->sequence, ciphertext, &written);
     sodium_memzero(key, sizeof(key));
-    nasfs_block_meta_t meta = {.seq_num = transfer->sequence,
-                               .size = cipher_len};
+    nasfs_block_meta_t meta = {.seq_num = physical, .size = cipher_len};
     if (rc != 0 || written != cipher_len ||
         nasfs_version_hash_block(transfer->header.hash, ciphertext, cipher_len,
                                  meta.hash) != 0) {
@@ -1491,6 +1694,17 @@ static void on_local_read(uv_fs_t* req) {
       close_connection((uv_handle_t*)stream);
       goto cleanup;
     }
+    unsigned data, parity;
+    uint64_t start;
+    if (nasfs_version_group(&transfer->header, transfer->sequence, &start,
+                            &data, &parity) < 0) {
+      free(ciphertext);
+      close_connection((uv_handle_t*)stream);
+      goto cleanup;
+    }
+    if (parity)
+      nasfs_ecc_accumulate(transfer->parity[0], transfer->parity[1], ciphertext,
+                           (unsigned)(transfer->sequence - start), cipher_len);
     uint8_t row[NASFS_BLOCK_META_SIZE];
     protocol_encode_block_meta(row, &meta);
     nasfs_version_index_add(&transfer->index, &meta);
@@ -1499,6 +1713,9 @@ static void on_local_read(uv_fs_t* req) {
     send_command(stream, NASFS_CMD_PUT_BLOCK_META, row, sizeof(row), 1);
     send_command(stream, NASFS_CMD_PUT_DATA, ciphertext, cipher_len, 0);
     free(ciphertext);
+    if (parity && transfer->sequence == start + data)
+      send_parity(stream, physical + 1, parity,
+                  transfer->header.block_size + NASFS_VERSION_BLOCK_TAG);
     report_event(client, NASFS_CLIENT_PROGRESS, transfer->file_offset);
   }
 cleanup:
@@ -1819,7 +2036,15 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 close_connection((uv_handle_t*)stream);
               break;
             case NASFS_CMD_GET_DATA:
-              if (receive_block(client, &plain_frame) < 0)
+              if (receive_block(stream, &plain_frame) < 0)
+                close_connection((uv_handle_t*)stream);
+              break;
+            case NASFS_CMD_GET_REPAIR_DATA:
+              if (receive_repair_row(transfer, &plain_frame) < 0)
+                close_connection((uv_handle_t*)stream);
+              break;
+            case NASFS_CMD_GET_REPAIR_DONE:
+              if (complete_repair(stream, &plain_frame) < 0)
                 close_connection((uv_handle_t*)stream);
               break;
             case NASFS_CMD_GET_DONE:

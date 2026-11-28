@@ -52,6 +52,15 @@ static int parse_hash_algo(const char* s) {
   return -1;
 }
 
+static int parse_ecc(const char* value) {
+  if (!value || !*value || strcmp(value, "off") == 0) return NASFS_ECC_OFF;
+  if (strcmp(value, "xor-4+1") == 0) return NASFS_ECC_XOR_4;
+  if (strcmp(value, "xor-8+1") == 0) return NASFS_ECC_XOR_8;
+  if (strcmp(value, "xor-16+1") == 0) return NASFS_ECC_XOR_16;
+  if (strcmp(value, "rs-8+2") == 0) return NASFS_ECC_RS_8;
+  return -1;
+}
+
 static int parse_u64(const char* value, uint64_t* out) {
   if (!*value || strspn(value, "0123456789") != strlen(value)) return -1;
   char* end;
@@ -349,6 +358,12 @@ int main(int argc, char** argv) {
                                 : "NASFS_KDF");
     return 1;
   }
+  int ecc = parse_ecc(getenv("NASFS_ECC"));
+  if (ecc < 0) {
+    fprintf(stderr, "Invalid NASFS_ECC profile\n");
+    return 1;
+  }
+  options.ecc = (nasfs_ecc_profile_t)ecc;
   options.file_cipher = (nasfs_cipher_algo_t)selected_cipher;
   options.file_hash = (nasfs_version_hash_t)selected_hash;
   int is_upload = strcmp(argv[1], "put") == 0 || strcmp(argv[1], "mput") == 0;

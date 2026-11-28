@@ -20,6 +20,8 @@ typedef struct {
   uint8_t proof[NASFS_VERSION_PROOF_SIZE];
   uint8_t version[NASFS_VERSION_DIGEST_SIZE];
   uint64_t sequence;
+  uint64_t repair_pos;
+  uint64_t repair_end;
   uint64_t first;
   uint64_t end;
   size_t pending_fs;
@@ -29,6 +31,9 @@ typedef struct {
   int busy;
   int has_expected;
   int send_index;
+  int waiting_ack;
+  int repair_sent;
+  int repairing;
   char name[NASFS_STORAGE_NAME_MAX + 1];
   char staging[NASFS_VERSION_TEMP_NAME];
 } nasfs_file_service_t;

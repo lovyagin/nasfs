@@ -13,6 +13,7 @@ typedef struct {
   uv_fs_t req;
   uv_buf_t buf;
   client_session_t* session;
+  uint64_t storage_sequence;
 } file_request_t;
 
 static void finish_put(client_session_t* session);
@@ -113,6 +114,8 @@ static void put_data(client_session_t* session, const nasfs_frame_t* frame) {
   uint32_t length;
   if (session->state != SESSION_STATE_RECEIVING_FILE || files->active_fd < 0 ||
       !files->has_expected ||
+      nasfs_version_is_parity(&files->header, files->sequence) !=
+          (frame->type == NASFS_CMD_PUT_PARITY) ||
       nasfs_version_record(&files->header, files->sequence, &offset, &length) <
           0 ||
       files->expected.seq_num != files->sequence ||
@@ -232,7 +235,7 @@ static void put_done(client_session_t* session, const nasfs_frame_t* frame) {
   nasfs_file_service_t* files = &session->files;
   if (session->state != SESSION_STATE_RECEIVING_FILE || files->active_fd < 0 ||
       files->has_expected || frame->payload_len != NASFS_VERSION_PROOF_SIZE ||
-      files->sequence != nasfs_version_block_count(&files->header)) {
+      files->sequence != nasfs_version_record_count(&files->header)) {
     abort_transfer(session);
     return;
   }
@@ -262,17 +265,22 @@ static void on_get_read(uv_fs_t* req) {
     int64_t offset;
     uint32_t length;
     if (req->result < 0 || (size_t)req->result != ctx->buf.len ||
-        nasfs_version_record(&files->header, files->sequence, &offset,
+        nasfs_version_record(&files->header, ctx->storage_sequence, &offset,
                              &length) < 0 ||
         protocol_decode_block_meta(row, NASFS_BLOCK_META_SIZE, &meta) < 0 ||
-        meta.seq_num != files->sequence || meta.size != length) {
+        meta.seq_num != ctx->storage_sequence || meta.size != length) {
       abort_transfer(session);
     } else if (files->send_index) {
       files->sequence++;
       session_send_frame(session, NASFS_CMD_GET_INDEX, row,
                          NASFS_BLOCK_META_SIZE, 1);
+    } else if (files->repairing) {
+      files->repair_pos++;
+      session_send_frame(session, NASFS_CMD_GET_REPAIR_DATA, row, ctx->buf.len,
+                         0);
     } else {
       files->sequence++;
+      files->waiting_ack = files->header.ecc != NASFS_ECC_OFF;
       session_send_frame(session, NASFS_CMD_GET_BLOCK_META, row,
                          NASFS_BLOCK_META_SIZE, 1);
       session_send_frame(session, NASFS_CMD_GET_DATA,
@@ -288,26 +296,37 @@ void nasfs_file_service_get_next(client_session_t* session) {
   if (session->state != SESSION_STATE_SENDING_FILE || files->active_fd < 0)
     return;
   if (files->send_index &&
-      files->sequence == nasfs_version_block_count(&files->header)) {
+      files->sequence == nasfs_version_record_count(&files->header)) {
     files->send_index = 0;
     files->sequence = files->first;
   }
-  if (!files->send_index && files->sequence == files->end) {
+  if (files->repairing && files->repair_pos == files->repair_end) {
+    files->repairing = 0;
+    session_send_frame(session, NASFS_CMD_GET_REPAIR_DONE, NULL, 0, 1);
+    return;
+  }
+  if (files->waiting_ack && !files->repairing) return;
+  if (!files->send_index && !files->repairing &&
+      files->sequence == files->end) {
     session->state = SESSION_STATE_AUTHENTICATED;
     close_active(session);
     session_send_frame(session, NASFS_CMD_GET_DONE, NULL, 0, 1);
     return;
   }
+  uint64_t sequence = files->send_index  ? files->sequence
+                      : files->repairing ? files->repair_pos
+                                         : nasfs_version_data_sequence(
+                                               &files->header, files->sequence);
   int64_t offset;
   uint32_t length;
-  if (nasfs_version_record(&files->header, files->sequence, &offset, &length) <
-      0) {
+  if (nasfs_version_record(&files->header, sequence, &offset, &length) < 0) {
     abort_transfer(session);
     return;
   }
   file_request_t* ctx = make_request(
       session, NASFS_BLOCK_META_SIZE + (files->send_index ? 0 : length));
   if (!ctx) return;
+  ctx->storage_sequence = sequence;
   int rc = uv_fs_read(session->handle.loop, &ctx->req, files->active_fd,
                       &ctx->buf, 1, offset, on_get_read);
   if (rc < 0) {
@@ -316,6 +335,33 @@ void nasfs_file_service_get_next(client_session_t* session) {
     return;
   }
   files->pending_fs++;
+}
+
+static void advance_get(client_session_t* session, const nasfs_frame_t* frame) {
+  nasfs_file_service_t* files = &session->files;
+  if (session->state != SESSION_STATE_SENDING_FILE || !files->waiting_ack ||
+      files->repairing || frame->payload_len != 0) {
+    abort_transfer(session);
+    return;
+  }
+  if (frame->type == NASFS_CMD_GET_ADVANCE) {
+    files->waiting_ack = 0;
+    files->repair_sent = 0;
+  } else {
+    uint64_t start;
+    unsigned data, parity;
+    if (files->repair_sent || files->sequence == 0 ||
+        nasfs_version_group(&files->header, files->sequence - 1, &start, &data,
+                            &parity) < 0) {
+      abort_transfer(session);
+      return;
+    }
+    files->repair_pos = nasfs_version_data_sequence(&files->header, start);
+    files->repair_end = files->repair_pos + data + parity;
+    files->repairing = 1;
+    files->repair_sent = 1;
+  }
+  nasfs_file_service_get_next(session);
 }
 
 typedef struct {
@@ -401,7 +447,12 @@ static void start_get(client_session_t* session, const open_request_t* work) {
     uint64_t end = start + length;
     files->end = end / header.block_size + (end % header.block_size != 0);
   }
-  files->send_index = start != 0 || length != header.size;
+  files->waiting_ack = 0;
+  files->repairing = 0;
+  files->repair_sent = 0;
+  files->send_index =
+      nasfs_version_record_count(&header) &&
+      (start != 0 || length != header.size || header.ecc != NASFS_ECC_OFF);
   files->sequence = files->send_index ? 0 : files->first;
   session->state = SESSION_STATE_SENDING_FILE;
   session_send_frame(session, NASFS_CMD_GET_ACK, work->bytes,
@@ -476,7 +527,12 @@ void nasfs_file_service_dispatch(client_session_t* session,
     return;
   }
 
-  if (frame.type == NASFS_CMD_PUT_DATA) {
+  if (frame.type == NASFS_CMD_GET_ADVANCE ||
+      frame.type == NASFS_CMD_GET_REPAIR) {
+    advance_get(session, &frame);
+    return;
+  }
+  if (frame.type == NASFS_CMD_PUT_DATA || frame.type == NASFS_CMD_PUT_PARITY) {
     put_data(session, &frame);
     return;
   }

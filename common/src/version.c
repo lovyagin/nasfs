@@ -20,7 +20,7 @@ void nasfs_version_encode(uint8_t out[NASFS_VERSION_HEADER_SIZE],
   memcpy(out + 68, header->salt, sizeof(header->salt));
   out[84] = header->cipher;
   out[85] = header->hash;
-  out[86] = 0;
+  out[86] = header->ecc;
   out[87] = 0;
   memcpy(out + 88, header->slot, sizeof(header->slot));
 }
@@ -30,7 +30,8 @@ int nasfs_version_decode(nasfs_version_header_t* header, const uint8_t* wire,
   if (!header || !wire || length != NASFS_VERSION_HEADER_SIZE ||
       memcmp(wire, format_id, sizeof(format_id)) != 0 ||
       wire[84] > NASFS_CIPHER_AES_256_GCM || wire[85] > NASFS_VERSION_BLAKE3 ||
-      wire[86] || wire[87] || sodium_is_zero(wire + 8, NASFS_OBJECT_ID_SIZE))
+      wire[86] > NASFS_ECC_RS_8 || wire[87] ||
+      sodium_is_zero(wire + 8, NASFS_OBJECT_ID_SIZE))
     return -1;
 
   memset(header, 0, sizeof(*header));
@@ -43,6 +44,7 @@ int nasfs_version_decode(nasfs_version_header_t* header, const uint8_t* wire,
   memcpy(header->salt, wire + 68, sizeof(header->salt));
   header->cipher = wire[84];
   header->hash = wire[85];
+  header->ecc = wire[86];
   memcpy(header->slot, wire + 88, sizeof(header->slot));
   return nasfs_version_file_size(header) < 0 ? -1 : 0;
 }
@@ -53,29 +55,79 @@ uint64_t nasfs_version_block_count(const nasfs_version_header_t* header) {
          (header->size % header->block_size != 0);
 }
 
+static uint64_t parity_records(const nasfs_version_header_t* header) {
+  unsigned data, parity;
+  if (nasfs_ecc_group(header->ecc, &data, &parity) < 0) return 0;
+  uint64_t blocks = nasfs_version_block_count(header);
+  return (blocks / data + (blocks % data != 0)) * parity;
+}
+
+uint64_t nasfs_version_record_count(const nasfs_version_header_t* header) {
+  return nasfs_version_block_count(header) + parity_records(header);
+}
+
+uint64_t nasfs_version_data_sequence(const nasfs_version_header_t* header,
+                                     uint64_t data_index) {
+  unsigned data, parity;
+  if (nasfs_ecc_group(header->ecc, &data, &parity) < 0) return UINT64_MAX;
+  return data_index + data_index / data * parity;
+}
+
+int nasfs_version_group(const nasfs_version_header_t* header,
+                        uint64_t data_index, uint64_t* start, unsigned* data,
+                        unsigned* parity) {
+  uint64_t blocks = nasfs_version_block_count(header);
+  if (nasfs_ecc_group(header->ecc, data, parity) < 0 || data_index >= blocks)
+    return -1;
+  *start = data_index / *data * *data;
+  if (blocks - *start < *data) *data = (unsigned)(blocks - *start);
+  return 0;
+}
+
+int nasfs_version_is_parity(const nasfs_version_header_t* header,
+                            uint64_t seq) {
+  unsigned data, parity;
+  if (nasfs_ecc_group(header->ecc, &data, &parity) < 0 || !parity) return 0;
+  unsigned group = data + parity;
+  uint64_t data_start = seq / group * data;
+  uint64_t count = nasfs_version_block_count(header);
+  if (data_start >= count) return 0;
+  unsigned available =
+      count - data_start < data ? (unsigned)(count - data_start) : data;
+  return seq % group >= available;
+}
+
 int64_t nasfs_version_file_size(const nasfs_version_header_t* header) {
   if (header->block_size < NASFS_VERSION_MIN_BLOCK ||
       header->block_size > NASFS_VERSION_MAX_BLOCK ||
+      header->ecc > NASFS_ECC_RS_8 ||
       header->size > INT64_MAX - NASFS_VERSION_DATA_OFFSET)
     return -1;
   uint64_t room = INT64_MAX - NASFS_VERSION_DATA_OFFSET - header->size;
   uint64_t count = nasfs_version_block_count(header);
   if (count > room / record_overhead) return -1;
+  room -= count * record_overhead;
+  uint64_t parity = parity_records(header);
+  unsigned stride = header->block_size + record_overhead;
+  if (parity > room / stride) return -1;
   return (int64_t)(NASFS_VERSION_DATA_OFFSET + header->size +
-                   count * record_overhead);
+                   count * record_overhead + parity * stride);
 }
 
 int nasfs_version_record(const nasfs_version_header_t* header, uint64_t seq,
                          int64_t* offset, uint32_t* length) {
   if (nasfs_version_file_size(header) < 0 ||
-      seq >= nasfs_version_block_count(header))
+      seq >= nasfs_version_record_count(header))
     return -1;
-  uint64_t remaining = header->size - seq * header->block_size;
-  uint32_t plaintext_length =
-      remaining < header->block_size ? (uint32_t)remaining : header->block_size;
+  uint32_t remainder = (uint32_t)(header->size % header->block_size);
+  uint32_t missing = remainder ? header->block_size - remainder : 0;
+  uint64_t last = nasfs_version_data_sequence(
+      header, nasfs_version_block_count(header) - 1);
   *offset = (int64_t)(NASFS_VERSION_DATA_OFFSET +
-                      seq * (header->block_size + record_overhead));
-  *length = plaintext_length + NASFS_VERSION_BLOCK_TAG;
+                      seq * (header->block_size + record_overhead) -
+                      (seq > last ? missing : 0));
+  *length = header->block_size + NASFS_VERSION_BLOCK_TAG -
+            (seq == last ? missing : 0);
   return 0;
 }
 

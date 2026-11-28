@@ -139,6 +139,38 @@ for position, marker in ((288 + 44, b"hash mismatch"), (288 + 12, b"hash mismatc
     assert marker in failure.stderr, failure.stderr
     assert output.read_bytes() == first.read_bytes()
 
+# ECC is selected by the signed version, independently of GET environment.
+ecc_input = ROOT / "ecc-source"
+ecc_input.write_bytes(bytes(i % 241 for i in range(4096 * 19 + 33)))
+for profile, failure_limit in (("xor-4+1", 1), ("xor-8+1", 1),
+                               ("xor-16+1", 1), ("rs-8+2", 2)):
+    digest = put(ecc_input, profile, NASFS_ECC=profile)
+    object_id, _ = resolve(profile)
+    stored = CATALOG / f"v-{digest}"
+    run("get", profile, output)
+    assert output.read_bytes() == ecc_input.read_bytes()
+    with stored.open("r+b") as stream:
+        for index in range(failure_limit):
+            position = 288 + index * (4096 + 16 + 44) + 44
+            stream.seek(position)
+            value = stream.read(1)
+            stream.seek(position)
+            stream.write(bytes([value[0] ^ 1]))
+    result = run("get", profile, output)
+    assert b"Recovered ciphertext with ECC" in result.stdout, result.stdout
+    assert output.read_bytes() == ecc_input.read_bytes()
+    run("get-version", object_id, digest, 123, 9000, output)
+    assert output.read_bytes() == ecc_input.read_bytes()[123:9123]
+    with stored.open("r+b") as stream:
+        position = 288 + failure_limit * (4096 + 16 + 44) + 44
+        stream.seek(position)
+        value = stream.read(1)
+        stream.seek(position)
+        stream.write(bytes([value[0] ^ 1]))
+    failure = run("get", profile, output, expected=1)
+    assert b"ECC recovery failed" in failure.stderr, failure.stderr
+    assert output.read_bytes() == ecc_input.read_bytes()[123:9123]
+
 assert run("get", "legacy.bin", output, expected=1).stderr
 assert (STORAGE / "legacy.bin").read_text() == "legacy data remains in the original directory\n"
 legacy_client = os.environ.get("NASFS_LEGACY_CLIENT_BIN")
