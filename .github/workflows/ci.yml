@@ -6,20 +6,17 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   lint:
     runs-on: ubuntu-24.04
     env:
       LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib64
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: Install build and test dependencies
+        run: bash .github/scripts/install-ubuntu-deps.sh
 
       - name: Check C formatting
         run: |
@@ -46,20 +43,11 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib64
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Ensure test runtime dependencies are available
-        run: |
-          if ! command -v python3 >/dev/null || ! command -v openssl >/dev/null; then
-            apt-get update
-            apt-get install -y python3 openssl
-          fi
+      - name: Install build and test dependencies
+        run: bash .github/scripts/install-ubuntu-deps.sh
 
       - name: Configure
         run: |
@@ -86,20 +74,11 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib64
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Ensure test runtime dependencies are available
-        run: |
-          if ! command -v python3 >/dev/null || ! command -v openssl >/dev/null; then
-            apt-get update
-            apt-get install -y python3 openssl
-          fi
+      - name: Install build and test dependencies
+        run: bash .github/scripts/install-ubuntu-deps.sh
 
       - name: Configure
         run: >
@@ -128,20 +107,11 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib64
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/nasfs-ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Ensure test runtime dependencies are available
-        run: |
-          if ! command -v python3 >/dev/null || ! command -v openssl >/dev/null; then
-            apt-get update
-            apt-get install -y python3 openssl
-          fi
+      - name: Install build and test dependencies
+        run: bash .github/scripts/install-ubuntu-deps.sh
 
       - name: Configure sanitizer build
         run: >
