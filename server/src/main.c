@@ -26,10 +26,10 @@
 #include "logging/log.h"
 #include "network/session.h"
 #include "protocol.h"
-#include "storage.h"
 #include "utils/daemon.h"
 #include "utils/pid_file.h"
 #include "utils/signal_handler.h"
+#include "version_store.h"
 
 uv_loop_t* loop;
 uv_tcp_t server;
@@ -73,7 +73,8 @@ static int reserve_standard_descriptors(void) {
 /* Anchor paths before chdir without requiring the target to exist. */
 static int resolve_daemon_paths(void) {
   char** paths[] = {&global_config.log_file, &global_config.pid_file,
-                    &global_config.authorized_keys_file};
+                    &global_config.authorized_keys_file,
+                    &global_config.storage_dir};
   char* cwd = NULL;
   int result = 0;
   for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
@@ -164,24 +165,26 @@ int main(int argc, char** argv) {
   }
   log_all(LOG_INFO, "Starting NASFS server...");
 
-  nasfs_storage_t storage;
-  const char* storage_dir =
-      global_config.storage_dir ? global_config.storage_dir : ".";
-  int r = nasfs_storage_init(&storage, storage_dir);
-  if (r < 0) {
-    log_all(LOG_ERROR, "Cannot open storage directory '%s': %s", storage_dir,
-            uv_strerror(r));
-    exit_code = 1;
-    goto cleanup;
-  }
-
   if (global_config.daemon_mode) {
     log_all(LOG_INFO, "Daemonizing process...");
     daemon_status_fd = daemonize(global_config.pid_file);
     if (daemon_status_fd < 0) {
       exit_code = 1;
-      goto close_storage;
+      goto cleanup;
     }
+  }
+
+  nasfs_version_store_t storage;
+  const char* storage_dir =
+      global_config.storage_dir ? global_config.storage_dir : ".";
+  int r = nasfs_version_store_open(&storage, storage_dir,
+                                   global_config.version_quota,
+                                   global_config.version_retention);
+  if (r < 0) {
+    log_all(LOG_ERROR, "Cannot open storage directory '%s': %s", storage_dir,
+            uv_strerror(r));
+    exit_code = 1;
+    goto cleanup;
   }
 
   loop = uv_default_loop();
@@ -269,7 +272,7 @@ close_handles:
     exit_code = 1;
   }
 close_storage:
-  nasfs_storage_close(&storage);
+  nasfs_version_store_close(&storage);
 
 cleanup:
   cleanup_pid_file();

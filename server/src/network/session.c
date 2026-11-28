@@ -665,7 +665,7 @@ static void session_dispatch_frame(client_session_t* session,
   nasfs_frame_t plain_frame = *frame;
   unsigned char* decrypted_payload = NULL;
 
-  if (frame->type >= 0x10 && frame->type < 0x20) {  // Encrypted command range
+  if (nasfs_control_command(frame->type)) {
     decrypted_payload = malloc(frame->payload_len);
     if (!decrypted_payload) {
       session_close((uv_handle_t*)&session->handle);
@@ -781,6 +781,8 @@ static void session_dispatch_frame(client_session_t* session,
     case NASFS_CMD_PUT_DATA:
     case NASFS_CMD_PUT_DONE:
     case NASFS_CMD_GET_REQ:
+    case NASFS_CMD_RESOLVE:
+    case NASFS_CMD_COLLECT:
       nasfs_file_service_dispatch(session, plain_frame);
       break;
     default:
@@ -800,7 +802,7 @@ static void on_socket_write_done(uv_write_t* req, int status) {
   } else {
     session->last_activity = uv_now(req->handle->loop);
     if (session->state == SESSION_STATE_SENDING_FILE &&
-        ctx->type == NASFS_CMD_GET_DATA) {
+        (ctx->type == NASFS_CMD_GET_DATA || ctx->type == NASFS_CMD_GET_INDEX)) {
       nasfs_file_service_get_next(session);
     }
   }
@@ -927,7 +929,7 @@ void session_on_new_connection(uv_stream_t* server, int status) {
   live_sessions++;
   session->last_activity = uv_now(server->loop);
   session->handle.data = session;
-  session->files.storage = server->data;
+  session->files.store = server->data;
   session->files.trusted_author = trusted_author;
   if (uv_accept(server, (uv_stream_t*)&session->handle) != 0) {
     session_close((uv_handle_t*)&session->handle);

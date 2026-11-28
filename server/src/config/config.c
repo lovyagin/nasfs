@@ -10,6 +10,7 @@
 #endif
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,14 +44,16 @@ static int parse_config_int(const char* value, int* out_value) {
 
 /* Double-quoted values can contain whitespace and #. Backslash can
    escape a quote or a backslash inside a quoted value. */
-static int parse_config_line(char* line, char** key, char** value) {
-  *key = line + strspn(line, " \t\r\v\f");
+static int parse_config_line(char* line, size_t length, char** key,
+                             char** value) {
+  size_t leading = strspn(line, " \t\r\v\f");
   *value = NULL;
-  if (!**key || **key == '#') {
+  if (leading >= length || line[leading] == '#') {
     *key = NULL;
     return 0;
   }
 
+  *key = line + leading;
   char* cursor = *key + strcspn(*key, " \t\r\v\f#");
   if (!*cursor) return 0;
   char separator = *cursor;
@@ -119,7 +122,7 @@ int load_config(const char* filename, server_config_t* config) {
 
     char* key;
     char* value;
-    if (parse_config_line(line, &key, &value) < 0) {
+    if (parse_config_line(line, length, &key, &value) < 0) {
       fprintf(stderr, "Invalid quoted value on configuration line %zu\n",
               line_number);
       fclose(file);
@@ -270,6 +273,20 @@ int load_config(const char* filename, server_config_t* config) {
         fclose(file);
         return -1;
       }
+    } else if (strcmp(key, "VersionQuotaBytes") == 0 ||
+               strcmp(key, "VersionRetentionSeconds") == 0) {
+      char* end;
+      errno = 0;
+      long long parsed = strtoll(value, &end, 10);
+      if (errno || !*value || *end || parsed < 0) {
+        fprintf(stderr, "Invalid %s value: %s\n", key, value);
+        fclose(file);
+        return -1;
+      }
+      if (strcmp(key, "VersionQuotaBytes") == 0)
+        config->version_quota = parsed;
+      else
+        config->version_retention = parsed;
     } else if (strcmp(key, "BlockSize") == 0) {
       int bs = 0;
       if (parse_config_int(value, &bs) != 0 || bs < 4096 || bs > 4194304) {
@@ -307,6 +324,8 @@ void set_defaults(server_config_t* config) {
   config->authorized_keys_file = strdup("/usr/local/etc/nasfs/authorized_keys");
   config->pubkey_auth_algorithms = strdup("ML-DSA-65,ML-DSA-44");
   config->block_size = 65536;
+  config->version_retention = 86400;
+  config->version_quota = 0;
 }
 
 /* Release configuration resources.

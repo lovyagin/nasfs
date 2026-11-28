@@ -23,6 +23,7 @@ run_root apt-get install -y \
   build-essential \
   cmake \
   git \
+  libsqlite3-dev \
   libssl-dev \
   libsodium-dev \
   libtool \

@@ -4,20 +4,31 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "crypto_engine.h"
+#include "version.h"
 
 #define NASFS_MAX_BATCH 512
 
 typedef enum {
   NASFS_CLIENT_PUT = 1,
-  NASFS_CLIENT_GET
+  NASFS_CLIENT_GET,
+  NASFS_CLIENT_RESOLVE,
+  NASFS_CLIENT_COLLECT
 } nasfs_client_operation_t;
+
+typedef struct {
+  uint8_t id[NASFS_OBJECT_ID_SIZE];
+  uint8_t digest[NASFS_VERSION_DIGEST_SIZE];
+} nasfs_client_version_t;
 
 typedef struct {
   nasfs_client_operation_t operation;
   const char* local_path;
   const char* remote_name;
   int create_only;
+  /* An exact GET may select a byte range. UINT64_MAX reads through EOF. */
+  const nasfs_client_version_t* version;
+  uint64_t offset;
+  uint64_t length;
 } nasfs_client_request_t;
 
 typedef enum {
@@ -27,13 +38,17 @@ typedef enum {
   NASFS_CLIENT_CANCELLED,
   NASFS_CLIENT_PUT_UNKNOWN,
   NASFS_CLIENT_PUT_PUBLISHED,
-  NASFS_CLIENT_GET_PUBLISHED
+  NASFS_CLIENT_GET_PUBLISHED,
+  NASFS_CLIENT_RESOLVED,
+  NASFS_CLIENT_COLLECTED,
+  NASFS_CLIENT_NOT_FOUND,
+  NASFS_CLIENT_CONFLICT,
+  NASFS_CLIENT_QUOTA
 } nasfs_client_outcome_t;
 
 typedef struct {
   nasfs_client_outcome_t outcome;
-  int has_digest;
-  uint8_t digest[32];
+  nasfs_client_version_t version;
 } nasfs_client_result_t;
 
 typedef enum {
@@ -63,11 +78,9 @@ typedef struct {
   const char* encryption_password;
   const char* author_key;
   nasfs_cipher_algo_t file_cipher;
-  nasfs_hash_algo_t file_hash;
-  nasfs_kdf_algo_t kdf;
+  nasfs_version_hash_t file_hash;
   size_t block_size;
   const uint8_t* expected_digest;
-  int allow_unsigned_reads;
   int watch_signals;
   nasfs_client_notify_fn notify;
   int (*should_cancel)(void* data);

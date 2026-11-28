@@ -62,7 +62,9 @@ server_failure(option("StorageDir", root / "missing"),
                b"Cannot open storage directory")
 server_failure(option("StorageDir", "missing-relative").replace(
                    "DaemonMode No", "DaemonMode Yes"),
-               b"Cannot open storage directory")
+               b"NASFS daemon failed to start")
+assert re.search(r"Cannot open storage directory.*missing-relative",
+                 (root / "logs/server.log").read_text())
 if sys.platform == "darwin":
     seed = os.environ["NASFS_SERVER_SIGNING_SEED"]
     subprocess.run(["chmod", "+a", "everyone allow read", seed], check=True)
@@ -227,7 +229,7 @@ try:
     for args in (("put", original, "stored"), ("get", "stored", daemon_root / "output")):
         transfer = subprocess.run([client, *args], env=env, capture_output=True, timeout=10)
         assert transfer.returncode == 0, (transfer, daemon_log.read_text())
-    assert (daemon_root / "storage/stored").is_file()
+    assert len(list((daemon_root / "storage/.nasfs-v2").glob("v-*"))) == 1
     assert (daemon_root / "output").read_bytes() == original.read_bytes()
     assert "authenticated with publickey" in daemon_log.read_text()
     daemon_log.rename(daemon_root / "daemon.log.old")
@@ -396,7 +398,10 @@ test "$NASFS_SERVER_PORT" = "$port"
 
 # A second instance cannot take ownership of a live PID file.
 printf 'Port invalid\n' > "$TEST_ROOT/nasfs.conf"
-if (cd "$TEST_ROOT" && "$server_path" "$TEST_ROOT/server.conf") > "$LOG_DIR/second.log" 2>&1; then
+mkdir -m 700 "$TEST_ROOT/second-storage"
+sed "s|^StorageDir .*|StorageDir $TEST_ROOT/second-storage|" \
+    "$TEST_ROOT/server.conf" > "$TEST_ROOT/second.conf"
+if (cd "$TEST_ROOT" && "$server_path" "$TEST_ROOT/second.conf") > "$LOG_DIR/second.log" 2>&1; then
     exit 1
 fi
 grep -Fq 'Failed to create PID file' "$LOG_DIR/second.log"

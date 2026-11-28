@@ -35,6 +35,7 @@ PKG_CHECK_MODULES([UV], [libuv])
 PKG_CHECK_MODULES([OQS], [liboqs])
 PKG_CHECK_MODULES([SODIUM], [libsodium])
 PKG_CHECK_MODULES([OPENSSL], [openssl >= 3])
+PKG_CHECK_MODULES([SQLITE], [sqlite3 >= 3.38])
 
 # Checks for header files.
 AC_CHECK_HEADERS([stdlib.h string.h unistd.h])

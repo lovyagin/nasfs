@@ -56,6 +56,11 @@ typedef enum {
   NASFS_CMD_PAKE_RESPONSE = 0x1B, /**< S->C: SPAKE2 server share [Y(32)]. */
 
   NASFS_CMD_PUT_RESULT = 0x1C, /**< S->C: Final PUT status, one byte. */
+  NASFS_CMD_RESOLVE = 0x1D,
+  NASFS_CMD_RESOLVED = 0x1E,
+  NASFS_CMD_GET_INDEX = 0x1F,
+  NASFS_CMD_COLLECT = 0x22,
+  NASFS_CMD_COLLECTED = 0x23,
 
   /* Data Transfer Commands (Unencrypted Payload) */
   NASFS_CMD_PUT_DATA = 0x20, /**< C->S: Data chunk for file upload. */
@@ -67,8 +72,17 @@ typedef enum {
 
 typedef enum {
   NASFS_PUT_PUBLISHED = 0,
-  NASFS_PUT_PUBLICATION_FAILED = 1
+  NASFS_PUT_PUBLICATION_FAILED = 1,
+  NASFS_PUT_CONFLICT = 2,
+  NASFS_PUT_QUOTA = 3,
+  NASFS_PUT_UNCERTAIN = 4
 } nasfs_put_status_t;
+
+static inline int nasfs_control_command(nasfs_cmd_type_t type) {
+  return (type >= NASFS_CMD_AUTH && type <= NASFS_CMD_GET_INDEX) ||
+         type == NASFS_CMD_COLLECT || type == NASFS_CMD_COLLECTED ||
+         type == NASFS_CMD_ERROR;
+}
 
 /**
  * @def NASFS_PROTO_HEADER_SIZE
@@ -127,32 +141,7 @@ void protocol_encode_block_meta(uint8_t out[NASFS_BLOCK_META_SIZE],
 int protocol_decode_block_meta(const uint8_t* payload, size_t length,
                                nasfs_block_meta_t* meta);
 
-/* Encrypted file requests using the portable format. */
-#define NASFS_FILE_REQUEST_PORTABLE 2u
-#define NASFS_PUT_REQUEST_EXCLUSIVE 3u
-/* Cipher-byte marker in portable containers, GET_ACK and manifests. */
-#define NASFS_FILE_CIPHER_PORTABLE 0x10u
-/* On-disk flags in the container's cipher byte. */
-#define NASFS_FILE_RECORD_LENGTHS 0x80u
-#define NASFS_FILE_MANIFEST 0x40u
-#define NASFS_FILE_OWNER_SLOT_V1 0x20u
-#define NASFS_FILE_METADATA_SIZE 26
 void protocol_store_u64(uint8_t out[8], uint64_t value);
 uint64_t protocol_load_u64(const uint8_t in[8]);
-#define NASFS_MANIFEST_SIZE (32 + crypto_sign_BYTES)
-void protocol_manifest_init(crypto_generichash_state* state, const char* object,
-                            uint64_t plaintext_size,
-                            const uint8_t salt[crypto_pwhash_SALTBYTES],
-                            uint8_t cipher, uint8_t hash);
-void protocol_manifest_owner_slot(crypto_generichash_state* state,
-                                  const uint8_t* slot, size_t length);
-void protocol_manifest_record(crypto_generichash_state* state,
-                              const uint8_t* ciphertext, size_t length);
-int protocol_manifest_sign(crypto_generichash_state* state,
-                           uint8_t manifest[NASFS_MANIFEST_SIZE],
-                           const uint8_t key[crypto_sign_SECRETKEYBYTES]);
-int protocol_manifest_verify(crypto_generichash_state* state,
-                             const uint8_t manifest[NASFS_MANIFEST_SIZE],
-                             const uint8_t key[crypto_sign_PUBLICKEYBYTES]);
 
 #endif /* NASFS_PROTOCOL_H */

@@ -4,7 +4,7 @@ TESTS_ENVIRONMENT = \
 	NASFS_SERVER_BIN="$(top_builddir)/server/nasfs_server" \
 	NASFS_CLIENT_BIN="$(top_builddir)/client/nasfs_client"
 
-EXTRA_DIST = test_end_to_end.sh test_file_encryption.sh test_lifecycle.sh integration_helpers.sh test_transfer_recovery.py test_systemd.sh fault_injection.c fixtures/implicit-4096.b64 fixtures/nasluks-author.b64 fixtures/nasluks-master-salt.b64 fixtures/nasluks-hkdf.b64 fixtures/nasluks-pbkdf2.b64
+EXTRA_DIST = test_end_to_end.sh test_file_encryption.sh test_lifecycle.sh integration_helpers.sh test_transfer_recovery.py test_versioned_transfers.py test_systemd.sh fault_injection.c fixtures/implicit-4096.b64 fixtures/nasluks-author.b64 fixtures/nasluks-master-salt.b64 fixtures/nasluks-hkdf.b64 fixtures/nasluks-pbkdf2.b64
 
 AM_CPPFLAGS = $(UV_CFLAGS) $(OQS_CFLAGS) $(SODIUM_CFLAGS) -I$(top_srcdir)/common/include -I$(top_srcdir)/server/include
 

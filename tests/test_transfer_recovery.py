@@ -93,7 +93,7 @@ def interrupt_transfer(client, args, upstream_port, direction, command, sig,
                        server_pid=None, corrupt=False, occurrence=1, cwd=None,
                        before_forward=None, on_pause=None, forbid=(),
                        wait_for_remote_close=False, auth_method=None,
-                       slow_frame_seconds=0, stall_partial=False):
+                       slow_frame_seconds=0, stall_partial=False, accepted_codes=None):
     observed = []
     reached = threading.Event()
     stop = threading.Event()
@@ -157,7 +157,7 @@ def interrupt_transfer(client, args, upstream_port, direction, command, sig,
                             expected_status = 0
                         if sig == signal.SIGKILL and server_pid is None:
                             expected_status = -signal.SIGKILL
-                        assert child.returncode == expected_status, stderr.decode()
+                        assert child.returncode in (accepted_codes or (expected_status,)), stderr.decode()
                         if sig is not None and sig != signal.SIGKILL and server_pid is None:
                             assert b"Transfer interrupted by signal" in stderr, stderr
                         disallowed = (*forbid, AUTH, PAKE_HELLO) if corrupt else forbid

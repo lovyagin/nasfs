@@ -10,6 +10,8 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include <stdint.h>
+
 /**
  * @struct server_config_t
  * @brief Server configuration structure.
@@ -36,6 +38,8 @@ typedef struct {
   char* pubkey_auth_algorithms; /**< Allowed PQ signature algorithms */
   char* server_signing_seed;    /**< Server Ed25519 seed path */
   char* author_public_key;      /**< Trusted file author key path */
+  int64_t version_quota;
+  int64_t version_retention;
   int block_size; /**< I/O block size in bytes for file transfers */
 } server_config_t;
 

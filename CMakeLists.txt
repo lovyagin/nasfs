@@ -39,6 +39,7 @@ pkg_check_modules(UV REQUIRED libuv)
 pkg_check_modules(OQS REQUIRED liboqs)
 pkg_check_modules(SODIUM REQUIRED libsodium)
 pkg_check_modules(OPENSSL REQUIRED openssl)
+pkg_check_modules(SQLITE REQUIRED IMPORTED_TARGET sqlite3>=3.38)
 
 set(NASFS_BINDIR "${CMAKE_INSTALL_FULL_BINDIR}")
 set(NASFS_SYSCONFDIR "${CMAKE_INSTALL_FULL_SYSCONFDIR}/nasfs")
@@ -52,14 +53,28 @@ configure_file(utils/nasfsctl.in ${CMAKE_CURRENT_BINARY_DIR}/nasfsctl @ONLY)
 configure_file(systemd/nasfs.service.in ${CMAKE_CURRENT_BINARY_DIR}/nasfs.service
                @ONLY)
 
+set(blake3_sources
+  vendor/blake3/blake3.c
+  vendor/blake3/blake3_dispatch.c
+  vendor/blake3/blake3_portable.c
+)
+set(blake3_definitions
+  BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
+  BLAKE3_USE_NEON=0
+)
+
 add_library(nasfs_common STATIC
+  ${blake3_sources}
   common/src/protocol.c
+  common/src/version.c
   common/src/handshake.c
   common/src/auth.c
   common/src/ecc.c
   common/src/crypto_engine.c
   common/src/pake.c
 )
+target_compile_definitions(nasfs_common PRIVATE ${blake3_definitions})
+target_include_directories(nasfs_common PRIVATE vendor/blake3)
 target_include_directories(nasfs_common PUBLIC
   common/include
   ${UV_INCLUDE_DIRS}
@@ -87,6 +102,7 @@ add_executable(nasfs_server
   server/src/logging/log.c
   server/src/network/session.c
   server/src/storage.c
+  server/src/version_store.c
   server/src/file_service.c
   server/src/utils/daemon.c
   server/src/utils/pid_file.c
@@ -100,7 +116,7 @@ target_link_directories(nasfs_server PRIVATE
   ${SODIUM_LIBRARY_DIRS}
   ${OPENSSL_LIBRARY_DIRS}
 )
-target_link_libraries(nasfs_server PRIVATE nasfs_common ${OPENSSL_LIBRARIES})
+target_link_libraries(nasfs_server PRIVATE nasfs_common PkgConfig::SQLITE ${OPENSSL_LIBRARIES})
 
 add_library(nasfs_client_api STATIC client/src/client.c)
 target_include_directories(nasfs_client_api PUBLIC client/include)

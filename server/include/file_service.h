@@ -1,11 +1,8 @@
 #ifndef NASFS_FILE_SERVICE_H
 #define NASFS_FILE_SERVICE_H
 
-#include <sodium.h>
-#include <uv.h>
-
-#include "protocol.h"
 #include "storage.h"
+#include "version_store.h"
 
 typedef struct client_session client_session_t;
 
@@ -14,46 +11,26 @@ typedef struct {
 } nasfs_file_access_t;
 
 typedef struct {
+  crypto_generichash_state index;
   nasfs_file_access_t access;
+  nasfs_version_store_t* store;
   const uint8_t* trusted_author;
-  const nasfs_storage_t* storage;
-  /* File Transfer State */
-  uv_file active_fd; /**< File descriptor for active transfers (PUT/GET). */
-  int has_record_lengths; /**< Container carries ciphertext record lengths. */
-  uint64_t file_offset;   /**< Current offset in the active file. */
-
-  crypto_generichash_state manifest;
-  uint8_t upload_manifest[32 + crypto_sign_BYTES];
-  int has_manifest;
-  uint8_t owner_slot[NASFS_OWNER_SLOT_V1_SIZE];
-  /* Block Integrity Verification / Encryption info */
-  int file_encryption_enabled; /**< Flag indicating if the current file transfer
-                                  has encryption/integrity enabled. */
-  int has_pending_block_meta; /**< Flag indicating if we received block metadata
-                                 but not yet the data. */
-  uint64_t
-      expected_block_seq; /**< Expected sequence number of the next block. */
-  uint32_t
-      expected_block_size; /**< Expected size of the next block's ciphertext. */
-  uint8_t expected_block_hash[32]; /**< Expected hash of the next block's
-                                      ciphertext. */
-  uint64_t
-      server_block_seq; /**< Current block sequence counter on the server. */
-  uint8_t file_salt[crypto_pwhash_SALTBYTES]; /**< Per-file random salt used for
-                                                 key derivation. */
-  uint64_t expected_plaintext_size; /**< Plaintext file size announced by the
-                                       client on PUT; returned on GET so the
-                                       client can verify no truncation. */
-  int upload_exclusive;     /**< Publish only if the name does not exist. */
-  uint8_t file_cipher_algo; /**< nasfs_cipher_algo_t for this file's blocks. */
-  uint8_t file_hash_algo;   /**< nasfs_hash_algo_t for block integrity. */
-
-  size_t
-      pending_fs; /**< File requests whose callbacks still own the session. */
-  char upload_name[NASFS_STORAGE_NAME_MAX + 1];
-  char upload_temp_name[NASFS_UPLOAD_TEMP_SIZE];
-  uint64_t upload_plaintext_bytes;
-  int put_draining; /**< PUT_DONE received while writes are outstanding. */
+  nasfs_version_header_t header;
+  nasfs_block_meta_t expected;
+  uint8_t proof[NASFS_VERSION_PROOF_SIZE];
+  uint8_t version[NASFS_VERSION_DIGEST_SIZE];
+  uint64_t sequence;
+  uint64_t first;
+  uint64_t end;
+  size_t pending_fs;
+  int64_t reserved;
+  uv_file active_fd;
+  int put_draining;
+  int busy;
+  int has_expected;
+  int send_index;
+  char name[NASFS_STORAGE_NAME_MAX + 1];
+  char staging[NASFS_VERSION_TEMP_NAME];
 } nasfs_file_service_t;
 
 /* File callbacks retain the owning session until all outstanding I/O drains. */

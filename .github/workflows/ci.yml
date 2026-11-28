@@ -20,7 +20,7 @@ jobs:
 
       - name: Check C formatting
         run: |
-          git -c safe.directory='*' ls-files '*.c' '*.h' | xargs clang-format --dry-run --Werror
+          git -c safe.directory='*' ls-files '*.c' '*.h' ':!vendor/blake3/**' | xargs clang-format --dry-run --Werror
 
       - name: Configure clang-tidy database
         run: >
@@ -31,7 +31,7 @@ jobs:
 
       - name: Run clang-tidy
         run: |
-          git -c safe.directory='*' ls-files '*.c' | xargs clang-tidy -p build-lint --quiet --warnings-as-errors='*'
+          git -c safe.directory='*' ls-files '*.c' ':!vendor/blake3/**' | xargs clang-tidy -p build-lint --quiet --warnings-as-errors='*'
 
       - name: Shellcheck scripts
         run: |

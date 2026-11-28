@@ -60,17 +60,23 @@ typedef struct {
 } nasfs_fs_ctx_t;
 
 typedef struct {
-  crypto_generichash_state file_manifest;
+  crypto_generichash_state index;
+  crypto_generichash_state index_selection;
+  struct stat download_initial_destination;
   const char* local_filename;
   const char* remote_filename;
   char* download_parent;
   const char* download_name;
   uint64_t file_offset;
-  uint64_t client_block_seq;
-  uint64_t expected_block_seq;
-  uint64_t put_plaintext_size;      /* size of local file being uploaded */
-  uint64_t expected_plaintext_size; /* expected size announced in GET_ACK */
-  struct stat download_initial_destination;
+  uint64_t sequence;
+  uint64_t index_position;
+  uint64_t start;
+  uint64_t length;
+  uint64_t first;
+  uint64_t end;
+  nasfs_version_header_t header;
+  nasfs_client_version_t version;
+  nasfs_block_meta_t expected;
   nasfs_client_operation_t current_op;
   uv_file local_fd;
   int download_directory;
@@ -78,18 +84,14 @@ typedef struct {
   int download_had_destination;
   int put_ack_pending;
   int put_result_pending;
-  int download_has_owner_slot;
+  int get_ack_pending;
+  int resolve_pending;
   int batch_upload_exclusive;
-  int download_legacy_counter;
-  int require_manifest_digest;
   int has_pending_block_meta;
-  uint32_t expected_block_size;
-  nasfs_cipher_algo_t file_cipher_algo;
-  nasfs_hash_algo_t file_hash_algo;
-  uint8_t file_salt[crypto_pwhash_SALTBYTES];
-  uint8_t manifest_digest[32];
+  int partial;
+  int index_verified;
   uint8_t encryption_key[crypto_secretbox_KEYBYTES];
-  uint8_t expected_block_hash[32];
+  uint8_t index_root[32];
   char download_temp_name[sizeof(".nasfs-download.") + 32];
   char download_staging_name[64];
 } client_transfer_t;
@@ -123,7 +125,6 @@ typedef struct {
   uint8_t auth_context[32];
   uint8_t author_secret[crypto_sign_SECRETKEYBYTES];
   uint8_t author_public[crypto_sign_PUBLICKEYBYTES];
-  int allow_unsigned_reads;
 
   int client_exit_code;
   int client_finished;
@@ -142,7 +143,6 @@ typedef struct {
   char* negotiated_cipher_algorithm;
 
   /* File Encryption/Integrity State */
-  int file_encryption_enabled;
   uint8_t master_key[32];
 
 } nasfs_client_t;
@@ -652,11 +652,12 @@ static void alloc_buffer(uv_handle_t* handle, size_t suggested_size,
   buf->len = client->client_recv_capacity - client->client_recv_length;
 }
 
-/* Send PUT_REQ for the current local_filename / remote_filename. */
 static void send_put_req(uv_stream_t* stream) {
   nasfs_client_t* client = stream->data;
   client_transfer_t* transfer = &client->transfer;
-  transfer->local_fd = open(transfer->local_filename, O_RDONLY | O_NONBLOCK);
+  nasfs_version_header_t* header = &transfer->header;
+  transfer->local_fd =
+      open(transfer->local_filename, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
   if (transfer->local_fd < 0) {
     client_message(client, NASFS_CLIENT_ERROR,
                    "Cannot open PUT source '%s': %s\n",
@@ -664,100 +665,50 @@ static void send_put_req(uv_stream_t* stream) {
     close_connection((uv_handle_t*)stream);
     return;
   }
-
   struct stat st;
-  if (fstat(transfer->local_fd, &st) < 0) {
-    client_message(client, NASFS_CLIENT_ERROR,
-                   "Cannot stat PUT source '%s': %s\n",
-                   transfer->local_filename, strerror(errno));
-    close_connection((uv_handle_t*)stream);
-    return;
-  }
-  if (!S_ISREG(st.st_mode) || st.st_size < 0) {
+  if (fstat(transfer->local_fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+      st.st_size < 0) {
     client_message(client, NASFS_CLIENT_ERROR,
                    "PUT source must be a regular file: %s\n",
                    transfer->local_filename);
     close_connection((uv_handle_t*)stream);
     return;
   }
-  transfer->put_plaintext_size = (uint64_t)st.st_size;
-  transfer->put_ack_pending = 1;
-
-  size_t fn_len = strlen(transfer->remote_filename);
-  if (client->file_encryption_enabled) {
-    size_t payload_len =
-        1 + NASFS_FILE_METADATA_SIZE + NASFS_OWNER_SLOT_V1_SIZE + fn_len + 1;
-    uint8_t* req_payload = malloc(payload_len);
-    if (!req_payload) {
-      close_connection((uv_handle_t*)stream);
-      return;
-    }
-    req_payload[0] = transfer->batch_upload_exclusive
-                         ? NASFS_PUT_REQUEST_EXCLUSIVE
-                         : NASFS_FILE_REQUEST_PORTABLE;
-    randombytes_buf(transfer->file_salt, crypto_pwhash_SALTBYTES);
-    uint8_t owner_slot[NASFS_OWNER_SLOT_V1_SIZE];
-    if (crypto_engine_create_owner_slot(owner_slot, transfer->encryption_key,
-                                        client->master_key,
-                                        transfer->file_salt) != 0) {
-      client_message(client, NASFS_CLIENT_ERROR,
-                     "Failed to create NASLUKS owner slot\n");
-      free(req_payload);
-      close_connection((uv_handle_t*)stream);
-      return;
-    }
-    size_t off = 1;
-    memcpy(req_payload + off, transfer->file_salt, crypto_pwhash_SALTBYTES);
-    off += crypto_pwhash_SALTBYTES;
-    protocol_store_u64(req_payload + off, transfer->put_plaintext_size);
-    off += sizeof(uint64_t);
-    req_payload[off++] = (uint8_t)transfer->file_cipher_algo;
-    req_payload[off++] = (uint8_t)transfer->file_hash_algo;
-    memcpy(req_payload + off, owner_slot, sizeof(owner_slot));
-    off += sizeof(owner_slot);
-    memcpy(req_payload + off, (const uint8_t*)transfer->remote_filename,
-           fn_len + 1);
-    protocol_manifest_init(
-        &transfer->file_manifest, transfer->remote_filename,
-        transfer->put_plaintext_size, transfer->file_salt,
-        transfer->file_cipher_algo | NASFS_FILE_CIPHER_PORTABLE,
-        transfer->file_hash_algo);
-    protocol_manifest_owner_slot(&transfer->file_manifest, owner_slot,
-                                 sizeof(owner_slot));
-    send_command(stream, NASFS_CMD_PUT_REQ, req_payload, payload_len, 1);
-    free(req_payload);
-  } else {
-    size_t payload_len = 1 + fn_len + 1;
-    uint8_t* req_payload = malloc(payload_len);
-    if (!req_payload) {
-      close_connection((uv_handle_t*)stream);
-      return;
-    }
-    req_payload[0] = 0;
-    memcpy(req_payload + 1, (const uint8_t*)transfer->remote_filename,
-           fn_len + 1);
-    send_command(stream, NASFS_CMD_PUT_REQ, req_payload, payload_len, 1);
-    free(req_payload);
-  }
-}
-
-/* Send GET_REQ for the current remote_filename. */
-static void send_get_req(uv_stream_t* stream) {
-  nasfs_client_t* client = stream->data;
-  client_transfer_t* transfer = &client->transfer;
-  size_t fn_len = strlen(transfer->remote_filename);
-  size_t payload_len = 1 + fn_len + 1;
-  uint8_t* req_payload = malloc(payload_len);
-  if (!req_payload) {
+  header->size = (uint64_t)st.st_size;
+  header->block_size = (uint32_t)client->options->block_size;
+  header->cipher = (uint8_t)client->options->file_cipher;
+  header->hash = (uint8_t)client->options->file_hash;
+  randombytes_buf(header->salt, sizeof(header->salt));
+  if (nasfs_version_file_size(header) < 0 ||
+      crypto_engine_create_owner_slot(header->slot, transfer->encryption_key,
+                                      client->master_key, header->salt) != 0) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Cannot prepare version metadata\n");
     close_connection((uv_handle_t*)stream);
     return;
   }
-  req_payload[0] =
-      client->file_encryption_enabled ? NASFS_FILE_REQUEST_PORTABLE : 0;
-  memcpy(req_payload + 1, (const uint8_t*)transfer->remote_filename,
-         fn_len + 1);
-  send_command(stream, NASFS_CMD_GET_REQ, req_payload, payload_len, 1);
-  free(req_payload);
+  const size_t header_bytes = 1 + NASFS_VERSION_HEADER_SIZE;
+  size_t length = strlen(transfer->remote_filename) + 1;
+  uint8_t req[1 + NASFS_VERSION_HEADER_SIZE + 256];
+  req[0] = transfer->batch_upload_exclusive ? NASFS_VERSION_EXCLUSIVE
+                                            : NASFS_VERSION_REQUEST;
+  nasfs_version_encode(req + 1, header);
+  memcpy(req + header_bytes, transfer->remote_filename, length);
+  nasfs_version_index_init(&transfer->index);
+  transfer->put_ack_pending = 1;
+  send_command(stream, NASFS_CMD_PUT_REQ, req, header_bytes + length, 1);
+}
+
+static void send_get_req(uv_stream_t* stream) {
+  nasfs_client_t* client = stream->data;
+  client_transfer_t* transfer = &client->transfer;
+  uint8_t req[NASFS_VERSION_GET_SIZE] = {NASFS_VERSION_REQUEST};
+  memcpy(req + 1, transfer->version.id, sizeof(transfer->version.id));
+  memcpy(req + 17, transfer->version.digest, sizeof(transfer->version.digest));
+  protocol_store_u64(req + 49, transfer->start);
+  protocol_store_u64(req + 57, transfer->length);
+  transfer->get_ack_pending = 1;
+  send_command(stream, NASFS_CMD_GET_REQ, req, sizeof(req), 1);
 }
 
 static int close_local_file(nasfs_client_t* client) {
@@ -1054,6 +1005,243 @@ static int publish_download(nasfs_client_t* client) {
   return 0;
 }
 
+static int begin_download(nasfs_client_t* client, const nasfs_frame_t* frame) {
+  client_transfer_t* transfer = &client->transfer;
+  nasfs_version_header_t* header = &transfer->header;
+  if (!transfer->get_ack_pending ||
+      frame->payload_len != NASFS_VERSION_DATA_OFFSET ||
+      nasfs_version_decode(header, frame->payload, NASFS_VERSION_HEADER_SIZE) <
+          0)
+    return -1;
+  transfer->get_ack_pending = 0;
+
+  const uint8_t* proof = frame->payload + NASFS_VERSION_HEADER_SIZE;
+  if (sodium_memcmp(transfer->version.id, header->id, sizeof(header->id)) !=
+          0 ||
+      sodium_memcmp(transfer->version.digest, proof + 32, 32) != 0 ||
+      nasfs_version_verify(header, proof, client->author_public) < 0) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "File manifest missing or invalid\n");
+    return -1;
+  }
+  if (transfer->start > header->size ||
+      (transfer->length != UINT64_MAX &&
+       transfer->length > header->size - transfer->start))
+    return -1;
+  if (transfer->length == UINT64_MAX)
+    transfer->length = header->size - transfer->start;
+
+  uint64_t first = transfer->start / header->block_size;
+  uint64_t end = transfer->start + transfer->length;
+  transfer->first = first;
+  transfer->end = transfer->length ? end / header->block_size +
+                                         (end % header->block_size != 0)
+                                   : first;
+  transfer->sequence = first;
+  transfer->partial = transfer->start != 0 || transfer->length != header->size;
+  transfer->index_position = 0;
+  nasfs_version_index_init(&transfer->index);
+  nasfs_version_index_init(&transfer->index_selection);
+  memcpy(transfer->index_root, proof, sizeof(transfer->index_root));
+  if (crypto_engine_open_owner_slot(transfer->encryption_key, header->slot,
+                                    client->master_key, header->salt) != 0) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Cannot open NASLUKS owner slot\n");
+    return -1;
+  }
+  if (open_download_file(client) < 0) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Cannot create temporary download for '%s': %s\n",
+                   transfer->local_filename, strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+static int read_index_row(client_transfer_t* transfer,
+                          const nasfs_frame_t* frame, uint64_t sequence,
+                          nasfs_block_meta_t* meta) {
+  int64_t offset;
+  uint32_t length;
+  return transfer->local_fd < 0 ||
+                 nasfs_version_record(&transfer->header, sequence, &offset,
+                                      &length) < 0 ||
+                 protocol_decode_block_meta(frame->payload, frame->payload_len,
+                                            meta) < 0 ||
+                 meta->seq_num != sequence || meta->size != length
+             ? -1
+             : 0;
+}
+
+static int receive_index(client_transfer_t* transfer,
+                         const nasfs_frame_t* frame) {
+  nasfs_block_meta_t meta;
+  if (!transfer->partial || transfer->index_verified ||
+      read_index_row(transfer, frame, transfer->index_position, &meta) < 0)
+    return -1;
+  if (meta.seq_num >= transfer->first && meta.seq_num < transfer->end)
+    nasfs_version_index_add(&transfer->index_selection, &meta);
+  nasfs_version_index_add(&transfer->index, &meta);
+  if (++transfer->index_position ==
+      nasfs_version_block_count(&transfer->header)) {
+    uint8_t root[32];
+    nasfs_version_index_final(&transfer->index, root);
+    if (sodium_memcmp(root, transfer->index_root, sizeof(root)) != 0) return -1;
+    nasfs_version_index_final(&transfer->index_selection, transfer->index_root);
+    nasfs_version_index_init(&transfer->index);
+    transfer->index_verified = 1;
+  }
+  return 0;
+}
+
+static int receive_block_meta(client_transfer_t* transfer,
+                              const nasfs_frame_t* frame) {
+  if (transfer->has_pending_block_meta || transfer->sequence >= transfer->end ||
+      (transfer->partial && !transfer->index_verified) ||
+      read_index_row(transfer, frame, transfer->sequence, &transfer->expected) <
+          0)
+    return -1;
+  transfer->has_pending_block_meta = 1;
+  return 0;
+}
+
+static int receive_block(nasfs_client_t* client, const nasfs_frame_t* frame) {
+  client_transfer_t* transfer = &client->transfer;
+  if (!transfer->has_pending_block_meta ||
+      frame->payload_len != transfer->expected.size)
+    return -1;
+  uint8_t digest[32];
+  if (nasfs_version_hash_block(transfer->header.hash, frame->payload,
+                               frame->payload_len, digest) < 0 ||
+      sodium_memcmp(digest, transfer->expected.hash, sizeof(digest)) != 0) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Integrity check failed (hash mismatch)\n");
+    return -1;
+  }
+
+  uint8_t* data = malloc(frame->payload_len);
+  if (!data) return -1;
+  uint8_t key[crypto_secretbox_KEYBYTES];
+  crypto_engine_derive_block_key(key, transfer->encryption_key,
+                                 transfer->header.salt, transfer->sequence, 0);
+  size_t plain_len = 0;
+  int rc = crypto_engine_decrypt_block(transfer->header.cipher, frame->payload,
+                                       frame->payload_len, key,
+                                       transfer->sequence, 0, data, &plain_len);
+  sodium_memzero(key, sizeof(key));
+  if (rc < 0 || plain_len + NASFS_VERSION_BLOCK_TAG != frame->payload_len) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Decryption failed. Wrong key or corrupted data\n");
+    free(data);
+    return -1;
+  }
+  uint64_t block_start = transfer->sequence * transfer->header.block_size;
+  size_t trim =
+      transfer->start > block_start ? transfer->start - block_start : 0;
+  size_t length = plain_len - trim;
+  uint64_t remaining = transfer->length - transfer->file_offset;
+  if (length > remaining) length = remaining;
+  uv_buf_t buffer = uv_buf_init((char*)data + trim, length);
+  uv_fs_t req;
+  rc = uv_fs_write(client->loop, &req, transfer->local_fd, &buffer, 1,
+                   (int64_t)transfer->file_offset, NULL);
+  uv_fs_req_cleanup(&req);
+  sodium_memzero(data, plain_len);
+  free(data);
+  if (rc < 0 || (size_t)rc != length) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Failed to write downloaded data: %s\n",
+                   rc < 0 ? uv_strerror(rc) : "short write");
+    return -1;
+  }
+  transfer->file_offset += length;
+  nasfs_version_index_add(&transfer->index, &transfer->expected);
+  transfer->sequence++;
+  transfer->has_pending_block_meta = 0;
+  report_event(client, NASFS_CLIENT_PROGRESS, transfer->file_offset);
+  return 0;
+}
+
+static int verify_download(nasfs_client_t* client, const nasfs_frame_t* frame) {
+  client_transfer_t* transfer = &client->transfer;
+  if (transfer->local_fd < 0 || frame->payload_len != 0 ||
+      transfer->has_pending_block_meta || transfer->sequence != transfer->end ||
+      transfer->file_offset != transfer->length ||
+      (transfer->partial && !transfer->index_verified))
+    return -1;
+  uint8_t root[32];
+  nasfs_version_index_final(&transfer->index, root);
+  if (sodium_memcmp(root, transfer->index_root, sizeof(root)) != 0) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "File manifest index mismatch\n");
+    return -1;
+  }
+  return publish_download(client);
+}
+
+static void start_resolved_operation(uv_stream_t* stream,
+                                     const nasfs_frame_t* frame) {
+  nasfs_client_t* client = stream->data;
+  client_transfer_t* transfer = &client->transfer;
+  if (!transfer->resolve_pending ||
+      (frame->payload_len != 0 && frame->payload_len != 48)) {
+    close_connection((uv_handle_t*)stream);
+    return;
+  }
+  transfer->resolve_pending = 0;
+  nasfs_client_result_t* result = &client->results[client->batch_idx - 1];
+  if (frame->payload_len == 48) {
+    memcpy(transfer->version.id, frame->payload, sizeof(transfer->version.id));
+    memcpy(transfer->version.digest, frame->payload + 16,
+           sizeof(transfer->version.digest));
+  }
+  if (transfer->current_op == NASFS_CLIENT_PUT) {
+    if (transfer->batch_upload_exclusive && frame->payload_len != 0) {
+      result->outcome = NASFS_CLIENT_CONFLICT;
+      client_message(client, NASFS_CLIENT_ERROR,
+                     "Server could not publish '%s': name already exists\n",
+                     transfer->remote_filename);
+      close_connection((uv_handle_t*)stream);
+      return;
+    }
+    if (frame->payload_len == 0) {
+      do {
+        randombytes_buf(transfer->version.id, sizeof(transfer->version.id));
+      } while (
+          sodium_is_zero(transfer->version.id, sizeof(transfer->version.id)));
+    }
+    memcpy(transfer->header.id, transfer->version.id,
+           sizeof(transfer->header.id));
+    memcpy(transfer->header.parent, transfer->version.digest,
+           sizeof(transfer->header.parent));
+    send_put_req(stream);
+    return;
+  }
+  if (frame->payload_len == 0) {
+    result->outcome = NASFS_CLIENT_NOT_FOUND;
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Server error: version unavailable\n");
+    close_connection((uv_handle_t*)stream);
+    return;
+  }
+  if (transfer->current_op == NASFS_CLIENT_RESOLVE) {
+    result->outcome = NASFS_CLIENT_RESOLVED;
+    result->version = transfer->version;
+    report_event(client, NASFS_CLIENT_COMPLETED, 0);
+    start_next_operation(stream);
+    return;
+  }
+  if (client->options->expected_digest &&
+      sodium_memcmp(client->options->expected_digest, transfer->version.digest,
+                    32) != 0) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Unexpected file manifest version\n");
+    close_connection((uv_handle_t*)stream);
+    return;
+  }
+  send_get_req(stream);
+}
+
 /* Reset per-file transfer state and start the next queued operation. */
 static void start_next_operation(uv_stream_t* stream) {
   nasfs_client_t* client = stream->data;
@@ -1062,11 +1250,10 @@ static void start_next_operation(uv_stream_t* stream) {
     close_connection((uv_handle_t*)stream);
     return;
   }
-  transfer->file_offset = 0;
-  transfer->client_block_seq = 0;
-  transfer->has_pending_block_meta = 0;
-  transfer->expected_block_size = 0;
-  transfer->expected_plaintext_size = 0;
+  sodium_memzero(transfer, sizeof(*transfer));
+  transfer->local_fd = -1;
+  transfer->download_directory = -1;
+  transfer->download_staging = -1;
 
   if (client->batch_idx >= client->batch_count) {
     client->client_finished = 1;
@@ -1083,9 +1270,11 @@ static void start_next_operation(uv_stream_t* stream) {
 
   report_event(client, NASFS_CLIENT_STARTED, 0);
 
-  if (transfer->current_op == NASFS_CLIENT_PUT) {
-    send_put_req(stream);
-  } else {
+  if (op->operation == NASFS_CLIENT_COLLECT) {
+    send_command(stream, NASFS_CMD_COLLECT, NULL, 0, 1);
+    return;
+  }
+  if (op->operation == NASFS_CLIENT_GET) {
     if (prepare_download(client) < 0) {
       client_message(client, NASFS_CLIENT_ERROR,
                      "Cannot prepare download '%s': %s\n",
@@ -1093,8 +1282,18 @@ static void start_next_operation(uv_stream_t* stream) {
       close_connection((uv_handle_t*)stream);
       return;
     }
-    send_get_req(stream);
+    if (op->version) {
+      transfer->version = *op->version;
+      transfer->start = op->offset;
+      transfer->length = op->length;
+      send_get_req(stream);
+      return;
+    }
+    transfer->length = UINT64_MAX;
   }
+  transfer->resolve_pending = 1;
+  send_command(stream, NASFS_CMD_RESOLVE, (const uint8_t*)op->remote_name,
+               strlen(op->remote_name) + 1, 1);
 }
 
 static void close_connection(uv_handle_t* handle) {
@@ -1104,6 +1303,7 @@ static void close_connection(uv_handle_t* handle) {
     client->client_exit_code = 1;
   if (client->transfer.put_result_pending) {
     client->results[client->batch_idx - 1].outcome = NASFS_CLIENT_PUT_UNKNOWN;
+    client->results[client->batch_idx - 1].version = client->transfer.version;
     client_message(
         client, NASFS_CLIENT_ERROR,
         "PUT outcome unknown for '%s': no valid publication response\n",
@@ -1242,91 +1442,64 @@ static void on_local_read(uv_fs_t* req) {
                    uv_strerror((int)req->result));
     client->client_exit_code = 1;
     close_connection((uv_handle_t*)stream);
-  } else if ((req->result == 0 &&
-              transfer->file_offset != transfer->put_plaintext_size) ||
-             (uint64_t)req->result >
-                 transfer->put_plaintext_size - transfer->file_offset) {
-    client_message(client, NASFS_CLIENT_ERROR,
-                   "PUT source size changed during upload: %s\n",
-                   transfer->local_filename);
-    close_connection((uv_handle_t*)stream);
-  } else if (req->result == 0) {
-    client_message(client, NASFS_CLIENT_INFO,
-                   "\nFinished reading local file. Waiting for publication.\n");
-    uint8_t manifest[NASFS_MANIFEST_SIZE];
-    if (protocol_manifest_sign(&transfer->file_manifest, manifest,
-                               client->author_secret) != 0) {
+  } else if (req->result == 0 &&
+             transfer->file_offset == transfer->header.size) {
+    uint8_t root[32], proof[NASFS_VERSION_PROOF_SIZE];
+    nasfs_version_index_final(&transfer->index, root);
+    if (nasfs_version_sign(&transfer->header, root, client->author_secret,
+                           proof) != 0) {
       close_connection((uv_handle_t*)stream);
       goto cleanup;
     }
-    memcpy(transfer->manifest_digest, manifest,
-           sizeof(transfer->manifest_digest));
-    send_command(stream, NASFS_CMD_PUT_DONE, manifest, sizeof(manifest), 1);
+    memcpy(transfer->version.digest, proof + 32,
+           sizeof(transfer->version.digest));
+    client_message(client, NASFS_CLIENT_INFO,
+                   "\nFinished reading local file. Waiting for publication.\n");
+    send_command(stream, NASFS_CMD_PUT_DONE, proof, sizeof(proof), 1);
   } else {
-    size_t bytes_read = req->result;
-    transfer->file_offset += bytes_read;
-
-    if (client->file_encryption_enabled) {
-      size_t ciphertext_len = bytes_read + 32; /* max overhead for any cipher */
-      uint8_t* ciphertext = malloc(ciphertext_len);
-      if (!ciphertext) {
-        client_message(client, NASFS_CLIENT_ERROR,
-                       "\nOut of memory for encryption\n");
-        client->client_exit_code = 1;
-        close_connection((uv_handle_t*)stream);
-        goto cleanup;
-      }
-
-      uint8_t block_key[crypto_secretbox_KEYBYTES];
-      crypto_engine_derive_block_key(block_key, transfer->encryption_key,
-                                     transfer->file_salt,
-                                     transfer->client_block_seq, 0);
-
-      size_t actual_ciphertext_len = 0;
-      if (crypto_engine_encrypt_block(
-              transfer->file_cipher_algo, (const uint8_t*)ctx->buf.base,
-              bytes_read, block_key, transfer->client_block_seq, ciphertext,
-              &actual_ciphertext_len) != 0) {
-        client_message(client, NASFS_CLIENT_ERROR, "\nEncryption failed\n");
-        free(ciphertext);
-        client->client_exit_code = 1;
-        close_connection((uv_handle_t*)stream);
-        goto cleanup;
-      }
-      ciphertext_len = actual_ciphertext_len;
-
-      nasfs_block_meta_t meta;
-      meta.seq_num = transfer->client_block_seq;
-      meta.size = (uint32_t)ciphertext_len;
-      memset(meta.hash, 0, sizeof(meta.hash));
-      size_t hash_out_len = 0;
-      if (crypto_engine_hash(transfer->file_hash_algo, ciphertext,
-                             ciphertext_len, meta.hash, &hash_out_len) != 0) {
-        client_message(client, NASFS_CLIENT_ERROR,
-                       "\nHash computation failed\n");
-        free(ciphertext);
-        client->client_exit_code = 1;
-        close_connection((uv_handle_t*)stream);
-        goto cleanup;
-      }
-
-      uint8_t encoded_meta[NASFS_BLOCK_META_SIZE];
-      protocol_encode_block_meta(encoded_meta, &meta);
-      send_command(stream, NASFS_CMD_PUT_BLOCK_META, encoded_meta,
-                   sizeof(encoded_meta), 1);
-      transfer->client_block_seq++;
-
-      protocol_manifest_record(&transfer->file_manifest, ciphertext,
-                               ciphertext_len);
-      send_command(stream, NASFS_CMD_PUT_DATA, ciphertext, ciphertext_len, 0);
-      free(ciphertext);
-    } else {
-      send_command(stream, NASFS_CMD_PUT_DATA, (uint8_t*)ctx->buf.base,
-                   bytes_read, 1);
+    int64_t record_offset;
+    uint32_t cipher_len;
+    if (nasfs_version_record(&transfer->header, transfer->sequence,
+                             &record_offset, &cipher_len) < 0 ||
+        req->result != (ssize_t)(cipher_len - NASFS_VERSION_BLOCK_TAG)) {
+      client_message(client, NASFS_CLIENT_ERROR,
+                     "PUT source size changed during upload: %s\n",
+                     transfer->local_filename);
+      close_connection((uv_handle_t*)stream);
+      goto cleanup;
     }
-
+    uint8_t* ciphertext = malloc(cipher_len);
+    if (!ciphertext) {
+      close_connection((uv_handle_t*)stream);
+      goto cleanup;
+    }
+    uint8_t key[crypto_secretbox_KEYBYTES];
+    crypto_engine_derive_block_key(key, transfer->encryption_key,
+                                   transfer->header.salt, transfer->sequence,
+                                   0);
+    size_t written = 0;
+    int rc = crypto_engine_encrypt_block(
+        transfer->header.cipher, (const uint8_t*)ctx->buf.base, req->result,
+        key, transfer->sequence, ciphertext, &written);
+    sodium_memzero(key, sizeof(key));
+    nasfs_block_meta_t meta = {.seq_num = transfer->sequence,
+                               .size = cipher_len};
+    if (rc != 0 || written != cipher_len ||
+        nasfs_version_hash_block(transfer->header.hash, ciphertext, cipher_len,
+                                 meta.hash) != 0) {
+      free(ciphertext);
+      close_connection((uv_handle_t*)stream);
+      goto cleanup;
+    }
+    uint8_t row[NASFS_BLOCK_META_SIZE];
+    protocol_encode_block_meta(row, &meta);
+    nasfs_version_index_add(&transfer->index, &meta);
+    transfer->sequence++;
+    transfer->file_offset += (uint64_t)req->result;
+    send_command(stream, NASFS_CMD_PUT_BLOCK_META, row, sizeof(row), 1);
+    send_command(stream, NASFS_CMD_PUT_DATA, ciphertext, cipher_len, 0);
+    free(ciphertext);
     report_event(client, NASFS_CLIENT_PROGRESS, transfer->file_offset);
-    fflush(stdout);
   }
 cleanup:
   free(ctx->buf.base);
@@ -1528,8 +1701,7 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
           nasfs_frame_t plain_frame = frame;
           unsigned char* decrypted_payload = NULL;
 
-          if ((frame.type >= 0x10 && frame.type < 0x20) ||
-              frame.type == NASFS_CMD_ERROR) {
+          if (nasfs_control_command(frame.type)) {
             decrypted_payload = malloc(frame.payload_len);
             if (!decrypted_payload) {
               close_connection((uv_handle_t*)stream);
@@ -1579,359 +1751,86 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               transfer->put_ack_pending = 0;
               do_put_read_chunk(stream);
               break;
-            case NASFS_CMD_PUT_RESULT:
-              if (transfer->current_op != NASFS_CLIENT_PUT ||
-                  !transfer->put_result_pending ||
-                  plain_frame.payload_len != 1) {
+            case NASFS_CMD_RESOLVED:
+              start_resolved_operation(stream, &plain_frame);
+              break;
+            case NASFS_CMD_COLLECTED:
+              if (transfer->current_op != NASFS_CLIENT_COLLECT ||
+                  plain_frame.payload_len != 0) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
-              if (plain_frame.payload[0] == NASFS_PUT_PUBLISHED) {
-                transfer->put_result_pending = 0;
-                nasfs_client_result_t* result =
-                    &client->results[client->batch_idx - 1];
+              client->results[client->batch_idx - 1].outcome =
+                  NASFS_CLIENT_COLLECTED;
+              report_event(client, NASFS_CLIENT_COMPLETED, 0);
+              start_next_operation(stream);
+              break;
+            case NASFS_CMD_PUT_RESULT: {
+              if ((!transfer->put_result_pending &&
+                   !transfer->put_ack_pending) ||
+                  plain_frame.payload_len != 1 ||
+                  plain_frame.payload[0] > NASFS_PUT_UNCERTAIN ||
+                  (!transfer->put_result_pending &&
+                   plain_frame.payload[0] == NASFS_PUT_PUBLISHED) ||
+                  plain_frame.payload[0] == NASFS_PUT_UNCERTAIN) {
+                close_connection((uv_handle_t*)stream);
+                break;
+              }
+              transfer->put_result_pending = 0;
+              nasfs_client_result_t* result =
+                  &client->results[client->batch_idx - 1];
+              uint8_t status = plain_frame.payload[0];
+              if (status == NASFS_PUT_PUBLISHED) {
                 result->outcome = NASFS_CLIENT_PUT_PUBLISHED;
-                result->has_digest = 1;
-                memcpy(result->digest, transfer->manifest_digest,
-                       sizeof(result->digest));
+                result->version = transfer->version;
                 report_event(client, NASFS_CLIENT_COMPLETED,
                              transfer->file_offset);
                 start_next_operation(stream);
-              } else if (plain_frame.payload[0] ==
-                         NASFS_PUT_PUBLICATION_FAILED) {
-                transfer->put_result_pending = 0;
-                client->results[client->batch_idx - 1].outcome =
-                    NASFS_CLIENT_REJECTED;
-                client_message(client, NASFS_CLIENT_ERROR,
-                               "Server could not publish '%s'\n",
-                               transfer->remote_filename);
-                close_connection((uv_handle_t*)stream);
               } else {
-                close_connection((uv_handle_t*)stream);
-              }
-              break;
-            case NASFS_CMD_GET_ACK: {
-              if (transfer->current_op != NASFS_CLIENT_GET ||
-                  transfer->local_fd != -1) {
-                close_connection((uv_handle_t*)stream);
-                break;
-              }
-              uint8_t manifest_cipher = transfer->file_cipher_algo;
-              if (client->file_encryption_enabled) {
-                /* GET_ACK: [16 salt][8 size][1 cipher][1 hash][optional slot]
-                 */
-                transfer->download_has_owner_slot =
-                    plain_frame.payload_len ==
-                    NASFS_FILE_METADATA_SIZE + NASFS_OWNER_SLOT_V1_SIZE;
-                if (!transfer->download_has_owner_slot &&
-                    plain_frame.payload_len != NASFS_FILE_METADATA_SIZE) {
-                  client_message(
-                      client, NASFS_CLIENT_ERROR,
-                      "Failed to download: Invalid GET_ACK length.\n");
-                  client->client_exit_code = 1;
-                  free(decrypted_payload);
-                  if (uv_is_closing((uv_handle_t*)stream)) return;
-                  close_connection((uv_handle_t*)stream);
-                  return;
-                }
-                memcpy(transfer->file_salt, plain_frame.payload,
-                       crypto_pwhash_SALTBYTES);
-                transfer->expected_plaintext_size = protocol_load_u64(
-                    plain_frame.payload + crypto_pwhash_SALTBYTES);
-                manifest_cipher =
-                    plain_frame
-                        .payload[crypto_pwhash_SALTBYTES + sizeof(uint64_t)];
-                transfer->download_legacy_counter =
-                    (manifest_cipher & NASFS_FILE_CIPHER_PORTABLE) == 0;
-                transfer->file_cipher_algo =
-                    manifest_cipher & ~NASFS_FILE_CIPHER_PORTABLE;
-                transfer->file_hash_algo =
-                    (nasfs_hash_algo_t)
-                        plain_frame.payload[crypto_pwhash_SALTBYTES +
-                                            sizeof(uint64_t) + 1];
-
-                if (transfer->file_cipher_algo > NASFS_CIPHER_AES_256_GCM ||
-                    transfer->file_hash_algo > NASFS_HASH_CRC32) {
-                  client_message(client, NASFS_CLIENT_ERROR,
-                                 "Invalid file cipher or hash algorithm\n");
-                  close_connection((uv_handle_t*)stream);
-                  break;
-                }
-                int key_rc =
-                    transfer->download_has_owner_slot
-                        ? crypto_engine_open_owner_slot(
-                              transfer->encryption_key,
-                              plain_frame.payload + NASFS_FILE_METADATA_SIZE,
-                              client->master_key, transfer->file_salt)
-                        : crypto_engine_derive_key(
-                              NASFS_KDF_HKDF_SHA256,
-                              (const char*)client->master_key,
-                              sizeof(client->master_key), transfer->file_salt,
-                              crypto_pwhash_SALTBYTES, transfer->encryption_key,
-                              sizeof(transfer->encryption_key));
-                if (key_rc != 0) {
-                  client_message(
-                      client, NASFS_CLIENT_ERROR,
-                      "Cannot open NASLUKS owner slot or derive legacy "
-                      "file key\n");
-                  client->client_exit_code = 1;
-                  free(decrypted_payload);
-                  if (uv_is_closing((uv_handle_t*)stream)) return;
-                  close_connection((uv_handle_t*)stream);
-                  return;
-                }
-              }
-
-              protocol_manifest_init(
-                  &transfer->file_manifest, transfer->remote_filename,
-                  transfer->expected_plaintext_size, transfer->file_salt,
-                  manifest_cipher, transfer->file_hash_algo);
-              if (transfer->download_has_owner_slot) {
-                protocol_manifest_owner_slot(
-                    &transfer->file_manifest,
-                    plain_frame.payload + NASFS_FILE_METADATA_SIZE,
-                    NASFS_OWNER_SLOT_V1_SIZE);
-              }
-              if (open_download_file(client) < 0) {
-                client_message(
-                    client, NASFS_CLIENT_ERROR,
-                    "Cannot create temporary download for '%s': %s\n",
-                    transfer->local_filename, strerror(errno));
+                result->outcome =
+                    status == NASFS_PUT_CONFLICT ? NASFS_CLIENT_CONFLICT
+                    : status == NASFS_PUT_QUOTA  ? NASFS_CLIENT_QUOTA
+                                                 : NASFS_CLIENT_REJECTED;
+                const char* reason =
+                    status == NASFS_PUT_CONFLICT ? "version conflict"
+                    : status == NASFS_PUT_QUOTA ? "quota exceeded; run collect "
+                                                  "to reclaim expired versions"
+                                                : "publication rejected";
+                client_message(client, NASFS_CLIENT_ERROR,
+                               "Server could not publish '%s': %s\n",
+                               transfer->remote_filename, reason);
                 close_connection((uv_handle_t*)stream);
               }
               break;
             }
-            case NASFS_CMD_GET_BLOCK_META: {
-              nasfs_block_meta_t meta;
-              if (transfer->current_op != NASFS_CLIENT_GET ||
-                  transfer->local_fd < 0 || transfer->has_pending_block_meta ||
-                  protocol_decode_block_meta(plain_frame.payload,
-                                             plain_frame.payload_len,
-                                             &meta) < 0) {
-                client_message(client, NASFS_CLIENT_ERROR,
-                               "Received invalid block meta size\n");
-                client->client_exit_code = 1;
-                free(decrypted_payload);
-                if (uv_is_closing((uv_handle_t*)stream)) return;
+            case NASFS_CMD_GET_ACK:
+              if (begin_download(client, &plain_frame) < 0)
                 close_connection((uv_handle_t*)stream);
-                return;
-              }
-              transfer->expected_block_seq = meta.seq_num;
-              transfer->expected_block_size = meta.size;
-              memcpy(transfer->expected_block_hash, meta.hash, 32);
-              transfer->has_pending_block_meta = 1;
               break;
-            }
-            case NASFS_CMD_GET_DATA: {
-              uv_fs_t write_req;
-              uv_buf_t write_buf;
-              int rc;
-
-              if (transfer->current_op != NASFS_CLIENT_GET ||
-                  transfer->local_fd == -1) {
-                free(decrypted_payload);
-                if (uv_is_closing((uv_handle_t*)stream)) return;
-                close_connection((uv_handle_t*)stream);
-                return;
-              }
-
-              uint8_t* write_data = plain_frame.payload;
-              size_t write_len = plain_frame.payload_len;
-              uint8_t* decrypted_buf = NULL;
-
-              if (client->file_encryption_enabled) {
-                if (!transfer->has_pending_block_meta) {
-                  client_message(
-                      client, NASFS_CLIENT_ERROR,
-                      "\nError: Received data block without metadata.\n");
-                  client->client_exit_code = 1;
-                  free(decrypted_payload);
-                  if (uv_is_closing((uv_handle_t*)stream)) return;
-                  close_connection((uv_handle_t*)stream);
-                  return;
-                }
-                if (plain_frame.payload_len != transfer->expected_block_size) {
-                  client_message(
-                      client, NASFS_CLIENT_ERROR,
-                      "\nError: Block size mismatch. Expected %u, got %zu.\n",
-                      transfer->expected_block_size, plain_frame.payload_len);
-                  client->client_exit_code = 1;
-                  free(decrypted_payload);
-                  if (uv_is_closing((uv_handle_t*)stream)) return;
-                  close_connection((uv_handle_t*)stream);
-                  return;
-                }
-                if (transfer->client_block_seq !=
-                    transfer->expected_block_seq) {
-                  client_message(
-                      client, NASFS_CLIENT_ERROR,
-                      "\nError: Sequence number mismatch. Expected %llu, "
-                      "got %llu.\n",
-                      (unsigned long long)transfer->client_block_seq,
-                      (unsigned long long)transfer->expected_block_seq);
-                  client->client_exit_code = 1;
-                  free(decrypted_payload);
-                  if (uv_is_closing((uv_handle_t*)stream)) return;
-                  close_connection((uv_handle_t*)stream);
-                  return;
-                }
-
-                uint8_t computed_hash[32] = {0};
-                size_t computed_hash_len = 0;
-                if (crypto_engine_hash(transfer->file_hash_algo,
-                                       plain_frame.payload,
-                                       plain_frame.payload_len, computed_hash,
-                                       &computed_hash_len) != 0) {
-                  client_message(client, NASFS_CLIENT_ERROR,
-                                 "\nError: Hash computation failed.\n");
-                  client->client_exit_code = 1;
-                  free(decrypted_payload);
-                  if (uv_is_closing((uv_handle_t*)stream)) return;
-                  close_connection((uv_handle_t*)stream);
-                  return;
-                }
-
-                if (sodium_memcmp(computed_hash, transfer->expected_block_hash,
-                                  32) != 0) {
-                  client_message(
-                      client, NASFS_CLIENT_ERROR,
-                      "\nError: Integrity check failed (hash mismatch) on "
-                      "block %llu.\n",
-                      (unsigned long long)transfer->client_block_seq);
-                  client->client_exit_code = 1;
-                  free(decrypted_payload);
-                  if (uv_is_closing((uv_handle_t*)stream)) return;
-                  close_connection((uv_handle_t*)stream);
-                  return;
-                }
-
-                decrypted_buf = malloc(plain_frame.payload_len);
-                if (!decrypted_buf) {
-                  client_message(client, NASFS_CLIENT_ERROR,
-                                 "\nError: Out of memory for decryption.\n");
-                  client->client_exit_code = 1;
-                  free(decrypted_payload);
-                  if (uv_is_closing((uv_handle_t*)stream)) return;
-                  close_connection((uv_handle_t*)stream);
-                  return;
-                }
-
-                uint8_t block_key[crypto_secretbox_KEYBYTES];
-                crypto_engine_derive_block_key(
-                    block_key, transfer->encryption_key, transfer->file_salt,
-                    transfer->client_block_seq,
-                    transfer->download_legacy_counter);
-
-                size_t plaintext_len = 0;
-                if (crypto_engine_decrypt_block(
-                        transfer->file_cipher_algo, plain_frame.payload,
-                        plain_frame.payload_len, block_key,
-                        transfer->client_block_seq,
-                        transfer->download_legacy_counter, decrypted_buf,
-                        &plaintext_len) != 0) {
-                  client_message(
-                      client, NASFS_CLIENT_ERROR,
-                      "\nError: Decryption failed. Wrong key or corrupted "
-                      "data on block %llu.\n",
-                      (unsigned long long)transfer->client_block_seq);
-                  free(decrypted_buf);
-                  client->client_exit_code = 1;
-                  free(decrypted_payload);
-                  if (uv_is_closing((uv_handle_t*)stream)) return;
-                  close_connection((uv_handle_t*)stream);
-                  return;
-                }
-                protocol_manifest_record(&transfer->file_manifest,
-                                         plain_frame.payload,
-                                         plain_frame.payload_len);
-                write_data = decrypted_buf;
-                write_len = plaintext_len;
-
-                transfer->has_pending_block_meta = 0;
-                transfer->client_block_seq++;
-              }
-
-              if (write_len > INT64_MAX - transfer->file_offset ||
-                  (client->file_encryption_enabled &&
-                   write_len > transfer->expected_plaintext_size -
-                                   transfer->file_offset)) {
+            case NASFS_CMD_GET_INDEX:
+              if (receive_index(transfer, &plain_frame) < 0) {
                 client_message(client, NASFS_CLIENT_ERROR,
-                               "Download exceeds expected file size\n");
-                free(decrypted_buf);
+                               "File manifest index mismatch\n");
                 close_connection((uv_handle_t*)stream);
-                break;
               }
-              write_buf = uv_buf_init((char*)write_data, write_len);
-              rc = uv_fs_write(client->loop, &write_req, transfer->local_fd,
-                               &write_buf, 1, transfer->file_offset, NULL);
-              uv_fs_req_cleanup(&write_req);
-              free(decrypted_buf);
-
-              if (rc < 0 || (size_t)rc != write_len) {
-                client_message(client, NASFS_CLIENT_ERROR,
-                               "Failed to write downloaded data: %s\n",
-                               rc < 0 ? uv_strerror(rc) : "short write");
-                close_connection((uv_handle_t*)stream);
-                break;
-              }
-              transfer->file_offset += (uint64_t)rc;
-              report_event(client, NASFS_CLIENT_PROGRESS,
-                           transfer->file_offset);
-              fflush(stdout);
               break;
-            }
+            case NASFS_CMD_GET_BLOCK_META:
+              if (receive_block_meta(transfer, &plain_frame) < 0)
+                close_connection((uv_handle_t*)stream);
+              break;
+            case NASFS_CMD_GET_DATA:
+              if (receive_block(client, &plain_frame) < 0)
+                close_connection((uv_handle_t*)stream);
+              break;
             case NASFS_CMD_GET_DONE:
-              if (transfer->current_op != NASFS_CLIENT_GET ||
-                  transfer->local_fd == -1) {
+              if (verify_download(client, &plain_frame) < 0) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
-              if (client->file_encryption_enabled &&
-                  transfer->file_offset != transfer->expected_plaintext_size) {
-                client_message(
-                    client, NASFS_CLIENT_ERROR,
-                    "\nIntegrity error: expected %llu bytes, got %llu "
-                    "(file truncated or padded by server).\n",
-                    (unsigned long long)transfer->expected_plaintext_size,
-                    (unsigned long long)transfer->file_offset);
-                client->client_exit_code = 1;
-                close_connection((uv_handle_t*)stream);
-                break;
-              }
-              if (!(client->allow_unsigned_reads &&
-                    !transfer->download_has_owner_slot &&
-                    plain_frame.payload_len == 0) &&
-                  (plain_frame.payload_len != NASFS_MANIFEST_SIZE ||
-                   protocol_manifest_verify(&transfer->file_manifest,
-                                            plain_frame.payload,
-                                            client->author_public) != 0)) {
-                client_message(client, NASFS_CLIENT_ERROR,
-                               "File manifest missing or invalid\n");
-                close_connection((uv_handle_t*)stream);
-                break;
-              }
-              if (transfer->require_manifest_digest &&
-                  (plain_frame.payload_len != NASFS_MANIFEST_SIZE ||
-                   sodium_memcmp(transfer->manifest_digest, plain_frame.payload,
-                                 sizeof(transfer->manifest_digest)) != 0)) {
-                client_message(client, NASFS_CLIENT_ERROR,
-                               "Unexpected file manifest version\n");
-                close_connection((uv_handle_t*)stream);
-                break;
-              }
-              if (transfer->has_pending_block_meta ||
-                  publish_download(client) < 0) {
-                close_connection((uv_handle_t*)stream);
-                break;
-              }
-              nasfs_client_result_t* result =
-                  &client->results[client->batch_idx - 1];
-              result->outcome = NASFS_CLIENT_GET_PUBLISHED;
-              if (plain_frame.payload_len == NASFS_MANIFEST_SIZE) {
-                result->has_digest = 1;
-                memcpy(result->digest, plain_frame.payload,
-                       sizeof(result->digest));
-              }
+              client->results[client->batch_idx - 1].outcome =
+                  NASFS_CLIENT_GET_PUBLISHED;
+              client->results[client->batch_idx - 1].version =
+                  transfer->version;
               report_event(client, NASFS_CLIENT_COMPLETED,
                            transfer->file_offset);
               start_next_operation(stream);
@@ -2031,23 +1930,30 @@ int nasfs_client_run(const nasfs_client_options_t* options,
   memset(output, 0, count * sizeof(*output));
   if (!options || !requests) return 1;
   nasfs_client_operation_t operation = requests[0].operation;
-  if ((operation != NASFS_CLIENT_PUT && operation != NASFS_CLIENT_GET) ||
+  int is_upload = operation == NASFS_CLIENT_PUT;
+  int transferring = is_upload || operation == NASFS_CLIENT_GET;
+  if (operation < NASFS_CLIENT_PUT || operation > NASFS_CLIENT_COLLECT ||
       !options->ip || options->port < 1 || options->port > 65535 ||
       !options->kex_algorithms || !options->cipher_algorithms ||
       !options->auth_method || !options->auth_user ||
-      !options->encryption_password || !options->encryption_password[0] ||
-      options->block_size < 4096 || options->block_size > 4194304 ||
-      !options->author_key || (options->expected_digest && count != 1) ||
-      (operation == NASFS_CLIENT_PUT && options->kdf != NASFS_KDF_ARGON2ID) ||
-      sodium_init() < 0) {
+      (transferring &&
+       (!options->encryption_password || !*options->encryption_password)) ||
+      !options->block_size || options->block_size > NASFS_VERSION_MAX_BLOCK ||
+      options->block_size < NASFS_VERSION_MIN_BLOCK || sodium_init() < 0) {
     if (options->notify)
       options->notify(options->callback_data, NASFS_CLIENT_ERROR, 0, 0,
                       "Invalid NASFS client options\n");
     return 1;
   }
   for (size_t i = 0; i < count; i++) {
-    if (requests[i].operation != operation || !requests[i].local_path ||
-        !requests[i].remote_name)
+    const nasfs_client_request_t* op = &requests[i];
+    if (op->operation != operation || (transferring && !op->local_path) ||
+        ((operation != NASFS_CLIENT_COLLECT && !op->version) &&
+         (!op->remote_name || !*op->remote_name ||
+          strlen(op->remote_name) > 255)) ||
+        (op->version && operation != NASFS_CLIENT_GET) ||
+        (op->version && options->expected_digest &&
+         sodium_memcmp(op->version->digest, options->expected_digest, 32) != 0))
       return 1;
   }
   void* memory;
@@ -2064,26 +1970,24 @@ int nasfs_client_run(const nasfs_client_options_t* options,
   transfer->local_fd = -1;
   transfer->download_directory = -1;
   transfer->download_staging = -1;
-  transfer->file_cipher_algo = options->file_cipher;
-  transfer->file_hash_algo = options->file_hash;
-  int is_upload = operation == NASFS_CLIENT_PUT;
   int return_code = 1;
-  client->file_encryption_enabled = 1;
-  uint8_t master_salt[crypto_pwhash_SALTBYTES];
-  if (load_master_salt(client, master_salt, is_upload) < 0) {
-    client_message(client, NASFS_CLIENT_ERROR,
-                   "Cannot load or save ~/.nasfs/master.salt: %s\n",
-                   strerror(errno));
-    goto cleanup;
-  }
-
-  if (crypto_engine_derive_key(options->kdf, options->encryption_password,
-                               strlen(options->encryption_password),
-                               master_salt, crypto_pwhash_SALTBYTES,
-                               client->master_key,
-                               sizeof(client->master_key)) != 0) {
-    client_message(client, NASFS_CLIENT_ERROR, "Failed to derive master key\n");
-    goto cleanup;
+  if (transferring) {
+    uint8_t master_salt[crypto_pwhash_SALTBYTES];
+    if (load_master_salt(client, master_salt, is_upload) < 0) {
+      client_message(client, NASFS_CLIENT_ERROR,
+                     "Cannot load or save ~/.nasfs/master.salt: %s\n",
+                     strerror(errno));
+      goto cleanup;
+    }
+    if (crypto_engine_derive_key(
+            NASFS_KDF_ARGON2ID, options->encryption_password,
+            strlen(options->encryption_password), master_salt,
+            sizeof(master_salt), client->master_key,
+            sizeof(client->master_key)) != 0) {
+      client_message(client, NASFS_CLIENT_ERROR,
+                     "Failed to derive master key\n");
+      goto cleanup;
+    }
   }
 
   if (!auth_method_requires_password(client->options->auth_method) &&
@@ -2105,7 +2009,7 @@ int nasfs_client_run(const nasfs_client_options_t* options,
     goto cleanup;
   }
 
-  if (client->options->auth_password &&
+  if (transferring && client->options->auth_password &&
       strcmp(options->encryption_password, client->options->auth_password) ==
           0) {
     client_message(
@@ -2124,13 +2028,7 @@ int nasfs_client_run(const nasfs_client_options_t* options,
                                           client->author_secret, seed);
     sodium_memzero(seed, sizeof(seed));
     if (result != 0) goto cleanup;
-  } else {
-    if (options->expected_digest) {
-      memcpy(transfer->manifest_digest, options->expected_digest,
-             sizeof(transfer->manifest_digest));
-      transfer->require_manifest_digest = 1;
-    }
-    client->allow_unsigned_reads = options->allow_unsigned_reads;
+  } else if (transferring) {
     if (nasfs_handshake_read_key(options->author_key, client->author_public,
                                  0) < 0) {
       client_message(client, NASFS_CLIENT_ERROR,

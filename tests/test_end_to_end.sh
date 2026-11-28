@@ -188,7 +188,8 @@ fi
 # Verify encrypted blob exists on server storage.
 # The stored file is E2EE ciphertext so its hash intentionally differs from
 # the plaintext hash; only verify presence here.
-if [ ! -f "$STORAGE_DIR/$REMOTE_NAME" ]; then
+published=$(sed -n 's/^Upload published. Manifest digest: //p' "$LOG_DIR/client_put.log")
+if [ ! -f "$STORAGE_DIR/.nasfs-v2/v-$published" ]; then
     printf "${RED}%s${NC}\n" "FAIL: Uploaded file not found in storage directory."
     exit 1
 fi
@@ -248,21 +249,20 @@ fi
 printf "${GREEN}%s${NC}\n" "      Negotiated suite verified in server logs."
 
 ln -s "$REMOTE_NAME" "$STORAGE_DIR/storage-link.bin"
-STORED_HASH=$(hash_file "$STORAGE_DIR/$REMOTE_NAME")
+STORED_HASH=$(hash_file "$STORAGE_DIR/.nasfs-v2/v-$published")
 expect_client_failure "$LOG_DIR/client_storage_link.log" "Server error:" \
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
     get "storage-link.bin" "$TEST_DIR/storage-link.bin"
-grep -Fq "GET: Open failed:" "$LOG_DIR/server.log"
 test ! -e "$TEST_DIR/storage-link.bin"
 test -L "$STORAGE_DIR/storage-link.bin"
-test "$(hash_file "$STORAGE_DIR/$REMOTE_NAME")" = "$STORED_HASH"
+test "$(hash_file "$STORAGE_DIR/.nasfs-v2/v-$published")" = "$STORED_HASH"
 
 expect_client_failure "$LOG_DIR/client_missing_source.log" "Cannot open PUT source" \
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
     put "$TEST_DIR/missing-source.bin" "missing-source.bin"
 test ! -e "$STORAGE_DIR/missing-source.bin"
 
-expect_client_failure "$LOG_DIR/client_missing_remote.log" "File not found" \
+expect_client_failure "$LOG_DIR/client_missing_remote.log" "version unavailable" \
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
     get "absent.bin" "$TEST_DIR/absent.bin"
 test ! -e "$TEST_DIR/absent.bin"
@@ -310,40 +310,14 @@ check_mput_alias() {
     local second_input="$TEST_DIR/alias-second/$2"
     printf 'First batch entry\n' > "$first_input"
     printf 'Second batch entry\n' > "$second_input"
-    touch "$STORAGE_DIR/$first"
-    local aliases=0
-    if [[ -e "$STORAGE_DIR/$second" ]]; then aliases=1; fi
-    rm "$STORAGE_DIR/$first"
-    if (( aliases )); then
-        expect_client_failure "$LOG_DIR/client_alias_$label.log" "Server could not publish" \
-            "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mput "$first_input" "$second_input"
-    else
-        run_client "$LOG_DIR/client_alias_$label.log" "ML-KEM-512" "password" \
-            "e2e-password" "" "ML-DSA-65" mput "$first_input" "$second_input"
-        run_client "$LOG_DIR/client_alias_second_$label.log" "ML-KEM-512" "password" \
-            "e2e-password" "" "ML-DSA-65" get "$second" "$TEST_DIR/alias-second.out"
-        cmp "$second_input" "$TEST_DIR/alias-second.out"
-    fi
-    if (( aliases )); then
-        expect_client_failure "$LOG_DIR/client_put_alias_$label.log" "Server could not publish" \
-            "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" put "$second_input" "$second"
-    else
-        run_client "$LOG_DIR/client_put_alias_$label.log" "ML-KEM-512" "password" \
-            "e2e-password" "" "ML-DSA-65" put "$first_input" "$second"
-        run_client "$LOG_DIR/client_get_replaced_$label.log" "ML-KEM-512" "password" \
-            "e2e-password" "" "ML-DSA-65" get "$second" "$TEST_DIR/alias-second.out"
-        cmp "$first_input" "$TEST_DIR/alias-second.out"
-    fi
+    run_client "$LOG_DIR/client_alias_$label.log" "ML-KEM-512" "password" \
+        "e2e-password" "" "ML-DSA-65" mput "$first_input" "$second_input"
+    run_client "$LOG_DIR/client_alias_second_$label.log" "ML-KEM-512" "password" \
+        "e2e-password" "" "ML-DSA-65" get "$second" "$TEST_DIR/alias-second.out"
+    cmp "$second_input" "$TEST_DIR/alias-second.out"
     run_client "$LOG_DIR/client_alias_first_$label.log" "ML-KEM-512" "password" \
         "e2e-password" "" "ML-DSA-65" get "$first" "$TEST_DIR/alias-first.out"
     cmp "$first_input" "$TEST_DIR/alias-first.out"
-    if (( aliases )); then
-        run_client "$LOG_DIR/client_put_exact_$label.log" "ML-KEM-512" "password" \
-            "e2e-password" "" "ML-DSA-65" put "$second_input" "$first"
-        run_client "$LOG_DIR/client_get_exact_$label.log" "ML-KEM-512" "password" \
-            "e2e-password" "" "ML-DSA-65" get "$first" "$TEST_DIR/alias-first.out"
-        cmp "$second_input" "$TEST_DIR/alias-first.out"
-    fi
 }
 check_mput_alias Batch-Case.bin batch-case.bin case
 check_mput_alias $'batch-\xc3\xa9.bin' $'batch-e\xcc\x81.bin' unicode
@@ -380,46 +354,36 @@ first_upload=$!
 run_client "$LOG_DIR/client_concurrent_second.log" "ML-KEM-512" "password" \
     "e2e-password" "" "ML-DSA-65" put "$other_input" "concurrent.bin" &
 second_upload=$!
-wait "$first_upload"
-wait "$second_upload"
+first_status=0
+second_status=0
+wait "$first_upload" || first_status=$?
+wait "$second_upload" || second_status=$?
+test "$first_status" -eq 0 || test "$second_status" -eq 0
 
 run_client "$LOG_DIR/client_concurrent_get.log" "ML-KEM-512" "password" \
     "e2e-password" "" "ML-DSA-65" get "concurrent.bin" "$TEST_DIR/concurrent.bin"
 concurrent_hash=$(hash_file "$TEST_DIR/concurrent.bin")
 test "$concurrent_hash" = "$INPUT_HASH" || test "$concurrent_hash" = "$other_hash"
 
-cp "$STORAGE_DIR/concurrent.bin" "$TEST_DIR/previous-container"
-chmod 400 "$STORAGE_DIR/concurrent.bin"
-expect_client_failure "$LOG_DIR/client_protected_target.log" "Server could not publish" \
-    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
-    put "$other_input" concurrent.bin
-cmp "$TEST_DIR/previous-container" "$STORAGE_DIR/concurrent.bin"
-chmod 600 "$STORAGE_DIR/concurrent.bin"
 run_client "$LOG_DIR/client_replace.log" "ML-KEM-512" "password" \
     "e2e-password" "" "ML-DSA-65" put "$other_input" concurrent.bin
 run_client "$LOG_DIR/client_replaced_get.log" "ML-KEM-512" "password" \
     "e2e-password" "" "ML-DSA-65" get concurrent.bin "$TEST_DIR/replaced.bin"
 cmp "$other_input" "$TEST_DIR/replaced.bin"
 
-mkdir "$STORAGE_DIR/upload_destination_directory"
-expect_client_failure "$LOG_DIR/client_upload_publish_failure.log" "Server could not publish" \
-    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" \
-    put "$TEST_INPUT" "upload_destination_directory"
-grep -Fq 'PUT: Publication failed:' "$LOG_DIR/server.log"
-test -d "$STORAGE_DIR/upload_destination_directory"
-
 cp "$TEST_INPUT" "$TEST_DIR/batch_first.bin"
-cp "$TEST_INPUT" "$TEST_DIR/upload_destination_directory"
+cp "$TEST_INPUT" "$TEST_DIR/concurrent.bin"
 cp "$other_input" "$TEST_DIR/batch_last.bin"
 expect_client_failure "$LOG_DIR/client_batch_publish_failure.log" "Server could not publish" \
     "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" mput \
-    "$TEST_DIR/batch_first.bin" "$TEST_DIR/upload_destination_directory" \
+    "$TEST_DIR/batch_first.bin" "$TEST_DIR/concurrent.bin" \
     "$TEST_DIR/batch_last.bin"
-test ! -e "$STORAGE_DIR/batch_last.bin"
+expect_client_failure "$LOG_DIR/client_batch_last.log" "version unavailable" \
+    "ML-KEM-512" "password" "e2e-password" "" "ML-DSA-65" resolve "batch_last.bin"
 run_client "$LOG_DIR/client_batch_first_get.log" "ML-KEM-512" "password" \
     "e2e-password" "" "ML-DSA-65" get "batch_first.bin" "$TEST_DIR/batch_first_get.bin"
 verify_download_hash "$INPUT_HASH" "$TEST_DIR/batch_first_get.bin"
-if compgen -G "$STORAGE_DIR/.nasfs/.nasfs-upload.*" > /dev/null; then
+if compgen -G "$STORAGE_DIR/.nasfs-v2/.attempt.*" > /dev/null; then
     printf "Temporary upload was not removed.\n" >&2
     exit 1
 fi

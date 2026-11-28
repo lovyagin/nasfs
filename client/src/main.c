@@ -46,20 +46,27 @@ static int parse_cipher_algo(const char* s) {
 }
 
 static int parse_hash_algo(const char* s) {
-  if (!s || !*s || strcmp(s, "blake2b") == 0) return NASFS_HASH_BLAKE2B;
-  if (strcmp(s, "sha256") == 0) return NASFS_HASH_SHA256;
-  if (strcmp(s, "adler32") == 0) return NASFS_HASH_ADLER32;
-  if (strcmp(s, "crc32") == 0) return NASFS_HASH_CRC32;
+  if (!s || !*s || strcmp(s, "blake2b") == 0) return NASFS_VERSION_BLAKE2B;
+  if (strcmp(s, "sha256") == 0) return NASFS_VERSION_SHA256;
+  if (strcmp(s, "blake3") == 0) return NASFS_VERSION_BLAKE3;
   return -1;
 }
 
-static int parse_kdf_algo(const char* s) {
-  if (!s || !*s || strcmp(s, "argon2id") == 0) return NASFS_KDF_ARGON2ID;
-  if (strcmp(s, "hkdf") == 0 || strcmp(s, "hkdf-sha256") == 0)
-    return NASFS_KDF_HKDF_SHA256;
-  if (strcmp(s, "pbkdf2") == 0 || strcmp(s, "pbkdf2-sha256") == 0)
-    return NASFS_KDF_PBKDF2_SHA256;
-  return -1;
+static int parse_u64(const char* value, uint64_t* out) {
+  if (!*value || strspn(value, "0123456789") != strlen(value)) return -1;
+  char* end;
+  errno = 0;
+  unsigned long long number = strtoull(value, &end, 10);
+  if (errno || *end) return -1;
+  *out = number;
+  return 0;
+}
+
+static int parse_hex(const char* value, uint8_t* out, size_t size) {
+  size_t length = strlen(value);
+  return length != size * 2
+             ? -1
+             : sodium_hex2bin(out, size, value, length, NULL, NULL, NULL);
 }
 
 static const char* get_basename(const char* path) {
@@ -223,17 +230,33 @@ static void show_client_event(void* data, nasfs_client_event_t event,
   int uploading = request->operation == NASFS_CLIENT_PUT;
   if (event == NASFS_CLIENT_STARTED) {
     printf("\n[%zu/%zu] %s %s\n", index + 1, output->count,
-           uploading ? "PUT" : "GET",
-           uploading ? request->local_path : request->remote_name);
+           uploading                                    ? "PUT"
+           : request->operation == NASFS_CLIENT_GET     ? "GET"
+           : request->operation == NASFS_CLIENT_RESOLVE ? "RESOLVE"
+                                                        : "COLLECT",
+           uploading              ? request->local_path
+           : request->remote_name ? request->remote_name
+                                  : "");
   } else if (event == NASFS_CLIENT_PROGRESS) {
     printf("\r%s %llu bytes...", uploading ? "Uploaded" : "Downloaded",
            (unsigned long long)bytes);
-  } else if (event == NASFS_CLIENT_COMPLETED && uploading) {
-    char digest[65];
-    sodium_bin2hex(digest, sizeof(digest), output->results[index].digest, 32);
-    printf("Upload published. Manifest digest: %s\n", digest);
+    fflush(stdout);
   } else if (event == NASFS_CLIENT_COMPLETED) {
-    printf("\nDownload complete.\n");
+    const nasfs_client_result_t* result = &output->results[index];
+    char id[33], digest[65];
+    sodium_bin2hex(id, sizeof(id), result->version.id,
+                   sizeof(result->version.id));
+    sodium_bin2hex(digest, sizeof(digest), result->version.digest,
+                   sizeof(result->version.digest));
+    if (uploading) {
+      printf("Upload published. Manifest digest: %s\n", digest);
+    } else if (request->operation == NASFS_CLIENT_GET) {
+      printf("\nDownload complete.\n");
+    } else if (request->operation == NASFS_CLIENT_RESOLVE) {
+      printf("%s %s\n", id, digest);
+    } else {
+      printf("Expired versions collected.\n");
+    }
   }
 }
 
@@ -251,7 +274,8 @@ int main(int argc, char** argv) {
     return write_keypair_files(argv[2], argv[3], algorithm);
   }
 
-  if (argc < 3) {
+  int collecting = argc == 2 && strcmp(argv[1], "collect") == 0;
+  if (argc < 3 && !collecting) {
     fprintf(
         stderr,
         "Usage:\n"
@@ -260,8 +284,11 @@ int main(int argc, char** argv) {
         "  %s mput <file1> <file2> ...           -- batch upload, create only\n"
         "  %s mget <remote1> <remote2> ...       -- batch download (one "
         "session)\n"
+        "  %s resolve <name>\n"
+        "  %s get-version <id> <digest> <offset> <length|all> <local_file>\n"
+        "  %s collect\n"
         "  %s keygen <private_key> <authorized_keys> [sig_algo]\n",
-        argv[0], argv[0], argv[0], argv[0], argv[0]);
+        argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 1;
   }
 
@@ -314,8 +341,8 @@ int main(int argc, char** argv) {
   const char* env_block_size = getenv("NASFS_BLOCK_SIZE");
   int selected_cipher = parse_cipher_algo(env_file_cipher);
   int selected_hash = parse_hash_algo(env_file_hash);
-  int selected_kdf = parse_kdf_algo(env_kdf);
-  if (selected_cipher < 0 || selected_hash < 0 || selected_kdf < 0) {
+  if (selected_cipher < 0 || selected_hash < 0 ||
+      (env_kdf && *env_kdf && strcmp(env_kdf, "argon2id") != 0)) {
     fprintf(stderr, "Invalid %s selection\n",
             selected_cipher < 0 ? "NASFS_FILE_CIPHER"
             : selected_hash < 0 ? "NASFS_FILE_HASH"
@@ -323,12 +350,10 @@ int main(int argc, char** argv) {
     return 1;
   }
   options.file_cipher = (nasfs_cipher_algo_t)selected_cipher;
-  options.file_hash = (nasfs_hash_algo_t)selected_hash;
+  options.file_hash = (nasfs_version_hash_t)selected_hash;
   int is_upload = strcmp(argv[1], "put") == 0 || strcmp(argv[1], "mput") == 0;
-  if (is_upload && selected_kdf != NASFS_KDF_ARGON2ID) {
-    fprintf(stderr, "NASFS_KDF must be argon2id for PUT and mput\n");
-    return 1;
-  }
+  int is_get = strcmp(argv[1], "get") == 0 || strcmp(argv[1], "mget") == 0 ||
+               strcmp(argv[1], "get-version") == 0;
   if (env_block_size && env_block_size[0] != '\0') {
     char* end;
     long bs = strtol(env_block_size, &end, 10);
@@ -340,7 +365,7 @@ int main(int argc, char** argv) {
   }
 
   const char* env_encryption_key = getenv("NASFS_ENCRYPTION_KEY");
-  if (!env_encryption_key || env_encryption_key[0] == '\0') {
+  if ((is_upload || is_get) && (!env_encryption_key || !*env_encryption_key)) {
     fprintf(stderr, "\n[SECURITY AUDIT ENFORCEMENT]\n");
     fprintf(stderr, "NASFS is now Secure-by-Default.\n");
     fprintf(stderr, "Plaintext file transmission is strictly forbidden.\n");
@@ -351,17 +376,39 @@ int main(int argc, char** argv) {
 
   nasfs_client_request_t batch_queue[NASFS_MAX_BATCH];
   int batch_count = 0;
-  if (strcmp(argv[1], "put") == 0) {
+  nasfs_client_version_t version;
+  if (collecting) {
+    batch_queue[batch_count++] =
+        (nasfs_client_request_t){.operation = NASFS_CLIENT_COLLECT};
+  } else if (strcmp(argv[1], "resolve") == 0 && argc == 3) {
+    batch_queue[batch_count++] = (nasfs_client_request_t){
+        .operation = NASFS_CLIENT_RESOLVE, .remote_name = argv[2]};
+  } else if (strcmp(argv[1], "get-version") == 0 && argc == 7) {
+    uint64_t offset, length = UINT64_MAX;
+    if (parse_hex(argv[2], version.id, sizeof(version.id)) < 0 ||
+        parse_hex(argv[3], version.digest, sizeof(version.digest)) < 0 ||
+        parse_u64(argv[4], &offset) < 0 ||
+        (strcmp(argv[5], "all") != 0 && parse_u64(argv[5], &length) < 0)) {
+      fprintf(stderr, "Invalid version identifier or range\n");
+      return 1;
+    }
+    batch_queue[batch_count++] =
+        (nasfs_client_request_t){.operation = NASFS_CLIENT_GET,
+                                 .local_path = argv[6],
+                                 .version = &version,
+                                 .offset = offset,
+                                 .length = length};
+  } else if (strcmp(argv[1], "put") == 0) {
     /* Single PUT: put <local> [remote] */
     const char* loc = argv[2];
     const char* rem = (argc >= 4) ? argv[3] : get_basename(loc);
-    batch_queue[batch_count++] =
-        (nasfs_client_request_t){NASFS_CLIENT_PUT, loc, rem, 0};
+    batch_queue[batch_count++] = (nasfs_client_request_t){
+        .operation = NASFS_CLIENT_PUT, .local_path = loc, .remote_name = rem};
   } else if (strcmp(argv[1], "get") == 0) {
     const char* rem = argv[2];
     const char* loc = (argc >= 4) ? argv[3] : get_basename(rem);
-    batch_queue[batch_count++] =
-        (nasfs_client_request_t){NASFS_CLIENT_GET, loc, rem, 0};
+    batch_queue[batch_count++] = (nasfs_client_request_t){
+        .operation = NASFS_CLIENT_GET, .local_path = loc, .remote_name = rem};
   } else if (strcmp(argv[1], "mput") == 0 || strcmp(argv[1], "mget") == 0) {
     if (argc - 2 > NASFS_MAX_BATCH) {
       fprintf(stderr, "Batch limit is %d files\n", NASFS_MAX_BATCH);
@@ -380,9 +427,13 @@ int main(int argc, char** argv) {
         }
       }
       batch_queue[batch_count++] =
-          uploading
-              ? (nasfs_client_request_t){NASFS_CLIENT_PUT, argv[i], name, 1}
-              : (nasfs_client_request_t){NASFS_CLIENT_GET, argv[i], name, 0};
+          uploading ? (nasfs_client_request_t){.operation = NASFS_CLIENT_PUT,
+                                               .local_path = argv[i],
+                                               .remote_name = name,
+                                               .create_only = 1}
+                    : (nasfs_client_request_t){.operation = NASFS_CLIENT_GET,
+                                               .local_path = argv[i],
+                                               .remote_name = name};
     }
   } else {
     fprintf(stderr, "Invalid operation. Use put, get, mput, or mget.\n");
@@ -390,15 +441,11 @@ int main(int argc, char** argv) {
   }
 
   options.encryption_password = env_encryption_key;
-  options.kdf = (nasfs_kdf_algo_t)selected_kdf;
   options.author_key = getenv(is_upload ? "NASFS_AUTHOR_SIGNING_SEED"
                                         : "NASFS_AUTHOR_PUBLIC_KEY");
-  const char* unsigned_reads = getenv("NASFS_ALLOW_UNSIGNED_READ");
-  options.allow_unsigned_reads =
-      unsigned_reads && strcmp(unsigned_reads, "1") == 0;
   uint8_t digest[32];
   const char* expected = getenv("NASFS_EXPECTED_MANIFEST");
-  if (!is_upload && expected) {
+  if (is_get && expected) {
     if (batch_count != 1 || strlen(expected) != 2 * sizeof(digest) ||
         sodium_hex2bin(digest, sizeof(digest), expected, strlen(expected), NULL,
                        NULL, NULL) != 0) {
