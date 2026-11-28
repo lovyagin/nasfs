@@ -32,6 +32,8 @@ if [[ $CLIENT_BIN != /* ]]; then
 fi
 # shellcheck source-path=SCRIPTDIR
 source "$SCRIPT_DIR/integration_helpers.sh"
+# shellcheck source-path=SCRIPTDIR
+source "$SCRIPT_DIR/benchmark_sftp.sh"
 
 SFTP_HOST="localhost"
 SFTP_USER="${USER:-$(id -un)}"
@@ -70,7 +72,7 @@ if command -v taskset >/dev/null && affinity=$(taskset -pc "$$" 2>/dev/null); th
   THROTTLE=(taskset -c "${affinity%%[-,]*}" "${THROTTLE[@]}")
 fi
 
-SFTP_OPTS=(-P "$SFTP_PORT" -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10)
+SFTP_OPTS=(-P "$SFTP_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10)
 [[ -n "$SFTP_KEY" ]] && SFTP_OPTS+=(-i "$SFTP_KEY")
 
 benchmark_home=${HOME:-}
@@ -201,77 +203,47 @@ bench_nasfs_batch_get() {
   awk "BEGIN {fps=$count/$total_sec; lat=$total_sec*1000/$count; tput=$count*$fsz/1048576.0/$total_sec; printf \"%.4f %.4f %.2f %.4f\", $total_sec, fps, lat, tput}"
 }
 
-# SFTP batches all files in ONE session (sftp -b batchfile)
-bench_sftp_put_batch() {
-  local file=$1 count=$2 fsz=$3
-  local remote_dir="/tmp/sftp_iops_$$"
-  local batchfile="$BENCH_ROOT/sftp_put_batch.txt"
+# SFTP batches all files in one timed session.
+bench_sftp_put_batch() (
+  local file=$1 count=$2 fsz=$3 remote_dir i
+  local t0 t1
+  prepare_sftp_scratch || return
+  t0=$(now_ns)
+  for ((i = 1; i <= count; i++)); do
+    printf 'put "%s" %s/f_%d\n' "$file" "$remote_dir" "$i"
+  done | sftp_batch >/dev/null || return
+  t1=$(now_ns)
 
-  printf "mkdir %s\n" "$remote_dir" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1 || true
+  local total_sec fps lat_ms throughput
+  total_sec=$(awk "BEGIN {printf \"%.4f\", ($t1 - $t0) / 1e9}")
+  fps=$(awk       "BEGIN {printf \"%.4f\", $count / $total_sec}")
+  lat_ms=$(awk    "BEGIN {printf \"%.2f\", $total_sec * 1000 / $count}")
+  throughput=$(awk "BEGIN {printf \"%.4f\", ($count * $fsz / 1048576.0) / $total_sec}")
+  echo "$total_sec $fps $lat_ms $throughput"
+)
 
-  # build batch: N put commands in one session
-  : > "$batchfile"
-  for i in $(seq 1 "$count"); do
-    echo "put $file $remote_dir/f_${i}" >> "$batchfile"
+bench_sftp_get_batch() (
+  local file=$1 count=$2 fsz=$3 remote_dir i
+  local local_dir="$BENCH_ROOT/sftp_got" t0 t1
+  mkdir -p "$local_dir" || return
+  prepare_sftp_scratch || return
+  for ((i = 1; i <= count; i++)); do
+    printf 'put "%s" %s/f_%d\n' "$file" "$remote_dir" "$i"
+  done | sftp_batch >/dev/null || return
+
+  t0=$(now_ns)
+  for ((i = 1; i <= count; i++)); do
+    printf 'get %s/f_%d "%s/f_%d"\n' "$remote_dir" "$i" "$local_dir" "$i"
+  done | sftp_batch >/dev/null || return
+  t1=$(now_ns)
+  for ((i = 1; i <= count; i++)); do
+    cmp -s "$file" "$local_dir/f_$i" || return
   done
-
-  local t0 t1
-  t0=$(now_ns)
-  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
-  t1=$(now_ns)
-
-  # cleanup remote
-  : > "$batchfile"
-  for i in $(seq 1 "$count"); do echo "rm $remote_dir/f_${i}" >> "$batchfile"; done
-  echo "rmdir $remote_dir" >> "$batchfile"
-  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1 || true
-
-  local total_sec fps lat_ms throughput
-  total_sec=$(awk "BEGIN {printf \"%.4f\", ($t1 - $t0) / 1e9}")
-  fps=$(awk       "BEGIN {printf \"%.4f\", $count / $total_sec}")
-  lat_ms=$(awk    "BEGIN {printf \"%.2f\",  $total_sec * 1000 / $count}")
-  throughput=$(awk "BEGIN {printf \"%.4f\", ($count * $fsz / 1048576.0) / $total_sec}")
-  echo "$total_sec $fps $lat_ms $throughput"
-}
-
-bench_sftp_get_batch() {
-  local file=$1 count=$2 fsz=$3
-  local remote_dir="/tmp/sftp_iops_src_$$"
-  local batchfile="$BENCH_ROOT/sftp_get_batch.txt"
-  local local_dir="$BENCH_ROOT/sftp_got"
-  mkdir -p "$local_dir"
-
-  # upload all files first (setup)
-  printf "mkdir %s\n" "$remote_dir" \
-    | sftp "${SFTP_OPTS[@]}" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1 || true
-  : > "$batchfile"
-  for i in $(seq 1 "$count"); do echo "put $file $remote_dir/f_${i}" >> "$batchfile"; done
-  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
-
-  # time the batch GET in one session
-  : > "$batchfile"
-  for i in $(seq 1 "$count"); do echo "get $remote_dir/f_${i} $local_dir/f_${i}" >> "$batchfile"; done
-
-  local t0 t1
-  t0=$(now_ns)
-  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null || return
-  t1=$(now_ns)
-
   rm -rf "$local_dir"
-  # cleanup remote
-  : > "$batchfile"
-  for i in $(seq 1 "$count"); do echo "rm $remote_dir/f_${i}" >> "$batchfile"; done
-  echo "rmdir $remote_dir" >> "$batchfile"
-  sftp "${SFTP_OPTS[@]}" -b "$batchfile" "$SFTP_USER@$SFTP_HOST" >/dev/null 2>&1 || true
-
-  local total_sec fps lat_ms throughput
+  local total_sec
   total_sec=$(awk "BEGIN {printf \"%.4f\", ($t1 - $t0) / 1e9}")
-  fps=$(awk       "BEGIN {printf \"%.4f\", $count / $total_sec}")
-  lat_ms=$(awk    "BEGIN {printf \"%.2f\",  $total_sec * 1000 / $count}")
-  throughput=$(awk "BEGIN {printf \"%.4f\", ($count * $fsz / 1048576.0) / $total_sec}")
-  echo "$total_sec $fps $lat_ms $throughput"
-}
+  awk "BEGIN {fps=$count/$total_sec; lat=$total_sec*1000/$count; tput=$count*$fsz/1048576.0/$total_sec; printf \"%.4f %.4f %.2f %.4f\", $total_sec, fps, lat, tput}"
+)
 
 # ---- Header ----
 echo ""

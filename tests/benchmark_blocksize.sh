@@ -19,6 +19,8 @@ SERVER_BIN="${NASFS_SERVER_BIN:-$ROOT_DIR/build/nasfs_server}"
 CLIENT_BIN="${NASFS_CLIENT_BIN:-$ROOT_DIR/build/nasfs_client}"
 # shellcheck source-path=SCRIPTDIR
 source "$SCRIPT_DIR/integration_helpers.sh"
+# shellcheck source-path=SCRIPTDIR
+source "$SCRIPT_DIR/benchmark_sftp.sh"
 
 SFTP_HOST="localhost"
 SFTP_USER="${USER:-$(id -un)}"
@@ -57,7 +59,7 @@ if command -v taskset >/dev/null && affinity=$(taskset -pc "$$" 2>/dev/null); th
   THROTTLE=(taskset -c "${affinity%%[-,]*}" "${THROTTLE[@]}")
 fi
 
-SFTP_OPTS=(-P "$SFTP_PORT" -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10)
+SFTP_OPTS=(-P "$SFTP_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10)
 [[ -n "$SFTP_KEY" ]] && SFTP_OPTS+=(-i "$SFTP_KEY")
 
 benchmark_home=${HOME:-}
@@ -153,42 +155,32 @@ run_nasfs_get() {
   awk "BEGIN {printf \"%.4f\", ($fsz / 1048576.0) / (($t1 - $t0) / 1e9)}"
 }
 
-sftp_batch() {
-  sftp "${SFTP_OPTS[@]}" -b - "$SFTP_USER@$SFTP_HOST"
-}
-
-run_sftp_put() {
-  local file=$1 sz remote_dir="/tmp/sftp_bench_$$"
+run_sftp_put() (
+  local file=$1 sz remote_dir count=1 t0 t1
   sz=$(wc -c < "$file" | tr -d ' ')
-  printf 'mkdir %s\n' "$remote_dir" | sftp_batch >/dev/null || return
-  local t0 t1 status=0
+  prepare_sftp_scratch || return
   t0=$(now_ns)
-  printf 'put "%s" %s/f\n' "$file" "$remote_dir" \
-    | sftp_batch >/dev/null || status=$?
+  printf 'put "%s" %s/f_1\n' "$file" "$remote_dir" \
+    | sftp_batch >/dev/null || return
   t1=$(now_ns)
-  printf -- '-rm %s/f\nrmdir %s\n' "$remote_dir" "$remote_dir" \
-    | sftp_batch >/dev/null 2>&1 || true
-  (( status == 0 )) || return "$status"
   awk "BEGIN {printf \"%.4f\", ($sz / 1048576.0) / (($t1 - $t0) / 1e9)}"
-}
+)
 
-run_sftp_get() {
-  local file=$1 sz remote_path="/tmp/sftp_src_$$"
+run_sftp_get() (
+  local file=$1 sz remote_dir count=1 t0 t1
+  local local_out="$BENCH_ROOT/sftp_got.bin"
   sz=$(wc -c < "$file" | tr -d ' ')
-  local t0 t1 local_out="$BENCH_ROOT/sftp_got_$$.bin" status=0
-  if printf 'put "%s" %s\n' "$file" "$remote_path" | sftp_batch >/dev/null; then
-    t0=$(now_ns)
-    printf 'get %s "%s"\n' "$remote_path" "$local_out" \
-      | sftp_batch >/dev/null || status=$?
-    t1=$(now_ns)
-  else
-    status=$?
-  fi
-  printf 'rm %s\n' "$remote_path" | sftp_batch >/dev/null 2>&1 || true
+  prepare_sftp_scratch || return
+  printf 'put "%s" %s/f_1\n' "$file" "$remote_dir" \
+    | sftp_batch >/dev/null || return
+  t0=$(now_ns)
+  printf 'get %s/f_1 "%s"\n' "$remote_dir" "$local_out" \
+    | sftp_batch >/dev/null || return
+  t1=$(now_ns)
+  cmp -s "$file" "$local_out" || return
   rm -f "$local_out"
-  (( status == 0 )) || return "$status"
   awk "BEGIN {printf \"%.4f\", ($sz / 1048576.0) / (($t1 - $t0) / 1e9)}"
-}
+)
 
 # ---- Pre-generate test files ----
 for fsz in "${FILE_SIZES[@]}"; do
