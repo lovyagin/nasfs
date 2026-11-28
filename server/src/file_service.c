@@ -231,7 +231,8 @@ static void put_data(client_session_t* session, const nasfs_frame_t* frame) {
   files->has_expected = 0;
   if (files->resumable) {
     files->checkpoint_bytes += ctx->buf.len;
-    if (files->checkpoint_bytes >= 16u * 1024u * 1024u)
+    if (files->checkpoint_bytes >= 16u * 1024u * 1024u ||
+        uv_now(session->handle.loop) - files->checkpoint_at >= 1000)
       submit_checkpoint(session);
   }
 }

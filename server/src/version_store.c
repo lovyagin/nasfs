@@ -329,7 +329,7 @@ int nasfs_version_stage(nasfs_version_store_t* store,
     int fd = openat(store->directory, candidate,
                     O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd >= 0) {
-      strcpy(name, candidate);
+      memcpy(name, candidate, sizeof(staging_prefix) + 32u);
       return fd;
     }
     if (errno != EEXIST) return uv_translate_sys_error(errno);
