@@ -258,7 +258,7 @@ static void show_client_event(void* data, nasfs_client_event_t event,
     sodium_bin2hex(digest, sizeof(digest), result->version.digest,
                    sizeof(result->version.digest));
     if (uploading) {
-      printf("Upload published. Manifest digest: %s\n", digest);
+      printf("\nUpload published. Manifest digest: %s\n", digest);
     } else if (request->operation == NASFS_CLIENT_GET) {
       printf("\nDownload complete.\n");
     } else if (request->operation == NASFS_CLIENT_RESOLVE) {
