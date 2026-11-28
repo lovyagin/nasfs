@@ -200,10 +200,15 @@ assert output.read_bytes() == first.read_bytes()
 get_journal = ROOT / "download.checkpoint"
 download_args = ["get-resume", str(get_journal), *committed, str(output)]
 previous = output.read_bytes()
+def await_download_checkpoint():
+    deadline = time.monotonic() + 5
+    while not get_journal.exists() or get_journal.stat().st_size <= 328:
+        assert time.monotonic() < deadline, "GET journal has no verified rows"
+        time.sleep(0.02)
+
 interrupt_transfer(CLIENT, download_args, PORT, "get", GET_DATA,
-                   signal.SIGTERM, occurrence=5)
+                   signal.SIGTERM, occurrence=5, on_pause=await_download_checkpoint)
 assert output.read_bytes() == previous
-assert get_journal.stat().st_size > 328
 result = run(*download_args)
 assert b"Restored verified download prefix" in result.stdout, result.stdout
 assert output.read_bytes() == expected_bytes

@@ -212,6 +212,10 @@ int nasfs_version_store_open(nasfs_version_store_t* store, const char* root,
     rc = UV_EIO;
     goto cleanup;
   }
+  if (sqlite3_busy_timeout(store->catalog, 5000) != SQLITE_OK) {
+    rc = UV_EIO;
+    goto cleanup;
+  }
   rc = db_run(
       store->catalog,
       "PRAGMA synchronous=FULL;"
