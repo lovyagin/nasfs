@@ -104,7 +104,6 @@ AuthMethods password
 AuthPassword nasfs
 BlockSize 65536
 EOF
-  rm -f "$STORAGE_DIR"/*
   : > "$LOG_DIR/server.log"
   start_integration_server "$BENCH_ROOT/server.conf" "${THROTTLE[@]}"
 }
@@ -131,13 +130,12 @@ nasfs_env() {
 
 # N serial PUTs (one connection per file)
 bench_nasfs_serial_put() {
-  local fsz=$1 count=$2
+  local fsz=$1 count=$2 run_number=$3
   local tfile="$BENCH_ROOT/src_${fsz}.bin"
-  rm -f "$STORAGE_DIR"/*
   local t0 t1
   t0=$(now_ns)
   for i in $(seq 1 "$count"); do
-    nasfs_env put "$tfile" "iops_${i}_$$.bin" || return
+    nasfs_env put "$tfile" "iops_serial_${fsz}_${run_number}_${i}.bin" || return
   done
   t1=$(now_ns)
   local total_sec
@@ -147,12 +145,12 @@ bench_nasfs_serial_put() {
 
 # N serial GETs (one connection per file)
 bench_nasfs_serial_get() {
-  local fsz=$1 count=$2
+  local fsz=$1 count=$2 run_number=$3
   local out="$BENCH_ROOT/got_$$.bin"
   local t0 t1
   t0=$(now_ns)
   for i in $(seq 1 "$count"); do
-    nasfs_env get "iops_${i}_$$.bin" "$out" || return
+    nasfs_env get "iops_serial_${fsz}_${run_number}_${i}.bin" "$out" || return
     rm -f "$out"
   done
   t1=$(now_ns)
@@ -163,17 +161,16 @@ bench_nasfs_serial_get() {
 
 # N files in ONE session via mput (batch)
 bench_nasfs_batch_put() {
-  local fsz=$1 count=$2
+  local fsz=$1 count=$2 run_number=$3
   local tfile="$BENCH_ROOT/src_${fsz}.bin"
-  rm -f "$STORAGE_DIR"/*
   # Symlinks give each upload a distinct destination basename.
   local ldir="$BENCH_ROOT/mput_src_$$"
   mkdir -p "$ldir"
   for i in $(seq 1 "$count"); do
-    ln -sf "$tfile" "$ldir/iops_${i}_$$.bin"
+    ln -sf "$tfile" "$ldir/iops_batch_${fsz}_${run_number}_${i}.bin"
   done
   local largs=()
-  for i in $(seq 1 "$count"); do largs+=("$ldir/iops_${i}_$$.bin"); done
+  for i in $(seq 1 "$count"); do largs+=("$ldir/iops_batch_${fsz}_${run_number}_${i}.bin"); done
 
   local t0 t1
   t0=$(now_ns)
@@ -187,11 +184,11 @@ bench_nasfs_batch_put() {
 
 # N files in ONE session via mget (batch)
 bench_nasfs_batch_get() {
-  local fsz=$1 count=$2
+  local fsz=$1 count=$2 run_number=$3
   local ldir="$BENCH_ROOT/mget_dst_$$"
   mkdir -p "$ldir"
   local remotes=()
-  for i in $(seq 1 "$count"); do remotes+=("iops_${i}_$$.bin"); done
+  for i in $(seq 1 "$count"); do remotes+=("iops_batch_${fsz}_${run_number}_${i}.bin"); done
   local t0 t1
   # mget downloads each remote to cwd basename; cd to ldir
   t0=$(now_ns)
@@ -281,7 +278,7 @@ for fidx in "${!FILE_SIZES[@]}"; do
   # --- serial PUT ---
   ser_put_fps=(); ser_put_lat=()
   for run in $(seq 1 "$RUNS"); do
-    measurement=$(bench_nasfs_serial_put "$fsz" "$COUNT")
+    measurement=$(bench_nasfs_serial_put "$fsz" "$COUNT" "$run")
     read -r total fps lat tput <<< "$measurement"
     ser_put_fps+=("$fps"); ser_put_lat+=("$lat")
     echo "nasfs_serial,${fsz},put,${run},${COUNT},${total},${fps},${lat},${tput}" >> "$CSV"
@@ -292,7 +289,7 @@ for fidx in "${!FILE_SIZES[@]}"; do
   # --- batch PUT (mput) ---
   bat_put_fps=(); bat_put_lat=()
   for run in $(seq 1 "$RUNS"); do
-    measurement=$(bench_nasfs_batch_put "$fsz" "$COUNT")
+    measurement=$(bench_nasfs_batch_put "$fsz" "$COUNT" "$run")
     read -r total fps lat tput <<< "$measurement"
     bat_put_fps+=("$fps"); bat_put_lat+=("$lat")
     echo "nasfs_batch,${fsz},put,${run},${COUNT},${total},${fps},${lat},${tput}" >> "$CSV"
@@ -307,7 +304,7 @@ for fidx in "${!FILE_SIZES[@]}"; do
   # --- serial GET ---
   ser_get_fps=(); ser_get_lat=()
   for run in $(seq 1 "$RUNS"); do
-    measurement=$(bench_nasfs_serial_get "$fsz" "$COUNT")
+    measurement=$(bench_nasfs_serial_get "$fsz" "$COUNT" "$run")
     read -r total fps lat tput <<< "$measurement"
     ser_get_fps+=("$fps"); ser_get_lat+=("$lat")
     echo "nasfs_serial,${fsz},get,${run},${COUNT},${total},${fps},${lat},${tput}" >> "$CSV"
@@ -318,7 +315,7 @@ for fidx in "${!FILE_SIZES[@]}"; do
   # --- batch GET (mget) ---
   bat_get_fps=(); bat_get_lat=()
   for run in $(seq 1 "$RUNS"); do
-    measurement=$(bench_nasfs_batch_get "$fsz" "$COUNT")
+    measurement=$(bench_nasfs_batch_get "$fsz" "$COUNT" "$run")
     read -r total fps lat tput <<< "$measurement"
     bat_get_fps+=("$fps"); bat_get_lat+=("$lat")
     echo "nasfs_batch,${fsz},get,${run},${COUNT},${total},${fps},${lat},${tput}" >> "$CSV"

@@ -102,13 +102,13 @@ LogLevel Info
 DaemonMode No
 PidFile $BENCH_ROOT/server.pid
 StorageDir $STORAGE_DIR
+VersionRetentionSeconds 0
 KexAlgorithms ML-KEM-512
 CipherAlgorithms xchacha20poly1305
 AuthMethods password
 AuthPassword nasfs
 BlockSize $block_size
 EOF
-  rm -f "$STORAGE_DIR"/*
   : > "$LOG_DIR/server.log"
   start_integration_server "$BENCH_ROOT/server.conf" "${THROTTLE[@]}"
 }
@@ -226,7 +226,6 @@ for cidx in "${!CIPHERS[@]}"; do
 
       puts=(); gets=()
       for run in $(seq 1 "$RUNS"); do
-        rm -f "$STORAGE_DIR"/bench_*.bin
         p=$(run_nasfs_put "$cipher" "$bs" "$tfile")
         g=$(run_nasfs_get "$cipher" "$bs" "$fsz")
         puts+=("$p"); gets+=("$g")
@@ -243,6 +242,8 @@ for cidx in "${!CIPHERS[@]}"; do
       printf "  %s MB/s  %s MB/s" "$(fmt "$mp")" "$(fmt "$mg")"
     done
     printf "\n"
+    NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=nasfs \
+      NASFS_KEX_ALGORITHMS=ML-KEM-512 "$CLIENT_BIN" collect >/dev/null
     stop_integration_server
   done
   echo ""
