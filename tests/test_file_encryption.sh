@@ -201,7 +201,7 @@ result = subprocess.run([client, "get", remote, str(destination)],
                         capture_output=True, timeout=10)
 assert result.returncode == 1 and b"Local file close failed" in result.stderr, result.stderr
 assert destination.read_bytes() == b"Previous destination"
-assert not list(root.glob(".nasfs-download.*"))
+assert not list(root.glob(".nasfs-client.*/.nasfs-download.*"))
 
 # The file is visible immediately after rename, even if the process never
 # reports success. A subsequent regular GET still reads the same bytes.
@@ -211,7 +211,7 @@ result = subprocess.run([client, "get", remote, str(destination)],
                         capture_output=True, timeout=10)
 assert result.returncode == -signal.SIGKILL, result.stderr
 assert destination.read_bytes() == source.read_bytes()
-assert not list(root.glob(".nasfs-download.*"))
+assert not list(root.glob(".nasfs-client.*/.nasfs-download.*"))
 subprocess.run([client, "get", remote, str(destination)], check=True,
                capture_output=True, timeout=10)
 assert destination.read_bytes() == source.read_bytes()
@@ -394,7 +394,7 @@ fi
 
 grep -Fq "Cannot open NASLUKS owner slot" "$LOG_DIR/client_get_incorrect.log"
 test "$(hash_file "$TEST_OUTPUT_INCORRECT")" = "$PREVIOUS_HASH"
-if compgen -G "$TEST_ROOT/.nasfs-download.*" > /dev/null; then
+if compgen -G "$TEST_ROOT/.nasfs-client.*/.nasfs-download.*" > /dev/null; then
     printf "Temporary download was not removed.\n" >&2
     exit 1
 fi
@@ -435,7 +435,7 @@ result = subprocess.run([client, "get", "encrypted_remote.bin", output],
 assert result.returncode == 1, result.stderr
 assert b"Failed to write downloaded data: short write" in result.stderr, result.stderr
 assert destination.read_bytes() == previous
-assert not list(destination.parent.glob(".nasfs-download.*"))
+assert not list(destination.parent.glob(".nasfs-client.*/.nasfs-download.*"))
 PYTHON
 
 # Write with 4 KiB records, then read both formats with the configured
@@ -572,7 +572,7 @@ while IFS=: read -r variant expected; do
     fi
     grep -Fq "$expected" "$LOG_DIR/$variant.log"
     cmp "$TEST_ROOT/record-expected" "$TEST_ROOT/record-destination"
-    test -z "$(find "$TEST_ROOT" -maxdepth 1 -name '.nasfs-download.*' -print)"
+    test -z "$(find "$TEST_ROOT" -maxdepth 2 -name '.nasfs-download.*' -print)"
 done <<'VARIANTS'
 missing-record:Integrity error
 repeated-record:Decryption failed
@@ -593,7 +593,7 @@ if transfer get truncated.bin "$TEST_ROOT/keep.bin" > "$LOG_DIR/truncated.log" 2
     exit 1
 fi
 cmp "$TEST_ROOT/expected-keep" "$TEST_ROOT/keep.bin"
-test -z "$(find "$TEST_ROOT" -maxdepth 1 -name '.nasfs-download.*' -print)"
+test -z "$(find "$TEST_ROOT" -maxdepth 2 -name '.nasfs-download.*' -print)"
 
 # Exercise cancellation, loss of the final PUT response and server SIGINT.
 NASFS_KEX_ALGORITHMS=ML-KEM-512 NASFS_AUTH_METHOD=password NASFS_AUTH_PASSWORD=super-secret \
@@ -614,12 +614,20 @@ crash_server_during_put() {
     wait "$SERVER_PID" 2>/dev/null || wait_status=$?
     test "$wait_status" -eq 137
     SERVER_PID=
+    if [[ $checkpoint == crash-before ]]; then
+        # Model a create-only PUT interrupted after linkat and before cleanup.
+        ln "$SERVER_STORED_FILE" "$linked_orphan"
+    fi
     rm "$LOG_DIR/server.log"
     start_integration_server "$TEST_ROOT/server-restarted.conf"
     transfer get encrypted_remote.bin "$TEST_ROOT/crash-recovery.bin"
 }
 
+# Model a create-only publisher that stopped after linkat and before cleanup.
+# Two restarts must preserve the already published object and remove its staging link.
+linked_orphan="$staging_dir/.nasfs-upload.11111111111111111111111111111111"
 crash_server_during_put crash-before
+test ! -e "$linked_orphan"
 cmp "$TEST_INPUT" "$TEST_ROOT/crash-recovery.bin"
 # The crash test checks for staging before restart. Recovery removes it.
 test -z "$(find "$staging_dir" -maxdepth 1 -name '.nasfs-upload.*' -print)"
@@ -646,6 +654,7 @@ test -f "$staging_dir/.nasfs-publish.lock"
 test ! -e "$TEST_ROOT/service-get.bin"
 
 crash_server_during_put crash-after
+test ! -e "$linked_orphan"
 cmp "$TEST_ROOT/replacement.bin" "$TEST_ROOT/crash-recovery.bin"
 transfer put "$TEST_INPUT" encrypted_remote.bin
 
@@ -763,7 +772,7 @@ os.execve(server, [server, *sys.argv[1:]], env)
 PYTHON
     chmod +x "$TEST_ROOT/fault-server"
     readonly_orphan=.nasfs-upload.00000000000000000000000000000000
-    printf 'abandoned staging file\n' > "$staging_dir/$readonly_orphan"
+    (umask 077; printf 'abandoned staging file\n' > "$staging_dir/$readonly_orphan")
     NASFS_TEST_READONLY_ORPHAN="$readonly_orphan" SERVER_BIN="$TEST_ROOT/fault-server" \
         start_integration_server "$TEST_ROOT/server-restarted.conf"
     cp "$TEST_ROOT/rotated.pub" "$HOME/.nasfs/server-127.0.0.1-$NASFS_SERVER_PORT.pub"
@@ -951,7 +960,7 @@ PYTHON
         rm -f "$TEST_ROOT/release-rename"
         if [[ $lock_mode == all ]]; then
             scenario=publication-without-lock
-            touch "$staging_dir/.nasfs-upload.00000000000000000000000000000000"
+            (umask 077; touch "$staging_dir/.nasfs-upload.00000000000000000000000000000000")
         fi
         NASFS_TEST_DIRECTORY_LOCK_ERROR="$lock_mode" \
             NASFS_TEST_RENAME_GATE="$TEST_ROOT/release-rename" SERVER_BIN="$TEST_ROOT/fault-server" \

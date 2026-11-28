@@ -341,7 +341,7 @@ def main():
             assert (output / names[0]).read_bytes() == source.read_bytes()
             for name in names[1:]:
                 assert (output / name).read_bytes() == b"Previous destination"
-            await_cleanup(output, ".nasfs-download.*")
+            await_cleanup(output, ".nasfs-client.*/.nasfs-download.*")
             return
         stop_prefix = "stop-during-"
         opening_io = mode[0][len(stop_prefix):] if mode[0].startswith(stop_prefix) else ""
@@ -391,7 +391,7 @@ def main():
             assert (storage / remote).read_bytes() == previous
             if reading:
                 assert destination.read_bytes() == b"Previous destination"
-                assert not list(root.glob(".nasfs-download.*"))
+                assert not list(root.glob(".nasfs-client.*/.nasfs-download.*"))
             return
         if mode in (["cancel-full-queue"], ["stop-full-queue"], ["timeout-full-queue"]):
             stop_server = mode == ["stop-full-queue"]
@@ -494,7 +494,7 @@ def main():
     for command in (GET_ACK, GET_DATA, GET_DONE):
         interrupt_transfer(client, get, upstream_port, "get", command,
                            signal.SIGTERM)
-        await_cleanup(root, ".nasfs-download.*")
+        await_cleanup(root, ".nasfs-client.*/.nasfs-download.*")
         assert destination.read_bytes() == b"Previous destination"
 
     for change in ("move", "retarget", "cancel-after-move"):
@@ -511,7 +511,7 @@ def main():
             parent = original
 
         def change_parent():
-            assert list(original.glob(".nasfs-download.*")), change
+            assert list(original.glob(".nasfs-client.*/.nasfs-download.*")), change
             if change == "retarget":
                 parent.unlink()
                 parent.symlink_to(substitute, target_is_directory=True)
@@ -531,8 +531,8 @@ def main():
         assert (expected_parent / "local.bin").read_bytes() == b"Previous destination"
         unexpected_parent = substitute if change == "retarget" else original
         assert not (unexpected_parent / "local.bin").exists()
-        await_cleanup(expected_parent, ".nasfs-download.*")
-        await_cleanup(unexpected_parent, ".nasfs-download.*")
+        await_cleanup(expected_parent, ".nasfs-client.*/.nasfs-download.*")
+        await_cleanup(unexpected_parent, ".nasfs-client.*/.nasfs-download.*")
 
     for initially_present in (False, True):
         target = root / f"changed-during-download-{initially_present}.bin"
@@ -545,11 +545,27 @@ def main():
                                     before_forward=lambda: other.replace(target))
         assert b"Cannot publish download" in stderr, stderr
         assert target.read_bytes() == b"Replacement from another writer"
-        await_cleanup(root, ".nasfs-download.*")
+        await_cleanup(root, ".nasfs-client.*/.nasfs-download.*")
+
+    target = root / "updated-in-place.bin"
+    target.write_bytes(b"original")
+    initial = target.stat()
+
+    def update_in_place():
+        target.write_bytes(b"modified")
+        os.utime(target, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+        assert target.stat().st_ino == initial.st_ino
+
+    stderr = interrupt_transfer(client, ["get", remote, str(target)],
+                                upstream_port, "get", GET_DONE, None,
+                                before_forward=update_in_place)
+    assert b"destination changed during transfer" in stderr, stderr
+    assert target.read_bytes() == b"modified"
+    await_cleanup(root, ".nasfs-client.*/.nasfs-download.*")
 
     interrupt_transfer(client, get, upstream_port, "get", GET_DONE, signal.SIGKILL)
     assert destination.read_bytes() == b"Previous destination"
-    orphans = list(root.glob(".nasfs-download.*"))
+    orphans = list(root.glob(".nasfs-client.*/.nasfs-download.*"))
     assert len(orphans) == 1, orphans
     subprocess.run([client, *get], check=True, stdout=subprocess.DEVNULL, timeout=10)
     assert destination.read_bytes() == source.read_bytes()
@@ -590,7 +606,7 @@ def main():
         interrupt_transfer(client, ["mget", *(path.name for path in batch)],
                            upstream_port, "get", GET_DONE, signal.SIGINT,
                            occurrence=cancelled + 1, cwd=output)
-        await_cleanup(output, ".nasfs-download.*")
+        await_cleanup(output, ".nasfs-client.*/.nasfs-download.*")
         for index, path in enumerate(batch):
             expected = path.read_bytes() if index < cancelled else b"Previous contents"
             assert (output / path.name).read_bytes() == expected

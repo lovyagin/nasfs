@@ -62,8 +62,11 @@ static int sweep_uploads(int root) {
 
     struct stat st;
     if (fstatat(root, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
-      if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1)
+      if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+          (st.st_mode & 077u) != 0)
         continue;
+      // A completed create-only PUT can still have this staging link. The
+      // exclusive lifetime lock rules out active uploads using these names.
       if (unlinkat(root, name, 0) == 0) continue;
     }
     if (errno != ENOENT && rc == 0) rc = uv_translate_sys_error(errno);

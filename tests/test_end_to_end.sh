@@ -285,7 +285,7 @@ test "$(cat "$TEST_DIR/get_protected")" = 'Existing destination'
 test -p "$TEST_DIR/get_fifo"
 test -L "$TEST_DIR/get_symlink"
 test "$(readlink "$TEST_DIR/get_symlink")" = get_protected
-if compgen -G "$TEST_DIR/.nasfs-download.*" > /dev/null; then
+if compgen -G "$TEST_DIR/.nasfs-client.*/.nasfs-download.*" > /dev/null; then
     printf "Temporary download was not removed.\n" >&2
     exit 1
 fi

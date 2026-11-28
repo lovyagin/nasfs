@@ -31,6 +31,10 @@
 #include <unistd.h>
 #include <uv.h>
 
+#ifdef __APPLE__
+#include <sys/acl.h>
+#endif
+
 #include "auth.h"
 #include "crypto_engine.h"
 #include "defaults.h"
@@ -224,6 +228,9 @@ const char* local_filename = NULL;
 const char* remote_filename = NULL;
 uv_file local_fd = -1;
 static int download_directory = -1;
+static int download_staging = -1;
+static char download_staging_name[64];
+static const char download_lock_name[] = ".publish.lock";
 static char* download_parent;
 static char download_temp_name[sizeof(".nasfs-download.") + 32];
 static const char* download_name;
@@ -883,16 +890,20 @@ static int close_local_file(void) {
 }
 
 static void discard_download(void) {
-  if (download_directory >= 0) {
+  if (download_staging >= 0) {
     if (download_temp_name[0] &&
-        unlinkat(download_directory, download_temp_name, 0) < 0 &&
+        unlinkat(download_staging, download_temp_name, 0) < 0 &&
         errno != ENOENT) {
       fprintf(stderr, "Cannot remove temporary download '%s': %s\n",
               download_temp_name, strerror(errno));
     }
+    close(download_staging);
+    download_staging = -1;
+    download_temp_name[0] = '\0';
+  }
+  if (download_directory >= 0) {
     close(download_directory);
     download_directory = -1;
-    download_temp_name[0] = '\0';
   }
   free(download_parent);
   download_parent = NULL;
@@ -920,7 +931,44 @@ static int prepare_download(void) {
   return 0;
 }
 
+static int private_download_entry(int fd, const struct stat* st) {
+  if (st->st_uid != geteuid() || (st->st_mode & 077u) != 0) return 0;
+#ifdef __APPLE__
+  acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+  if (!acl) return errno == ENOENT;
+  acl_entry_t entry;
+  int rc = acl_get_entry(acl, ACL_FIRST_ENTRY, &entry);
+  int empty = rc < 0 && errno == EINVAL;
+  acl_free(acl);
+  return empty;
+#else
+  (void)fd;
+  return 1;
+#endif
+}
+
+static int open_download_staging(void) {
+  struct stat parent, staging;
+  snprintf(download_staging_name, sizeof(download_staging_name),
+           ".nasfs-client.%lu", (unsigned long)geteuid());
+  if (mkdirat(download_directory, download_staging_name, 0700) < 0 &&
+      errno != EEXIST)
+    return -1;
+  download_staging = openat(download_directory, download_staging_name,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (download_staging < 0 || fstat(download_directory, &parent) < 0 ||
+      fstat(download_staging, &staging) < 0)
+    return -1;
+  if (parent.st_dev != staging.st_dev ||
+      !private_download_entry(download_staging, &staging)) {
+    errno = EACCES;
+    return -1;
+  }
+  return 0;
+}
+
 static int open_download_file(void) {
+  if (open_download_staging() < 0) return -1;
   static const char prefix[] = ".nasfs-download.";
   char candidate[sizeof(download_temp_name)] = ".nasfs-download.";
   for (int attempt = 0; attempt < 8; attempt++) {
@@ -929,7 +977,7 @@ static int open_download_file(void) {
     sodium_bin2hex(candidate + sizeof(prefix) - 1,
                    sizeof(candidate) - sizeof(prefix) + 1, random_id,
                    sizeof(random_id));
-    int fd = openat(download_directory, candidate,
+    int fd = openat(download_staging, candidate,
                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd >= 0) {
       memcpy(download_temp_name, candidate, sizeof(candidate));
@@ -944,6 +992,27 @@ static int open_download_file(void) {
 static int same_download_entry(const struct stat* first,
                                const struct stat* second) {
   return first->st_dev == second->st_dev && first->st_ino == second->st_ino;
+}
+
+static int same_download_snapshot(const struct stat* first,
+                                  const struct stat* second) {
+#ifdef __APPLE__
+  const struct timespec mtime1 = first->st_mtimespec;
+  const struct timespec mtime2 = second->st_mtimespec;
+  const struct timespec ctime1 = first->st_ctimespec;
+  const struct timespec ctime2 = second->st_ctimespec;
+#else
+  const struct timespec mtime1 = first->st_mtim;
+  const struct timespec mtime2 = second->st_mtim;
+  const struct timespec ctime1 = first->st_ctim;
+  const struct timespec ctime2 = second->st_ctim;
+#endif
+  return same_download_entry(first, second) &&
+         first->st_size == second->st_size &&
+         first->st_mode == second->st_mode && first->st_uid == second->st_uid &&
+         first->st_gid == second->st_gid && mtime1.tv_sec == mtime2.tv_sec &&
+         mtime1.tv_nsec == mtime2.tv_nsec && ctime1.tv_sec == ctime2.tv_sec &&
+         ctime1.tv_nsec == ctime2.tv_nsec;
 }
 
 static int check_download_parent(void) {
@@ -962,17 +1031,10 @@ static int replace_download(void) {
   struct stat destination;
   if (fstatat(download_directory, download_name, &destination,
               AT_SYMLINK_NOFOLLOW) < 0) {
-    if (errno != ENOENT) return -1;
-    if (download_had_destination) {
-      errno = EAGAIN;
-      return -1;
-    }
-    // If the name is created concurrently, leave that new entry intact.
-    return linkat(download_directory, download_temp_name, download_directory,
-                  download_name, 0);
+    if (errno == ENOENT) errno = EAGAIN;
+    return -1;
   }
-  if (!download_had_destination ||
-      !same_download_entry(&destination, &download_initial_destination)) {
+  if (!same_download_snapshot(&destination, &download_initial_destination)) {
     errno = EAGAIN;
     return -1;
   }
@@ -1001,31 +1063,72 @@ static int replace_download(void) {
   if (fstatat(download_directory, download_name, &current,
               AT_SYMLINK_NOFOLLOW) < 0)
     return -1;
-  if (!same_download_entry(&destination, &current) ||
-      destination.st_mode != current.st_mode ||
-      destination.st_uid != current.st_uid ||
-      destination.st_gid != current.st_gid) {
+  if (!same_download_snapshot(&download_initial_destination, &current)) {
     errno = EAGAIN;
     return -1;
   }
-  if (renameat(download_directory, download_temp_name, download_directory,
+  if (renameat(download_staging, download_temp_name, download_directory,
                download_name) < 0)
     return -1;
   download_temp_name[0] = '\0';
   return 0;
 }
 
+static int lock_download_replacement(void) {
+  int lock =
+      openat(download_staging, download_lock_name,
+             O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+  if (lock < 0) return -1;
+  struct stat opened, named, staging, named_staging;
+  int error = EACCES;
+  if (fstat(lock, &opened) == 0 && S_ISREG(opened.st_mode) &&
+      opened.st_nlink == 1 && private_download_entry(lock, &opened)) {
+    if (flock(lock, LOCK_EX) < 0) {
+      error = errno;
+    } else if (fstatat(download_staging, download_lock_name, &named,
+                       AT_SYMLINK_NOFOLLOW) == 0 &&
+               same_download_entry(&opened, &named) &&
+               fstat(download_staging, &staging) == 0 &&
+               fstatat(download_directory, download_staging_name,
+                       &named_staging, AT_SYMLINK_NOFOLLOW) == 0 &&
+               same_download_entry(&staging, &named_staging)) {
+      return lock;
+    }
+  }
+  close(lock);
+  errno = error;
+  return -1;
+}
+
 static int publish_download(void) {
-  if (close_local_file() < 0) return -1;
-  // Serialize NASFS publishers in this directory. POSIX renameat cannot
-  // compare the target against an inode when other writers ignore the lock.
-  if (flock(download_directory, LOCK_EX) < 0) {
-    fprintf(stderr, "Cannot lock download directory '%s': %s\n",
-            download_parent, strerror(errno));
+  struct stat downloaded, named;
+  if (fstat(local_fd, &downloaded) < 0 ||
+      fstatat(download_staging, download_temp_name, &named,
+              AT_SYMLINK_NOFOLLOW) < 0 ||
+      !same_download_snapshot(&downloaded, &named)) {
+    fprintf(stderr, "Download staging changed: '%s'\n", local_filename);
     return -1;
   }
-  if (check_download_parent() < 0) return -1;
-  if (replace_download() < 0) {
+  if (close_local_file() < 0 || check_download_parent() < 0) return -1;
+
+  int rc;
+  if (download_had_destination) {
+    // The lock coordinates NASFS publishers. External writers must also
+    // coordinate to avoid a race between the final check and renameat.
+    int lock = lock_download_replacement();
+    if (lock < 0) {
+      rc = -1;
+    } else {
+      rc = check_download_parent() < 0 ? -1 : replace_download();
+      int error = errno;
+      close(lock);
+      errno = error;
+    }
+  } else {
+    rc = linkat(download_staging, download_temp_name, download_directory,
+                download_name, 0);
+  }
+  if (rc < 0) {
     const char* reason = errno == EAGAIN ? "destination changed during transfer"
                                          : strerror(errno);
     fprintf(stderr, "Cannot publish download '%s': %s\n", local_filename,
@@ -1033,13 +1136,6 @@ static int publish_download(void) {
     return -1;
   }
   if (batch_count > 1) {
-    struct stat downloaded;
-    if (fstatat(download_directory, download_name, &downloaded,
-                AT_SYMLINK_NOFOLLOW) < 0) {
-      fprintf(stderr, "Cannot identify published download '%s': %s\n",
-              local_filename, strerror(errno));
-      return -1;
-    }
     published_downloads[batch_idx - 1].device = downloaded.st_dev;
     published_downloads[batch_idx - 1].inode = downloaded.st_ino;
   }
@@ -1958,9 +2054,16 @@ int main(int argc, char** argv) {
   if (env_server_ip && env_server_ip[0] != '\0') {
     client_server_ip = env_server_ip;
   }
-  if (env_server_port && env_server_port[0] != '\0') {
-    long p = strtol(env_server_port, NULL, 10);
-    if (p > 0 && p <= 65535) client_server_port = (int)p;
+  if (env_server_port) {
+    char* end;
+    errno = 0;
+    long port = strtol(env_server_port, &end, 10);
+    if (errno || *end || port < 1 || port > 65535 ||
+        strspn(env_server_port, "0123456789") != strlen(env_server_port)) {
+      fprintf(stderr, "Invalid NASFS_SERVER_PORT (expected 1–65535)\n");
+      return 1;
+    }
+    client_server_port = (int)port;
   }
 
   const char* env_file_cipher = getenv("NASFS_FILE_CIPHER");

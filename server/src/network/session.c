@@ -37,6 +37,30 @@
 #define MAX_RECV_BUFFER_SIZE (64 * 1024 * 1024)
 #define MAX_PENDING_PUT_WRITES 4
 
+static void log_authenticated_client(const nasfs_auth_payload_t* auth) {
+  static const char hex[] = "0123456789abcdef";
+  char username[256 * 4 + 4];
+  char* out = username;
+  const unsigned char* in = (const unsigned char*)auth->username;
+  for (size_t i = 0; *in && i < 256; i++, in++) {
+    unsigned char byte = *in;
+    if (byte < 0x20 || byte >= 0x7f || byte == '\\' || byte == 0x27) {
+      *out++ = '\\';
+      *out++ = 'x';
+      *out++ = hex[byte >> 4];
+      *out++ = hex[byte & 0x0f];
+    } else {
+      *out++ = (char)byte;
+    }
+  }
+  if (*in)
+    memcpy(out, "...", sizeof("..."));
+  else
+    *out = '\0';
+  log_all(LOG_INFO, "Client '%s' authenticated with %s.", username,
+          auth->method);
+}
+
 static uint8_t server_signing_key[crypto_sign_SECRETKEYBYTES];
 
 static uint8_t trusted_author[crypto_sign_PUBLICKEYBYTES];
@@ -1315,8 +1339,7 @@ static void session_dispatch_frame(client_session_t* session,
         break;
       }
 
-      log_all(LOG_INFO, "Client '%s' authenticated with %s.", auth.username,
-              auth.method);
+      log_authenticated_client(&auth);
       session->state = SESSION_STATE_AUTHENTICATED;
       session_send_frame(session, NASFS_CMD_AUTH_ACK, NULL, 0, 1);
       nasfs_auth_payload_free(&auth);
