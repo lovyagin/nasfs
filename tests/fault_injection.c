@@ -181,6 +181,12 @@ int uv_fs_write(uv_loop_t* loop, uv_fs_t* request, uv_file fd,
     uv_buf_t buffer = opening_io(buffers[0], "put-header");
     return actual(loop, request, fd, &buffer, count, offset, callback);
   }
+  if (callback && count == 1 && buffers[0].len > 1 &&
+      matches_file(fd, "NASFS_TEST_SHORT_WRITE")) {
+    uv_buf_t short_buffer = buffers[0];
+    short_buffer.len--;
+    return actual(loop, request, fd, &short_buffer, count, offset, callback);
+  }
   if (!callback || !matches_file(fd, "NASFS_TEST_DELAY_WRITES"))
     return actual(loop, request, fd, buffers, count, offset, callback);
 

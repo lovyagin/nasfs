@@ -177,9 +177,9 @@ int main(int argc, char** argv) {
   nasfs_version_store_t storage;
   const char* storage_dir =
       global_config.storage_dir ? global_config.storage_dir : ".";
-  int r = nasfs_version_store_open(&storage, storage_dir,
-                                   global_config.version_quota,
-                                   global_config.version_retention);
+  int r = nasfs_version_store_open(
+      &storage, storage_dir, global_config.version_quota,
+      global_config.version_retention, global_config.attempt_retention);
   if (r < 0) {
     log_all(LOG_ERROR, "Cannot open storage directory '%s': %s", storage_dir,
             uv_strerror(r));

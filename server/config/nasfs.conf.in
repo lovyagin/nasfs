@@ -33,3 +33,8 @@ PubKeyAuthAlgorithms ML-DSA-65,ML-DSA-44
 # Absolute paths for service-managed key files.
 # ServerSigningSeed "@NASFS_SYSCONFDIR@/server.seed"
 # AuthorPublicKey "@NASFS_SYSCONFDIR@/author.pub"
+
+# Versioned storage retention and container quota (0 disables the quota).
+VersionRetentionSeconds 86400
+AttemptRetentionSeconds 86400
+VersionQuotaBytes 0

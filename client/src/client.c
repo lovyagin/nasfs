@@ -67,6 +67,7 @@ typedef struct {
   const char* remote_filename;
   char* download_parent;
   const char* download_name;
+  const char* checkpoint;
   FILE* index_file;
   uint8_t* parity[NASFS_ECC_MAX_PARITY];
   uint8_t* repair_rows[NASFS_ECC_MAX_DATA + NASFS_ECC_MAX_PARITY];
@@ -74,6 +75,11 @@ typedef struct {
   uint64_t sequence;
   uint64_t index_position;
   uint64_t repair_start;
+  uint64_t replay_position;
+  uint64_t resume_blocks;
+  uint64_t journal_sync_time;
+  size_t journal_unsynced;
+  int64_t journal_end;
   uint64_t start;
   uint64_t length;
   uint64_t first;
@@ -83,6 +89,8 @@ typedef struct {
   nasfs_block_meta_t expected;
   nasfs_client_operation_t current_op;
   uv_file local_fd;
+  int resume_fd;
+  int spooling;
   int download_directory;
   int download_staging;
   int download_had_destination;
@@ -101,6 +109,8 @@ typedef struct {
   unsigned repair_position;
   uint8_t encryption_key[crypto_secretbox_KEYBYTES];
   uint8_t index_root[32];
+  uint8_t resume_token[32];
+  uint8_t resume_proof[NASFS_VERSION_PROOF_SIZE];
   char download_temp_name[sizeof(".nasfs-download.") + 32];
   char download_staging_name[64];
 } client_transfer_t;
@@ -156,6 +166,11 @@ typedef struct {
 
 } nasfs_client_t;
 
+static const uint8_t upload_journal_magic[8] = {'N', 'A', 'S', 'P',
+                                                'U', 'T', '2', 0};
+#define JOURNAL_NAME_OFFSET 72u
+#define JOURNAL_HEADER_OFFSET (JOURNAL_NAME_OFFSET + 257u)
+
 static const char download_lock_name[] = ".publish.lock";
 
 static void report_event(nasfs_client_t* client, nasfs_client_event_t event,
@@ -187,6 +202,7 @@ static void close_connection(uv_handle_t* handle);
 static void send_put_req(uv_stream_t* stream);
 static void send_get_req(uv_stream_t* stream);
 static void start_next_operation(uv_stream_t* stream);
+static int begin_upload_journal(nasfs_client_t* client, const char* path);
 
 static int read_master_salt(int dir, uint8_t salt[crypto_pwhash_SALTBYTES]) {
   int fd = openat(dir, "master.salt", O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
@@ -710,6 +726,19 @@ static void send_put_req(uv_stream_t* stream) {
     close_connection((uv_handle_t*)stream);
     return;
   }
+  nasfs_version_index_init(&transfer->index);
+  if (transfer->checkpoint) {
+    int64_t size = nasfs_version_file_size(header);
+    if (size > INT64_MAX - JOURNAL_HEADER_OFFSET ||
+        begin_upload_journal(client, transfer->checkpoint) < 0) {
+      client_message(client, NASFS_CLIENT_ERROR,
+                     "Cannot create upload checkpoint: %s\n", strerror(errno));
+      close_connection((uv_handle_t*)stream);
+      return;
+    }
+    do_put_read_chunk(stream);
+    return;
+  }
   const size_t header_bytes = 1 + NASFS_VERSION_HEADER_SIZE;
   size_t length = strlen(transfer->remote_filename) + 1;
   uint8_t req[1 + NASFS_VERSION_HEADER_SIZE + 256];
@@ -717,7 +746,6 @@ static void send_put_req(uv_stream_t* stream) {
                                             : NASFS_VERSION_REQUEST;
   nasfs_version_encode(req + 1, header);
   memcpy(req + header_bytes, transfer->remote_filename, length);
-  nasfs_version_index_init(&transfer->index);
   transfer->put_ack_pending = 1;
   send_command(stream, NASFS_CMD_PUT_REQ, req, header_bytes + length, 1);
 }
@@ -725,7 +753,8 @@ static void send_put_req(uv_stream_t* stream) {
 static void send_get_req(uv_stream_t* stream) {
   nasfs_client_t* client = stream->data;
   client_transfer_t* transfer = &client->transfer;
-  uint8_t req[NASFS_VERSION_GET_SIZE] = {NASFS_VERSION_REQUEST};
+  uint8_t req[NASFS_VERSION_GET_SIZE] = {
+      transfer->checkpoint ? NASFS_VERSION_GET_INDEXED : NASFS_VERSION_REQUEST};
   memcpy(req + 1, transfer->version.id, sizeof(transfer->version.id));
   memcpy(req + 17, transfer->version.digest, sizeof(transfer->version.digest));
   protocol_store_u64(req + 49, transfer->start);
@@ -849,7 +878,7 @@ static int open_download_file(nasfs_client_t* client) {
                    sizeof(candidate) - sizeof(prefix) + 1, random_id,
                    sizeof(random_id));
     int fd = openat(client->transfer.download_staging, candidate,
-                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+                    O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd >= 0) {
       memcpy(client->transfer.download_temp_name, candidate, sizeof(candidate));
       client->transfer.local_fd = fd;
@@ -1028,6 +1057,318 @@ static int publish_download(nasfs_client_t* client) {
   return 0;
 }
 
+static int read_at(int fd, void* data, size_t len, int64_t offset) {
+  uint8_t* bytes = data;
+  while (len) {
+    ssize_t n = pread(fd, bytes, len, (off_t)offset);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return -1;
+    offset += n;
+    bytes += n;
+    len -= (size_t)n;
+  }
+  return 0;
+}
+
+static int write_at(int fd, const void* data, size_t len, int64_t offset) {
+  const uint8_t* bytes = data;
+  while (len) {
+    ssize_t n = pwrite(fd, bytes, len, (off_t)offset);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return -1;
+    offset += n;
+    bytes += n;
+    len -= (size_t)n;
+  }
+  return 0;
+}
+
+static void send_resume_request(uv_stream_t* stream) {
+  nasfs_client_t* client = stream->data;
+  client_transfer_t* transfer = &client->transfer;
+  uint8_t request[65 + NASFS_VERSION_HEADER_SIZE + 256];
+  memcpy(request, transfer->resume_token, sizeof(transfer->resume_token));
+  memcpy(request + 32, transfer->version.digest,
+         sizeof(transfer->version.digest));
+  request[64] = transfer->batch_upload_exclusive ? NASFS_VERSION_EXCLUSIVE
+                                                 : NASFS_VERSION_REQUEST;
+  nasfs_version_encode(request + 65, &transfer->header);
+  size_t length = strlen(transfer->remote_filename) + 1;
+  memcpy(request + 65 + NASFS_VERSION_HEADER_SIZE, transfer->remote_filename,
+         length);
+  transfer->put_ack_pending = 1;
+  send_command(stream, NASFS_CMD_PUT_RESUME, request,
+               65 + NASFS_VERSION_HEADER_SIZE + length, 1);
+}
+
+static int load_upload_journal(nasfs_client_t* client, const char* path) {
+  client_transfer_t* transfer = &client->transfer;
+  int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) return errno == ENOENT ? 1 : -1;
+  struct stat st;
+  uint8_t prefix[JOURNAL_HEADER_OFFSET + NASFS_VERSION_DATA_OFFSET];
+  int rc = -1;
+  if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+      (st.st_mode & 077u) || !private_download_entry(fd, &st) ||
+      read_at(fd, prefix, sizeof(prefix), 0) < 0 ||
+      sodium_memcmp(prefix, upload_journal_magic,
+                    sizeof(upload_journal_magic)) != 0 ||
+      sodium_memcmp(prefix + 40, client->trusted_server_key, 32) != 0 ||
+      prefix[JOURNAL_NAME_OFFSET + 255] != 0 ||
+      strcmp((const char*)prefix + JOURNAL_NAME_OFFSET,
+             transfer->remote_filename) != 0 ||
+      prefix[JOURNAL_NAME_OFFSET + 256] !=
+          (uint8_t)transfer->batch_upload_exclusive ||
+      nasfs_version_decode(&transfer->header, prefix + JOURNAL_HEADER_OFFSET,
+                           NASFS_VERSION_HEADER_SIZE) < 0)
+    goto cleanup;
+  int64_t file_size = nasfs_version_file_size(&transfer->header);
+  const uint8_t* proof =
+      prefix + JOURNAL_HEADER_OFFSET + NASFS_VERSION_HEADER_SIZE;
+  if (file_size < 0 || file_size > INT64_MAX - JOURNAL_HEADER_OFFSET ||
+      (int64_t)st.st_size != file_size + JOURNAL_HEADER_OFFSET ||
+      nasfs_version_verify(&transfer->header, proof, client->author_public) < 0)
+    goto cleanup;
+
+  memcpy(transfer->resume_token, prefix + 8, sizeof(transfer->resume_token));
+  memcpy(transfer->resume_proof, proof, sizeof(transfer->resume_proof));
+  memcpy(transfer->version.digest, proof + 32,
+         sizeof(transfer->version.digest));
+  memcpy(transfer->version.id, transfer->header.id,
+         sizeof(transfer->version.id));
+  transfer->resume_fd = fd;
+  return 0;
+
+cleanup:
+  close(fd);
+  return rc;
+}
+
+static int begin_upload_journal(nasfs_client_t* client, const char* path) {
+  client_transfer_t* transfer = &client->transfer;
+  int source = transfer->local_fd;
+  const char* source_name = transfer->local_filename;
+  transfer->local_filename = path;
+  int rc = prepare_download(client);
+  if (rc == 0 && transfer->download_had_destination) {
+    errno = EEXIST;
+    rc = -1;
+  }
+  if (rc == 0) {
+    rc = open_download_file(client);
+    if (rc == 0) transfer->resume_fd = transfer->local_fd;
+  }
+  transfer->local_fd = source;
+  transfer->local_filename = source_name;
+  transfer->spooling = rc == 0;
+  return rc;
+}
+
+static int finish_upload_journal(nasfs_client_t* client, const uint8_t* proof) {
+  client_transfer_t* transfer = &client->transfer;
+  uint8_t prefix[JOURNAL_HEADER_OFFSET + NASFS_VERSION_DATA_OFFSET] = {0};
+  memcpy(prefix, upload_journal_magic, sizeof(upload_journal_magic));
+  randombytes_buf(transfer->resume_token, sizeof(transfer->resume_token));
+  memcpy(prefix + 8, transfer->resume_token, sizeof(transfer->resume_token));
+  memcpy(prefix + 40, client->trusted_server_key, 32);
+  memcpy(prefix + JOURNAL_NAME_OFFSET, transfer->remote_filename,
+         strlen(transfer->remote_filename) + 1);
+  prefix[JOURNAL_NAME_OFFSET + 256] = (uint8_t)transfer->batch_upload_exclusive;
+  nasfs_version_encode(prefix + JOURNAL_HEADER_OFFSET, &transfer->header);
+  memcpy(prefix + JOURNAL_HEADER_OFFSET + NASFS_VERSION_HEADER_SIZE, proof,
+         NASFS_VERSION_PROOF_SIZE);
+
+  int fd = transfer->resume_fd;
+  struct stat opened, named;
+  if (write_at(fd, prefix, sizeof(prefix), 0) < 0 || fsync(fd) < 0 ||
+      fstat(fd, &opened) < 0 ||
+      fstatat(transfer->download_staging, transfer->download_temp_name, &named,
+              AT_SYMLINK_NOFOLLOW) < 0 ||
+      !same_download_snapshot(&opened, &named) ||
+      check_download_parent(client) < 0 ||
+      linkat(transfer->download_staging, transfer->download_temp_name,
+             transfer->download_directory, transfer->download_name, 0) < 0 ||
+      fsync(transfer->download_directory) < 0)
+    return -1;
+  discard_download(client);
+  memcpy(transfer->resume_proof, proof, sizeof(transfer->resume_proof));
+  transfer->spooling = 0;
+  transfer->file_offset = 0;
+  return close_local_file(client);
+}
+
+static void replay_upload(uv_stream_t* stream) {
+  nasfs_client_t* client = stream->data;
+  client_transfer_t* transfer = &client->transfer;
+  uint64_t seq = transfer->replay_position;
+  if (seq == nasfs_version_record_count(&transfer->header)) {
+    send_command(stream, NASFS_CMD_PUT_DONE, transfer->resume_proof,
+                 sizeof(transfer->resume_proof), 1);
+    return;
+  }
+
+  int64_t offset;
+  uint32_t length;
+  if (nasfs_version_record(&transfer->header, seq, &offset, &length) < 0)
+    goto failed;
+  size_t size = NASFS_BLOCK_META_SIZE + length;
+  uint8_t* row = malloc(size);
+  if (!row) goto failed;
+  nasfs_block_meta_t meta;
+  uint8_t hash[32];
+  if (read_at(transfer->resume_fd, row, size, offset + JOURNAL_HEADER_OFFSET) <
+          0 ||
+      protocol_decode_block_meta(row, NASFS_BLOCK_META_SIZE, &meta) < 0 ||
+      meta.seq_num != seq || meta.size != length ||
+      nasfs_version_hash_block(transfer->header.hash,
+                               row + NASFS_BLOCK_META_SIZE, length,
+                               hash) != 0 ||
+      sodium_memcmp(hash, meta.hash, sizeof(hash)) != 0) {
+    free(row);
+    goto failed;
+  }
+  int parity = nasfs_version_is_parity(&transfer->header, seq);
+  transfer->replay_position++;
+  send_command(stream, NASFS_CMD_PUT_BLOCK_META, row, NASFS_BLOCK_META_SIZE, 1);
+  send_command(stream, parity ? NASFS_CMD_PUT_PARITY : NASFS_CMD_PUT_DATA,
+               row + NASFS_BLOCK_META_SIZE, length, 0);
+  free(row);
+  if (!parity) {
+    transfer->file_offset += length - NASFS_VERSION_BLOCK_TAG;
+    report_event(client, NASFS_CLIENT_PROGRESS, transfer->file_offset);
+  }
+  return;
+
+failed:
+  client_message(client, NASFS_CLIENT_ERROR,
+                 "Invalid ciphertext in upload checkpoint\n");
+  close_connection((uv_handle_t*)stream);
+}
+
+static const uint8_t download_journal_magic[8] = {'N', 'A', 'S', 'G',
+                                                  'E', 'T', '2', 0};
+#define DOWNLOAD_JOURNAL_OFFSET 40u
+#define DOWNLOAD_JOURNAL_DATA \
+  (DOWNLOAD_JOURNAL_OFFSET + NASFS_VERSION_DATA_OFFSET)
+
+static int load_download_journal(nasfs_client_t* client) {
+  client_transfer_t* transfer = &client->transfer;
+  int fd =
+      open(transfer->checkpoint, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) return errno == ENOENT ? 0 : -1;
+
+  struct stat st;
+  int rc = -1;
+  uint8_t prefix[DOWNLOAD_JOURNAL_DATA];
+  if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+      (st.st_mode & 077u) || !private_download_entry(fd, &st) ||
+      (transfer->download_had_destination &&
+       same_download_entry(&st, &transfer->download_initial_destination)) ||
+      flock(fd, LOCK_EX | LOCK_NB) < 0)
+    goto failed;
+  if (st.st_size == 0) {
+    transfer->resume_fd = fd;
+    return 0;
+  }
+  size_t available =
+      st.st_size < (off_t)sizeof(prefix) ? (size_t)st.st_size : sizeof(prefix);
+  if (available < sizeof(download_journal_magic) ||
+      read_at(fd, prefix, available, 0) < 0 ||
+      sodium_memcmp(prefix, download_journal_magic,
+                    sizeof(download_journal_magic)) != 0)
+    goto failed;
+  if (available < sizeof(prefix)) {
+    if (ftruncate(fd, 0) < 0) goto failed;
+    transfer->resume_fd = fd;
+    return 0;
+  }
+  nasfs_version_header_t stored;
+  const uint8_t* proof =
+      prefix + DOWNLOAD_JOURNAL_OFFSET + NASFS_VERSION_HEADER_SIZE;
+  if (sodium_memcmp(prefix + 8, client->trusted_server_key, 32) != 0 ||
+      nasfs_version_decode(&stored, prefix + DOWNLOAD_JOURNAL_OFFSET,
+                           NASFS_VERSION_HEADER_SIZE) < 0 ||
+      sodium_memcmp(stored.id, transfer->version.id, sizeof(stored.id)) != 0 ||
+      sodium_memcmp(proof + 32, transfer->version.digest, 32) != 0 ||
+      nasfs_version_verify(&stored, proof, client->author_public) < 0)
+    goto failed;
+
+  uint64_t rows = nasfs_version_block_count(&stored);
+  uint64_t size = (uint64_t)st.st_size;
+  uint64_t offset = sizeof(prefix), sequence = 0;
+  while (sequence < rows) {
+    int64_t stored_offset;
+    uint32_t cipher_len;
+    if (nasfs_version_record(&stored,
+                             nasfs_version_data_sequence(&stored, sequence),
+                             &stored_offset, &cipher_len) < 0)
+      goto failed;
+    uint64_t row_size = NASFS_BLOCK_META_SIZE + cipher_len;
+    if (row_size > size - offset) break;
+    offset += row_size;
+    sequence++;
+  }
+  if (offset != size && ftruncate(fd, (off_t)offset) < 0) goto failed;
+  transfer->journal_end = (int64_t)offset;
+  transfer->resume_blocks = sequence;
+  transfer->start =
+      sequence == rows ? stored.size : sequence * stored.block_size;
+  transfer->resume_fd = fd;
+  return 0;
+
+failed:
+  close(fd);
+  return rc;
+}
+
+static int prepare_download_journal(nasfs_client_t* client,
+                                    const nasfs_frame_t* frame) {
+  client_transfer_t* transfer = &client->transfer;
+  if (!transfer->checkpoint || transfer->journal_end) return 0;
+  int fd = transfer->resume_fd;
+  if (fd < 0) {
+    fd = open(transfer->checkpoint,
+              O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    transfer->resume_fd = fd;
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) return -1;
+  }
+  uint8_t prefix[DOWNLOAD_JOURNAL_DATA];
+  memcpy(prefix, download_journal_magic, sizeof(download_journal_magic));
+  memcpy(prefix + 8, client->trusted_server_key, 32);
+  memcpy(prefix + DOWNLOAD_JOURNAL_OFFSET, frame->payload,
+         NASFS_VERSION_DATA_OFFSET);
+  if (write_at(fd, prefix, sizeof(prefix), 0) < 0 || fsync(fd) < 0) return -1;
+  transfer->journal_end = sizeof(prefix);
+  transfer->journal_sync_time = uv_now(client->loop);
+  return 0;
+}
+
+static int journal_download_block(nasfs_client_t* client,
+                                  const nasfs_frame_t* frame) {
+  client_transfer_t* transfer = &client->transfer;
+  uint8_t row[NASFS_BLOCK_META_SIZE];
+  protocol_encode_block_meta(row, &transfer->expected);
+  size_t length = sizeof(row) + frame->payload_len;
+  int fd = transfer->resume_fd;
+  int64_t offset = transfer->journal_end;
+  if ((uint64_t)length > (uint64_t)(INT64_MAX - offset) ||
+      write_at(fd, row, sizeof(row), offset) < 0 ||
+      write_at(fd, frame->payload, frame->payload_len,
+               offset + (int64_t)sizeof(row)) < 0)
+    return -1;
+  transfer->journal_end += (int64_t)length;
+  transfer->journal_unsynced += length;
+  uint64_t now = uv_now(client->loop);
+  if (transfer->journal_unsynced >= 16u * 1024u * 1024u ||
+      now - transfer->journal_sync_time >= 1000) {
+    if (fsync(fd) < 0) return -1;
+    transfer->journal_unsynced = 0;
+    transfer->journal_sync_time = now;
+  }
+  return 0;
+}
+
 static void clear_repair(client_transfer_t* transfer) {
   for (size_t i = 0; i < NASFS_ECC_MAX_DATA + NASFS_ECC_MAX_PARITY; i++) {
     free(transfer->repair_rows[i]);
@@ -1138,7 +1479,9 @@ static int begin_download(nasfs_client_t* client, const nasfs_frame_t* frame) {
   if (transfer->length == UINT64_MAX)
     transfer->length = header->size - transfer->start;
 
-  uint64_t first = transfer->start / header->block_size;
+  uint64_t first = transfer->start == header->size
+                       ? nasfs_version_block_count(header)
+                       : transfer->start / header->block_size;
   uint64_t end = transfer->start + transfer->length;
   transfer->first = first;
   transfer->end = transfer->length ? end / header->block_size +
@@ -1148,8 +1491,9 @@ static int begin_download(nasfs_client_t* client, const nasfs_frame_t* frame) {
   transfer->partial =
       nasfs_version_record_count(header) &&
       (transfer->start != 0 || transfer->length != header->size ||
-       header->ecc != NASFS_ECC_OFF);
-  if (transfer->partial && header->ecc != NASFS_ECC_OFF) {
+       header->ecc != NASFS_ECC_OFF || transfer->checkpoint);
+  if (transfer->partial &&
+      (header->ecc != NASFS_ECC_OFF || transfer->checkpoint)) {
     transfer->index_file = tmpfile();
     if (!transfer->index_file) return -1;
   }
@@ -1161,6 +1505,11 @@ static int begin_download(nasfs_client_t* client, const nasfs_frame_t* frame) {
                                     client->master_key, header->salt) != 0) {
     client_message(client, NASFS_CLIENT_ERROR,
                    "Cannot open NASLUKS owner slot\n");
+    return -1;
+  }
+  if (prepare_download_journal(client, frame) < 0) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Cannot prepare download checkpoint\n");
     return -1;
   }
   if (open_download_file(client) < 0) {
@@ -1235,8 +1584,8 @@ static int receive_block_meta(client_transfer_t* transfer,
   return 0;
 }
 
-static int store_verified_block(uv_stream_t* stream,
-                                const nasfs_frame_t* frame) {
+static int store_verified_block(uv_stream_t* stream, const nasfs_frame_t* frame,
+                                int from_journal) {
   nasfs_client_t* client = stream->data;
   client_transfer_t* transfer = &client->transfer;
   uint8_t* data = malloc(frame->payload_len);
@@ -1256,10 +1605,13 @@ static int store_verified_block(uv_stream_t* stream,
     return -1;
   }
   uint64_t block_start = transfer->sequence * transfer->header.block_size;
-  size_t trim =
-      transfer->start > block_start ? transfer->start - block_start : 0;
+  size_t trim = !from_journal && transfer->start > block_start
+                    ? transfer->start - block_start
+                    : 0;
   size_t length = plain_len - trim;
-  uint64_t remaining = transfer->length - transfer->file_offset;
+  uint64_t output_size =
+      transfer->checkpoint ? transfer->header.size : transfer->length;
+  uint64_t remaining = output_size - transfer->file_offset;
   if (length > remaining) length = remaining;
   uv_buf_t buffer = uv_buf_init((char*)data + trim, length);
   uv_fs_t req;
@@ -1275,13 +1627,65 @@ static int store_verified_block(uv_stream_t* stream,
     return -1;
   }
   transfer->file_offset += length;
-  nasfs_version_index_add(&transfer->index, &transfer->expected);
   transfer->sequence++;
+  if (from_journal) return 0;
+  if (transfer->checkpoint && journal_download_block(client, frame) < 0) {
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Cannot advance download checkpoint\n");
+    return -1;
+  }
+  nasfs_version_index_add(&transfer->index, &transfer->expected);
   transfer->has_pending_block_meta = 0;
   report_event(client, NASFS_CLIENT_PROGRESS, transfer->file_offset);
   if (transfer->header.ecc != NASFS_ECC_OFF)
     send_command(stream, NASFS_CMD_GET_ADVANCE, NULL, 0, 1);
   return 0;
+}
+
+static int replay_download_prefix(uv_stream_t* stream) {
+  nasfs_client_t* client = stream->data;
+  client_transfer_t* transfer = &client->transfer;
+  size_t capacity = transfer->header.block_size + NASFS_VERSION_BLOCK_TAG;
+  uint8_t* bytes = malloc(capacity);
+  if (!bytes) return -1;
+  int64_t offset = DOWNLOAD_JOURNAL_DATA;
+  transfer->sequence = 0;
+  int rc = 0;
+  while (transfer->sequence < transfer->resume_blocks) {
+    uint64_t sequence =
+        nasfs_version_data_sequence(&transfer->header, transfer->sequence);
+    uint8_t trusted[NASFS_BLOCK_META_SIZE], row[NASFS_BLOCK_META_SIZE],
+        hash[32];
+    nasfs_block_meta_t meta;
+    if (load_index_row(transfer, sequence, trusted) < 0 ||
+        read_at(transfer->resume_fd, row, sizeof(row), offset) < 0 ||
+        sodium_memcmp(trusted, row, sizeof(row)) != 0 ||
+        protocol_decode_block_meta(row, sizeof(row), &meta) < 0 ||
+        meta.size > capacity ||
+        read_at(transfer->resume_fd, bytes, meta.size, offset + sizeof(row)) <
+            0 ||
+        nasfs_version_hash_block(transfer->header.hash, bytes, meta.size,
+                                 hash) < 0 ||
+        sodium_memcmp(hash, meta.hash, sizeof(hash)) != 0) {
+      (void)ftruncate(transfer->resume_fd, (off_t)offset);
+      rc = -1;
+      break;
+    }
+    nasfs_frame_t recovered = {.payload = bytes, .payload_len = meta.size};
+    if (store_verified_block(stream, &recovered, 1) < 0) {
+      rc = -1;
+      break;
+    }
+    offset += (int64_t)(sizeof(row) + meta.size);
+  }
+  free(bytes);
+  if (rc < 0)
+    client_message(client, NASFS_CLIENT_ERROR,
+                   "Download checkpoint failed verification\n");
+  else
+    client_message(client, NASFS_CLIENT_INFO,
+                   "Restored verified download prefix.\n");
+  return rc;
 }
 
 static int receive_block(uv_stream_t* stream, const nasfs_frame_t* frame) {
@@ -1295,7 +1699,7 @@ static int receive_block(uv_stream_t* stream, const nasfs_frame_t* frame) {
                                frame->payload_len, digest) < 0)
     return -1;
   if (sodium_memcmp(digest, transfer->expected.hash, sizeof(digest)) == 0)
-    return store_verified_block(stream, frame);
+    return store_verified_block(stream, frame, 0);
   if (transfer->header.ecc != NASFS_ECC_OFF) return request_repair(stream);
   client_message(client, NASFS_CLIENT_ERROR,
                  "Integrity check failed (hash mismatch)\n");
@@ -1328,7 +1732,7 @@ static int complete_repair(uv_stream_t* stream, const nasfs_frame_t* done) {
       rc = -1;
     } else {
       nasfs_frame_t repaired = {.payload = bytes, .payload_len = length};
-      rc = store_verified_block(stream, &repaired);
+      rc = store_verified_block(stream, &repaired, 0);
     }
   }
   free(bytes);
@@ -1344,7 +1748,8 @@ static int verify_download(nasfs_client_t* client, const nasfs_frame_t* frame) {
   client_transfer_t* transfer = &client->transfer;
   if (transfer->local_fd < 0 || frame->payload_len != 0 ||
       transfer->has_pending_block_meta || transfer->sequence != transfer->end ||
-      transfer->file_offset != transfer->length ||
+      transfer->file_offset !=
+          (transfer->checkpoint ? transfer->header.size : transfer->length) ||
       (transfer->partial && !transfer->index_verified))
     return -1;
   uint8_t root[32];
@@ -1354,6 +1759,7 @@ static int verify_download(nasfs_client_t* client, const nasfs_frame_t* frame) {
                    "File manifest index mismatch\n");
     return -1;
   }
+  if (transfer->resume_fd >= 0 && fsync(transfer->resume_fd) < 0) return -1;
   return publish_download(client);
 }
 
@@ -1429,8 +1835,10 @@ static void start_next_operation(uv_stream_t* stream) {
     return;
   }
   close_ecc(transfer);
+  if (transfer->resume_fd >= 0) close(transfer->resume_fd);
   sodium_memzero(transfer, sizeof(*transfer));
   transfer->local_fd = -1;
+  transfer->resume_fd = -1;
   transfer->download_directory = -1;
   transfer->download_staging = -1;
 
@@ -1445,6 +1853,7 @@ static void start_next_operation(uv_stream_t* stream) {
   transfer->batch_upload_exclusive = op->create_only;
   client->results[client->batch_idx - 1].outcome = NASFS_CLIENT_FAILED;
   transfer->local_filename = op->local_path;
+  transfer->checkpoint = op->checkpoint;
   transfer->remote_filename = op->remote_name;
 
   report_event(client, NASFS_CLIENT_STARTED, 0);
@@ -1452,6 +1861,19 @@ static void start_next_operation(uv_stream_t* stream) {
   if (op->operation == NASFS_CLIENT_COLLECT) {
     send_command(stream, NASFS_CMD_COLLECT, NULL, 0, 1);
     return;
+  }
+  if (op->operation == NASFS_CLIENT_PUT && op->checkpoint) {
+    int rc = load_upload_journal(client, op->checkpoint);
+    if (rc <= 0) {
+      if (rc == 0) {
+        send_resume_request(stream);
+      } else {
+        client_message(client, NASFS_CLIENT_ERROR,
+                       "Invalid or inaccessible upload checkpoint\n");
+        close_connection((uv_handle_t*)stream);
+      }
+      return;
+    }
   }
   if (op->operation == NASFS_CLIENT_GET) {
     if (prepare_download(client) < 0) {
@@ -1465,6 +1887,12 @@ static void start_next_operation(uv_stream_t* stream) {
       transfer->version = *op->version;
       transfer->start = op->offset;
       transfer->length = op->length;
+      if (op->checkpoint && load_download_journal(client) < 0) {
+        client_message(client, NASFS_CLIENT_ERROR,
+                       "Invalid or inaccessible download checkpoint\n");
+        close_connection((uv_handle_t*)stream);
+        return;
+      }
       send_get_req(stream);
       return;
     }
@@ -1498,6 +1926,13 @@ static void close_connection(uv_handle_t* handle) {
   if (!client->local_read_pending) close_local_file(client);
   discard_download(client);
   close_ecc(&client->transfer);
+  if (client->transfer.resume_fd >= 0) {
+    if (client->transfer.current_op == NASFS_CLIENT_GET &&
+        client->transfer.journal_unsynced)
+      (void)fsync(client->transfer.resume_fd);
+    close(client->transfer.resume_fd);
+  }
+  client->transfer.resume_fd = -1;
   client_message(client, NASFS_CLIENT_INFO, "\nConnection closed.\n");
 }
 
@@ -1541,10 +1976,13 @@ static void on_write(uv_write_t* req, int status) {
   if (ctx->buf.base) free(ctx->buf.base);
   if (client->transfer.current_op == NASFS_CLIENT_PUT &&
       !uv_is_closing((uv_handle_t*)stream)) {
-    if (client->transfer.local_fd != -1 && ctx->type == NASFS_CMD_PUT_DATA) {
-      free(ctx);
+    if (client->transfer.resume_fd >= 0 &&
+        (ctx->type == NASFS_CMD_PUT_DATA ||
+         ctx->type == NASFS_CMD_PUT_PARITY)) {
+      replay_upload(stream);
+    } else if (client->transfer.local_fd >= 0 &&
+               ctx->type == NASFS_CMD_PUT_DATA) {
       do_put_read_chunk(stream);
-      return;
     }
   }
 
@@ -1606,6 +2044,33 @@ fail:
   close_connection((uv_handle_t*)stream);
 }
 
+static int emit_upload_record(uv_stream_t* stream,
+                              const nasfs_block_meta_t* meta,
+                              const uint8_t* data, int parity) {
+  nasfs_client_t* client = stream->data;
+  client_transfer_t* transfer = &client->transfer;
+  uint8_t row[NASFS_BLOCK_META_SIZE];
+  protocol_encode_block_meta(row, meta);
+  nasfs_version_index_add(&transfer->index, meta);
+  if (transfer->spooling) {
+    int64_t offset;
+    uint32_t length;
+    if (nasfs_version_record(&transfer->header, meta->seq_num, &offset,
+                             &length) < 0 ||
+        length != meta->size ||
+        write_at(transfer->resume_fd, row, sizeof(row),
+                 offset + JOURNAL_HEADER_OFFSET) < 0 ||
+        write_at(transfer->resume_fd, data, length,
+                 offset + JOURNAL_HEADER_OFFSET + NASFS_BLOCK_META_SIZE) < 0)
+      return -1;
+  } else {
+    send_command(stream, NASFS_CMD_PUT_BLOCK_META, row, sizeof(row), 1);
+    send_command(stream, parity ? NASFS_CMD_PUT_PARITY : NASFS_CMD_PUT_DATA,
+                 data, meta->size, 0);
+  }
+  return uv_is_closing((uv_handle_t*)stream) ? -1 : 0;
+}
+
 static void send_parity(uv_stream_t* stream, uint64_t first, unsigned count,
                         uint32_t length) {
   nasfs_client_t* client = stream->data;
@@ -1617,13 +2082,10 @@ static void send_parity(uv_stream_t* stream, uint64_t first, unsigned count,
       close_connection((uv_handle_t*)stream);
       return;
     }
-    uint8_t row[NASFS_BLOCK_META_SIZE];
-    protocol_encode_block_meta(row, &meta);
-    nasfs_version_index_add(&transfer->index, &meta);
-    send_command(stream, NASFS_CMD_PUT_BLOCK_META, row, sizeof(row), 1);
-    if (uv_is_closing((uv_handle_t*)stream)) return;
-    send_command(stream, NASFS_CMD_PUT_PARITY, transfer->parity[i], length, 0);
-    if (uv_is_closing((uv_handle_t*)stream)) return;
+    if (emit_upload_record(stream, &meta, transfer->parity[i], 1) < 0) {
+      close_connection((uv_handle_t*)stream);
+      return;
+    }
     memset(transfer->parity[i], 0, length);
   }
 }
@@ -1657,7 +2119,17 @@ static void on_local_read(uv_fs_t* req) {
            sizeof(transfer->version.digest));
     client_message(client, NASFS_CLIENT_INFO,
                    "\nFinished reading local file. Waiting for publication.\n");
-    send_command(stream, NASFS_CMD_PUT_DONE, proof, sizeof(proof), 1);
+    if (transfer->spooling) {
+      if (finish_upload_journal(client, proof) < 0) {
+        client_message(client, NASFS_CLIENT_ERROR,
+                       "Cannot publish upload checkpoint\n");
+        close_connection((uv_handle_t*)stream);
+        goto cleanup;
+      }
+      send_resume_request(stream);
+    } else {
+      send_command(stream, NASFS_CMD_PUT_DONE, proof, sizeof(proof), 1);
+    }
   } else {
     int64_t record_offset;
     uint32_t cipher_len;
@@ -1705,18 +2177,22 @@ static void on_local_read(uv_fs_t* req) {
     if (parity)
       nasfs_ecc_accumulate(transfer->parity[0], transfer->parity[1], ciphertext,
                            (unsigned)(transfer->sequence - start), cipher_len);
-    uint8_t row[NASFS_BLOCK_META_SIZE];
-    protocol_encode_block_meta(row, &meta);
-    nasfs_version_index_add(&transfer->index, &meta);
     transfer->sequence++;
     transfer->file_offset += (uint64_t)req->result;
-    send_command(stream, NASFS_CMD_PUT_BLOCK_META, row, sizeof(row), 1);
-    send_command(stream, NASFS_CMD_PUT_DATA, ciphertext, cipher_len, 0);
+    int emitted = emit_upload_record(stream, &meta, ciphertext, 0);
     free(ciphertext);
+    if (emitted < 0) {
+      close_connection((uv_handle_t*)stream);
+      goto cleanup;
+    }
     if (parity && transfer->sequence == start + data)
       send_parity(stream, physical + 1, parity,
                   transfer->header.block_size + NASFS_VERSION_BLOCK_TAG);
-    report_event(client, NASFS_CLIENT_PROGRESS, transfer->file_offset);
+    if (transfer->spooling && !uv_is_closing((uv_handle_t*)stream)) {
+      do_put_read_chunk(stream);
+    } else if (!transfer->spooling) {
+      report_event(client, NASFS_CLIENT_PROGRESS, transfer->file_offset);
+    }
   }
 cleanup:
   free(ctx->buf.base);
@@ -1960,13 +2436,26 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               break;
             case NASFS_CMD_PUT_ACK:
               if (transfer->current_op != NASFS_CLIENT_PUT ||
-                  !transfer->put_ack_pending || transfer->local_fd == -1 ||
-                  plain_frame.payload_len != 0) {
+                  !transfer->put_ack_pending ||
+                  plain_frame.payload_len !=
+                      (transfer->resume_fd >= 0 ? 8u : 0u) ||
+                  (transfer->resume_fd < 0 && transfer->local_fd < 0)) {
                 close_connection((uv_handle_t*)stream);
                 break;
               }
               transfer->put_ack_pending = 0;
-              do_put_read_chunk(stream);
+              if (transfer->resume_fd >= 0) {
+                transfer->replay_position =
+                    protocol_load_u64(plain_frame.payload);
+                if (transfer->replay_position >
+                    nasfs_version_record_count(&transfer->header)) {
+                  close_connection((uv_handle_t*)stream);
+                  break;
+                }
+                replay_upload(stream);
+              } else {
+                do_put_read_chunk(stream);
+              }
               break;
             case NASFS_CMD_RESOLVED:
               start_resolved_operation(stream, &plain_frame);
@@ -1987,7 +2476,7 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                    !transfer->put_ack_pending) ||
                   plain_frame.payload_len != 1 ||
                   plain_frame.payload[0] > NASFS_PUT_UNCERTAIN ||
-                  (!transfer->put_result_pending &&
+                  (!transfer->put_result_pending && transfer->resume_fd < 0 &&
                    plain_frame.payload[0] == NASFS_PUT_PUBLISHED) ||
                   plain_frame.payload[0] == NASFS_PUT_UNCERTAIN) {
                 close_connection((uv_handle_t*)stream);
@@ -2028,6 +2517,9 @@ static void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
               if (receive_index(transfer, &plain_frame) < 0) {
                 client_message(client, NASFS_CLIENT_ERROR,
                                "File manifest index mismatch\n");
+                close_connection((uv_handle_t*)stream);
+              } else if (transfer->index_verified && transfer->resume_blocks &&
+                         replay_download_prefix(stream) < 0) {
                 close_connection((uv_handle_t*)stream);
               }
               break;
@@ -2173,6 +2665,10 @@ int nasfs_client_run(const nasfs_client_options_t* options,
   for (size_t i = 0; i < count; i++) {
     const nasfs_client_request_t* op = &requests[i];
     if (op->operation != operation || (transferring && !op->local_path) ||
+        (op->checkpoint && operation != NASFS_CLIENT_PUT &&
+         (operation != NASFS_CLIENT_GET || !op->version || op->offset != 0 ||
+          op->length != UINT64_MAX ||
+          strcmp(op->checkpoint, op->local_path) == 0)) ||
         ((operation != NASFS_CLIENT_COLLECT && !op->version) &&
          (!op->remote_name || !*op->remote_name ||
           strlen(op->remote_name) > 255)) ||
@@ -2193,6 +2689,7 @@ int nasfs_client_run(const nasfs_client_options_t* options,
   client->batch_count = count;
   client->results = output;
   transfer->local_fd = -1;
+  transfer->resume_fd = -1;
   transfer->download_directory = -1;
   transfer->download_staging = -1;
   int return_code = 1;

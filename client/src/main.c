@@ -293,11 +293,14 @@ int main(int argc, char** argv) {
         "  %s mput <file1> <file2> ...           -- batch upload, create only\n"
         "  %s mget <remote1> <remote2> ...       -- batch download (one "
         "session)\n"
+        "  %s put-resume <checkpoint> <local_file> <remote_name>\n"
         "  %s resolve <name>\n"
         "  %s get-version <id> <digest> <offset> <length|all> <local_file>\n"
+        "  %s get-resume <checkpoint> <id> <digest> <local_file>\n"
         "  %s collect\n"
         "  %s keygen <private_key> <authorized_keys> [sig_algo]\n",
-        argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+        argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
+        argv[0], argv[0]);
     return 1;
   }
 
@@ -366,9 +369,11 @@ int main(int argc, char** argv) {
   options.ecc = (nasfs_ecc_profile_t)ecc;
   options.file_cipher = (nasfs_cipher_algo_t)selected_cipher;
   options.file_hash = (nasfs_version_hash_t)selected_hash;
-  int is_upload = strcmp(argv[1], "put") == 0 || strcmp(argv[1], "mput") == 0;
+  int is_upload = strcmp(argv[1], "put") == 0 || strcmp(argv[1], "mput") == 0 ||
+                  strcmp(argv[1], "put-resume") == 0;
   int is_get = strcmp(argv[1], "get") == 0 || strcmp(argv[1], "mget") == 0 ||
-               strcmp(argv[1], "get-version") == 0;
+               strcmp(argv[1], "get-version") == 0 ||
+               strcmp(argv[1], "get-resume") == 0;
   if (env_block_size && env_block_size[0] != '\0') {
     char* end;
     long bs = strtol(env_block_size, &end, 10);
@@ -413,6 +418,24 @@ int main(int argc, char** argv) {
                                  .version = &version,
                                  .offset = offset,
                                  .length = length};
+  } else if (strcmp(argv[1], "get-resume") == 0 && argc == 6) {
+    if (parse_hex(argv[3], version.id, sizeof(version.id)) < 0 ||
+        parse_hex(argv[4], version.digest, sizeof(version.digest)) < 0) {
+      fprintf(stderr, "Invalid version identifier\n");
+      return 1;
+    }
+    batch_queue[batch_count++] =
+        (nasfs_client_request_t){.operation = NASFS_CLIENT_GET,
+                                 .checkpoint = argv[2],
+                                 .local_path = argv[5],
+                                 .version = &version,
+                                 .length = UINT64_MAX};
+  } else if (strcmp(argv[1], "put-resume") == 0 && argc == 5) {
+    batch_queue[batch_count++] =
+        (nasfs_client_request_t){.operation = NASFS_CLIENT_PUT,
+                                 .checkpoint = argv[2],
+                                 .local_path = argv[3],
+                                 .remote_name = argv[4]};
   } else if (strcmp(argv[1], "put") == 0) {
     /* Single PUT: put <local> [remote] */
     const char* loc = argv[2];

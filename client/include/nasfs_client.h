@@ -29,6 +29,7 @@ typedef struct {
   const nasfs_client_version_t* version;
   uint64_t offset;
   uint64_t length;
+  const char* checkpoint; /* Optional local journal for resumable transfers. */
 } nasfs_client_request_t;
 
 typedef enum {

@@ -274,19 +274,23 @@ int load_config(const char* filename, server_config_t* config) {
         return -1;
       }
     } else if (strcmp(key, "VersionQuotaBytes") == 0 ||
-               strcmp(key, "VersionRetentionSeconds") == 0) {
+               strcmp(key, "VersionRetentionSeconds") == 0 ||
+               strcmp(key, "AttemptRetentionSeconds") == 0) {
       char* end;
       errno = 0;
       long long parsed = strtoll(value, &end, 10);
-      if (errno || !*value || *end || parsed < 0) {
+      if (errno || !*value || *end || parsed < 0 ||
+          (strcmp(key, "VersionQuotaBytes") != 0 && parsed > INT_MAX)) {
         fprintf(stderr, "Invalid %s value: %s\n", key, value);
         fclose(file);
         return -1;
       }
       if (strcmp(key, "VersionQuotaBytes") == 0)
         config->version_quota = parsed;
-      else
+      else if (strcmp(key, "VersionRetentionSeconds") == 0)
         config->version_retention = parsed;
+      else
+        config->attempt_retention = parsed;
     } else if (strcmp(key, "BlockSize") == 0) {
       int bs = 0;
       if (parse_config_int(value, &bs) != 0 || bs < 4096 || bs > 4194304) {
@@ -325,6 +329,7 @@ void set_defaults(server_config_t* config) {
   config->pubkey_auth_algorithms = strdup("ML-DSA-65,ML-DSA-44");
   config->block_size = 65536;
   config->version_retention = 86400;
+  config->attempt_retention = 86400;
   config->version_quota = 0;
 }
 

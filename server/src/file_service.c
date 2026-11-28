@@ -17,6 +17,7 @@ typedef struct {
 } file_request_t;
 
 static void finish_put(client_session_t* session);
+static int submit_checkpoint(client_session_t* session);
 
 static void close_active(client_session_t* session) {
   nasfs_file_service_t* files = &session->files;
@@ -27,10 +28,12 @@ static void close_active(client_session_t* session) {
     files->active_fd = -1;
     if (rc < 0) log_all(LOG_WARNING, "File close failed: %s", uv_strerror(rc));
   }
-  nasfs_version_discard(files->store, files->staging);
+  if (!files->resumable || files->finalized)
+    nasfs_version_discard(files->store, files->staging);
   files->staging[0] = '\0';
   nasfs_version_release(files->store, files->reserved);
   files->reserved = 0;
+  files->resumable = 0;
 }
 
 int nasfs_file_service_close(client_session_t* session) {
@@ -39,12 +42,14 @@ int nasfs_file_service_close(client_session_t* session) {
     finish_put(session);
     return 0;
   }
+  if (submit_checkpoint(session)) return 0;
   close_active(session);
   return 1;
 }
 
 int nasfs_file_service_draining(const client_session_t* session) {
-  return session->files.put_draining || session->files.busy;
+  return session->files.put_draining || session->files.busy ||
+         session->files.checkpoint_pending;
 }
 
 int nasfs_file_service_at_capacity(const client_session_t* session) {
@@ -67,11 +72,88 @@ static void io_finished(client_session_t* session) {
     session_finish_close(session);
     return;
   }
-  if (files->put_draining && !files->pending_fs) finish_put(session);
+  if (!files->pending_fs) {
+    if (files->put_draining) {
+      finish_put(session);
+    } else if (files->checkpoint_pending && !submit_checkpoint(session)) {
+      abort_transfer(session);
+      return;
+    }
+  }
   if (session->state != SESSION_STATE_ERROR &&
       !nasfs_file_service_draining(session))
     process_session_frames(session);
   session_resume_read(session);
+}
+
+typedef struct {
+  uv_work_t req;
+  client_session_t* session;
+  int status;
+} checkpoint_request_t;
+
+static void run_checkpoint(uv_work_t* req) {
+  checkpoint_request_t* work = req->data;
+  nasfs_file_service_t* files = &work->session->files;
+  work->status = nasfs_version_checkpoint(files->store, &files->attempt,
+                                          files->active_fd, files->sequence);
+}
+
+static void on_checkpoint(uv_work_t* req, int status) {
+  checkpoint_request_t* work = req->data;
+  client_session_t* session = work->session;
+  nasfs_file_service_t* files = &session->files;
+  int rc = status < 0 ? status : work->status;
+  free(work);
+  files->checkpoint_pending = 0;
+  if (rc == 0) {
+    files->durable_sequence = files->sequence;
+    files->checkpoint_bytes = 0;
+    files->checkpoint_at = uv_now(session->handle.loop);
+  } else {
+    files->write_failed = 1;
+    log_all(LOG_WARNING, "PUT checkpoint failed: %s", uv_strerror(rc));
+    abort_transfer(session);
+  }
+  io_finished(session);
+}
+
+/* Only complete writes may advance the journal. Reading stays paused until
+ * the worker has synchronized the staging fd and committed the position. */
+static int submit_checkpoint(client_session_t* session) {
+  nasfs_file_service_t* files = &session->files;
+  if (!files->resumable || files->active_fd < 0 || files->write_failed ||
+      files->sequence == files->durable_sequence || files->put_draining)
+    return 0;
+  files->checkpoint_pending = 1;
+  if (files->pending_fs) return 1;
+
+  checkpoint_request_t* work = malloc(sizeof(*work));
+  int rc = UV_ENOMEM;
+  if (work) {
+    work->session = session;
+    work->req.data = work;
+    rc = uv_queue_work(session->handle.loop, &work->req, run_checkpoint,
+                       on_checkpoint);
+    if (!rc) {
+      files->pending_fs++;
+      return 1;
+    }
+    free(work);
+  }
+  files->checkpoint_pending = 0;
+  files->write_failed = 1;
+  log_all(LOG_WARNING, "Cannot start PUT checkpoint: %s", uv_strerror(rc));
+  return 0;
+}
+
+void nasfs_file_service_on_clock(client_session_t* session) {
+  nasfs_file_service_t* files = &session->files;
+  if (session->state == SESSION_STATE_RECEIVING_FILE && files->resumable &&
+      !files->checkpoint_pending &&
+      uv_now(session->handle.loop) - files->checkpoint_at >= 1000 &&
+      files->sequence != files->durable_sequence && !submit_checkpoint(session))
+    abort_transfer(session);
 }
 
 static void free_request(file_request_t* req) {
@@ -100,6 +182,7 @@ static void on_put_write(uv_fs_t* req) {
   client_session_t* session = ctx->session;
   if (req->result < 0 || (size_t)req->result != ctx->buf.len) {
     session->files.put_draining = 0;
+    session->files.write_failed = 1;
     log_all(LOG_ERROR, "PUT: Write failed: %s",
             req->result < 0 ? uv_strerror((int)req->result) : "short write");
     abort_transfer(session);
@@ -146,6 +229,11 @@ static void put_data(client_session_t* session, const nasfs_frame_t* frame) {
   files->pending_fs++;
   files->sequence++;
   files->has_expected = 0;
+  if (files->resumable) {
+    files->checkpoint_bytes += ctx->buf.len;
+    if (files->checkpoint_bytes >= 16u * 1024u * 1024u)
+      submit_checkpoint(session);
+  }
 }
 
 typedef struct {
@@ -172,13 +260,18 @@ static void publish_version(uv_work_t* req) {
   } else if (rc >= 0) {
     rc = UV_EIO;
   }
-  int closed = uv_fs_close(NULL, &write_req, files->active_fd, NULL);
-  uv_fs_req_cleanup(&write_req);
-  if (!rc) rc = closed;
-  if (!rc)
+  if (!rc) {
     rc = nasfs_version_publish(files->store, files->staging, files->name,
                                &files->header, files->proof + 32,
-                               nasfs_version_file_size(&files->header));
+                               nasfs_version_file_size(&files->header),
+                               files->resumable ? &files->attempt : NULL);
+    if (!files->resumable) files->reserved = 0;
+    files->finalized = rc == 0 || rc == UV_EEXIST || rc == UV_ENOSPC;
+  }
+  int closed = uv_fs_close(NULL, &write_req, files->active_fd, NULL);
+  uv_fs_req_cleanup(&write_req);
+  if (closed < 0)
+    log_all(LOG_WARNING, "File close failed: %s", uv_strerror(closed));
   work->status = rc;
 }
 
@@ -235,7 +328,9 @@ static void put_done(client_session_t* session, const nasfs_frame_t* frame) {
   nasfs_file_service_t* files = &session->files;
   if (session->state != SESSION_STATE_RECEIVING_FILE || files->active_fd < 0 ||
       files->has_expected || frame->payload_len != NASFS_VERSION_PROOF_SIZE ||
-      files->sequence != nasfs_version_record_count(&files->header)) {
+      files->sequence != nasfs_version_record_count(&files->header) ||
+      (files->resumable &&
+       sodium_memcmp(frame->payload + 32, files->attempt.digest, 32) != 0)) {
     abort_transfer(session);
     return;
   }
@@ -371,6 +466,7 @@ typedef struct {
   uint64_t start;
   uint64_t length;
   int result;
+  int saved_result;
   uint8_t bytes[NASFS_VERSION_DATA_OFFSET];
 } open_request_t;
 
@@ -388,6 +484,11 @@ static void open_object(uv_work_t* req) {
       work->result = rc;
       break;
     }
+    case NASFS_CMD_PUT_RESUME:
+      work->result = nasfs_version_attempt_open(
+          files->store, &files->attempt, &files->header, files->name,
+          files->staging, &files->sequence, &work->saved_result, &files->index);
+      break;
     case NASFS_CMD_GET_REQ: {
       int fd =
           nasfs_version_open(files->store, files->header.id, files->version);
@@ -441,7 +542,8 @@ static void start_get(client_session_t* session, const open_request_t* work) {
   }
   if (length == UINT64_MAX) length = header.size - start;
   files->header = header;
-  files->first = start / header.block_size;
+  files->first = start == header.size ? nasfs_version_block_count(&header)
+                                      : start / header.block_size;
   files->end = files->first;
   if (length) {
     uint64_t end = start + length;
@@ -450,9 +552,9 @@ static void start_get(client_session_t* session, const open_request_t* work) {
   files->waiting_ack = 0;
   files->repairing = 0;
   files->repair_sent = 0;
-  files->send_index =
-      nasfs_version_record_count(&header) &&
-      (start != 0 || length != header.size || header.ecc != NASFS_ECC_OFF);
+  files->send_index = nasfs_version_record_count(&header) &&
+                      (files->force_index || start != 0 ||
+                       length != header.size || header.ecc != NASFS_ECC_OFF);
   files->sequence = files->send_index ? 0 : files->first;
   session->state = SESSION_STATE_SENDING_FILE;
   session_send_frame(session, NASFS_CMD_GET_ACK, work->bytes,
@@ -466,25 +568,39 @@ static void on_opened(uv_work_t* req, int status) {
   nasfs_file_service_t* files = &session->files;
   int rc = status < 0 ? status : work->result;
   files->busy = 0;
-  if ((work->command == NASFS_CMD_PUT_REQ ||
-       work->command == NASFS_CMD_GET_REQ) &&
-      rc >= 0)
+  int uploading = work->command == NASFS_CMD_PUT_REQ ||
+                  work->command == NASFS_CMD_PUT_RESUME;
+  if ((uploading || work->command == NASFS_CMD_GET_REQ) && rc >= 0)
     files->active_fd = rc;
   if (session->state != SESSION_STATE_ERROR) {
     if (work->command == NASFS_CMD_RESOLVE && (rc == 0 || rc == UV_ENOENT)) {
       session_send_frame(session, NASFS_CMD_RESOLVED, work->bytes,
                          rc == 0 ? 48 : 0, 1);
-    } else if (rc < 0 && work->command == NASFS_CMD_PUT_REQ) {
-      put_result(session, rc);
+    } else if (work->command == NASFS_CMD_PUT_RESUME && rc == UV_EALREADY) {
+      files->staging[0] = '\0';
+      int saved = work->saved_result;
+      put_result(session, saved == 1 ? 0 : saved == 2 ? UV_EEXIST : UV_ENOSPC);
+    } else if (rc < 0 && uploading) {
+      if (rc == UV_EACCES || rc == UV_EBUSY || rc == UV_ETIMEDOUT) {
+        send_error(session, "Upload attempt unavailable for this session");
+      } else {
+        put_result(session, rc);
+      }
     } else if (rc < 0) {
       send_error(session,
                  rc == UV_ENOENT ? "Version unavailable" : uv_strerror(rc));
-    } else if (work->command == NASFS_CMD_PUT_REQ) {
-      files->sequence = 0;
+    } else if (uploading) {
       files->has_expected = 0;
-      nasfs_version_index_init(&files->index);
+      files->write_failed = 0;
+      files->durable_sequence = files->sequence;
+      files->checkpoint_at = uv_now(session->handle.loop);
+      files->checkpoint_bytes = 0;
+      if (!files->resumable) nasfs_version_index_init(&files->index);
       session->state = SESSION_STATE_RECEIVING_FILE;
-      session_send_frame(session, NASFS_CMD_PUT_ACK, NULL, 0, 1);
+      uint8_t checkpoint[8];
+      protocol_store_u64(checkpoint, files->sequence);
+      session_send_frame(session, NASFS_CMD_PUT_ACK, checkpoint,
+                         files->resumable ? sizeof(checkpoint) : 0, 1);
     } else if (work->command == NASFS_CMD_GET_REQ) {
       start_get(session, work);
     } else {
@@ -506,6 +622,7 @@ static void submit_open(client_session_t* session, nasfs_cmd_type_t command,
   work->command = command;
   work->start = start;
   work->length = length;
+  work->saved_result = 0;
   work->req.data = work;
   int rc =
       uv_queue_work(session->handle.loop, &work->req, open_object, on_opened);
@@ -564,12 +681,19 @@ void nasfs_file_service_dispatch(client_session_t* session,
         return;
       }
       break;
+    case NASFS_CMD_PUT_RESUME:
     case NASFS_CMD_PUT_REQ: {
-      const size_t name_offset = 1 + NASFS_VERSION_HEADER_SIZE;
+      files->resumable = frame.type == NASFS_CMD_PUT_RESUME;
+      files->finalized = 0;
+      files->sequence = 0;
+      files->write_failed = 0;
+      files->checkpoint_pending = 0;
+      size_t prefix = files->resumable ? 64 : 0;
+      const size_t name_offset = prefix + 1 + NASFS_VERSION_HEADER_SIZE;
       if (frame.payload_len <= name_offset ||
-          (frame.payload[0] != NASFS_VERSION_REQUEST &&
-           frame.payload[0] != NASFS_VERSION_EXCLUSIVE) ||
-          nasfs_version_decode(&files->header, frame.payload + 1,
+          (frame.payload[prefix] != NASFS_VERSION_REQUEST &&
+           frame.payload[prefix] != NASFS_VERSION_EXCLUSIVE) ||
+          nasfs_version_decode(&files->header, frame.payload + prefix + 1,
                                NASFS_VERSION_HEADER_SIZE) < 0) {
         send_error(session, "Unsupported transfer format");
         return;
@@ -580,19 +704,26 @@ void nasfs_file_service_dispatch(client_session_t* session,
         send_error(session, "Invalid file name");
         return;
       }
-      if (frame.payload[0] == NASFS_VERSION_EXCLUSIVE &&
+      if (frame.payload[prefix] == NASFS_VERSION_EXCLUSIVE &&
           !sodium_is_zero(files->header.parent, sizeof(files->header.parent))) {
         send_error(session, "Create-only upload requires an unused name");
         return;
+      }
+      if (files->resumable) {
+        memcpy(files->attempt.token, frame.payload, 32);
+        memcpy(files->attempt.digest, frame.payload + 32, 32);
+        memcpy(files->attempt.scope, files->access.scope, 32);
       }
       break;
     }
     case NASFS_CMD_GET_REQ:
       if (frame.payload_len != NASFS_VERSION_GET_SIZE ||
-          frame.payload[0] != NASFS_VERSION_REQUEST) {
+          (frame.payload[0] != NASFS_VERSION_REQUEST &&
+           frame.payload[0] != NASFS_VERSION_GET_INDEXED)) {
         send_error(session, "Unsupported transfer format");
         return;
       }
+      files->force_index = frame.payload[0] == NASFS_VERSION_GET_INDEXED;
       memcpy(files->header.id, frame.payload + 1, 16);
       memcpy(files->version, frame.payload + 17, 32);
       start = protocol_load_u64(frame.payload + 49);

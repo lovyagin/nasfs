@@ -8,6 +8,7 @@ typedef struct client_session client_session_t;
 
 typedef struct {
   char* subject;
+  uint8_t scope[32];
 } nasfs_file_access_t;
 
 typedef struct {
@@ -17,6 +18,7 @@ typedef struct {
   const uint8_t* trusted_author;
   nasfs_version_header_t header;
   nasfs_block_meta_t expected;
+  nasfs_attempt_t attempt;
   uint8_t proof[NASFS_VERSION_PROOF_SIZE];
   uint8_t version[NASFS_VERSION_DIGEST_SIZE];
   uint64_t sequence;
@@ -26,14 +28,22 @@ typedef struct {
   uint64_t end;
   size_t pending_fs;
   int64_t reserved;
+  uint64_t checkpoint_at;
+  uint64_t checkpoint_bytes;
+  uint64_t durable_sequence;
   uv_file active_fd;
   int put_draining;
   int busy;
   int has_expected;
   int send_index;
+  int force_index;
   int waiting_ack;
   int repair_sent;
   int repairing;
+  int resumable;
+  int finalized;
+  int checkpoint_pending;
+  int write_failed;
   char name[NASFS_STORAGE_NAME_MAX + 1];
   char staging[NASFS_VERSION_TEMP_NAME];
 } nasfs_file_service_t;
@@ -42,6 +52,7 @@ typedef struct {
 int nasfs_file_service_close(client_session_t* session);
 void nasfs_file_service_dispatch(client_session_t* session,
                                  nasfs_frame_t frame);
+void nasfs_file_service_on_clock(client_session_t* session);
 void nasfs_file_service_get_next(client_session_t* session);
 int nasfs_file_service_draining(const client_session_t* session);
 int nasfs_file_service_at_capacity(const client_session_t* session);

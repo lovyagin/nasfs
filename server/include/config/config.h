@@ -40,6 +40,7 @@ typedef struct {
   char* author_public_key;      /**< Trusted file author key path */
   int64_t version_quota;
   int64_t version_retention;
+  int64_t attempt_retention;
   int block_size; /**< I/O block size in bytes for file transfers */
 } server_config_t;
 

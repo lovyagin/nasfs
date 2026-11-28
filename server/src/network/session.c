@@ -418,6 +418,7 @@ void session_expire_idle(uv_handle_t* handle, void* listener) {
   if (handle->type != UV_TCP || handle == listener || uv_is_closing(handle))
     return;
   client_session_t* session = handle->data;
+  nasfs_file_service_on_clock(session);
   if (uv_now(handle->loop) - session->last_activity >=
       (uint64_t)global_config.client_timeout * 1000u) {
     log_all(LOG_WARNING, "Session idle timeout.");
@@ -768,6 +769,15 @@ static void session_dispatch_frame(client_session_t* session,
       }
 
       log_authenticated_client(&auth);
+      crypto_generichash_state scope;
+      crypto_generichash_init(&scope, NULL, 0, 32);
+      crypto_generichash_update(&scope, (const uint8_t*)auth.method,
+                                strlen(auth.method) + 1);
+      crypto_generichash_update(&scope, (const uint8_t*)auth.username,
+                                strlen(auth.username) + 1);
+      if (auth.public_key_len > 0)
+        crypto_generichash_update(&scope, auth.public_key, auth.public_key_len);
+      crypto_generichash_final(&scope, session->files.access.scope, 32);
       session->files.access.subject = auth.username;
       auth.username = NULL;
       session->state = SESSION_STATE_AUTHENTICATED;
@@ -777,6 +787,7 @@ static void session_dispatch_frame(client_session_t* session,
     }
 
     case NASFS_CMD_PUT_REQ:
+    case NASFS_CMD_PUT_RESUME:
     case NASFS_CMD_PUT_BLOCK_META:
     case NASFS_CMD_PUT_DATA:
     case NASFS_CMD_PUT_DONE:

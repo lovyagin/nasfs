@@ -36,6 +36,36 @@ start_integration_server "$config"
 export NASFS_VERSION_TEST_ROOT="$TEST_ROOT" NASFS_VERSION_TEST_STORAGE="$STORAGE_DIR"
 python3 -B "$ROOT_DIR/tests/test_versioned_transfers.py" "$CLIENT_BIN"
 
+# Verify the timed checkpoint survives SIGKILL and server startup cleanup.
+NASFS_VERSION_TEST_SERVER_PID="$SERVER_PID" \
+    python3 -B "$ROOT_DIR/tests/test_versioned_transfers.py" "$CLIENT_BIN" crash-checkpoint
+status=0
+wait "$SERVER_PID" 2>/dev/null || status=$?
+test "$status" -eq 137
+SERVER_PID=
+start_integration_server "$config"
+"$CLIENT_BIN" put-resume "$TEST_ROOT/crash.checkpoint" "$TEST_ROOT/missing-after-crash" crash.bin
+"$CLIENT_BIN" get crash.bin "$TEST_ROOT/crash-output"
+cmp "$TEST_ROOT/crash-source" "$TEST_ROOT/crash-output"
+
+# Inject a short asynchronous write, preserving the previously published head.
+if [[ $(uname -s) == Linux ]]; then
+    stop_integration_server
+    "${CC:-cc}" -shared -fPIC -Wall -Wextra -Werror \
+        "$ROOT_DIR/tests/fault_injection.c" -ldl -o "$TEST_ROOT/io-fault.so"
+    preload="$TEST_ROOT/io-fault.so"
+    asan_lib=$(ldd "$SERVER_BIN" | awk '/libasan\.so/ {print $3; exit}')
+    if [[ -n $asan_lib ]]; then preload="$asan_lib:$preload"; fi
+    LD_PRELOAD="$preload" NASFS_TEST_SHORT_WRITE=".attempt." \
+        start_integration_server "$config"
+    if "$CLIENT_BIN" put "$TEST_ROOT/first.bin" crash.bin > "$LOG_DIR/short-write.log" 2>&1; then
+        exit 1
+    fi
+    grep -Fq 'PUT: Write failed: short write' "$LOG_DIR/server.log"
+    "$CLIENT_BIN" get crash.bin "$TEST_ROOT/short-write-output"
+    cmp "$TEST_ROOT/crash-source" "$TEST_ROOT/short-write-output"
+fi
+
 # A deliberately small logical quota blocks publication.
 stop_integration_server
 printf 'VersionQuotaBytes 1\n' >> "$config"

@@ -5,11 +5,13 @@ from pathlib import Path
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
+import time
 
-from test_transfer_recovery import GET_DATA, GET_DONE, PUT_DONE, PUT_RESULT, interrupt_transfer
+from test_transfer_recovery import GET_DATA, GET_DONE, PUT_DATA, PUT_DONE, PUT_RESULT, interrupt_transfer
 
 
 CLIENT = os.path.abspath(sys.argv[1])
@@ -38,6 +40,31 @@ def put(source, name, **env):
     match = re.search(rb"^Upload published. Manifest digest: ([0-9a-f]{64})$", output, re.M)
     assert match, output
     return match[1].decode()
+
+
+if len(sys.argv) > 2 and sys.argv[2] == "crash-checkpoint":
+    journal = ROOT / "crash.checkpoint"
+    source = ROOT / "crash-source"
+    source.write_bytes(bytes(i % 247 for i in range(4096 * 16 + 11)))
+
+    def await_checkpoint():
+        deadline = time.monotonic() + 6
+        while True:
+            with sqlite3.connect(CATALOG / "catalog.db") as db:
+                row = db.execute(
+                    "SELECT sequence FROM attempts WHERE name='crash.bin'"
+                ).fetchone()
+            if row and row[0] >= 2:
+                return
+            assert time.monotonic() < deadline, row
+            time.sleep(0.04)
+
+    interrupt_transfer(CLIENT, ["put-resume", str(journal), str(source), "crash.bin"],
+                       PORT, "put", PUT_DATA, signal.SIGKILL,
+                       int(os.environ["NASFS_VERSION_TEST_SERVER_PID"]),
+                       occurrence=4, on_pause=await_checkpoint)
+    assert not list(ROOT.glob(".nasfs-client.*/.nasfs-download.*"))
+    sys.exit(0)
 
 
 first = ROOT / "first.bin"
@@ -123,6 +150,65 @@ assert output.read_bytes() in (first.read_bytes(), second.read_bytes())
 error = interrupt_transfer(CLIENT, ["put", str(first), str(name)], PORT,
                            "get", PUT_RESULT, None)
 assert b"PUT outcome unknown" in error, error
+run("get", name, output)
+assert output.read_bytes() == first.read_bytes()
+
+# A prepared upload can continue from the server's durable prefix. The
+# checkpoint binds a per-attempt token, authenticated subject, name and proof.
+journal = ROOT / "upload.checkpoint"
+resumable = ROOT / "resume-source"
+resumable.write_bytes(first.read_bytes() * 8)
+resume_name = "resume.bin"
+resumable_args = ["put-resume", str(journal), str(resumable), resume_name]
+
+def competing_resume():
+    second_writer = run(*resumable_args, expected=1)
+    assert b"Upload attempt unavailable" in second_writer.stderr
+    wrong_owner = run(*resumable_args, expected=1,
+                      env=dict(os.environ, NASFS_AUTH_USER="different-subject"))
+    assert b"Upload attempt unavailable" in wrong_owner.stderr
+
+interrupt_transfer(CLIENT, resumable_args, PORT, "put", PUT_DATA, signal.SIGTERM,
+                   occurrence=5, on_pause=competing_resume)
+assert journal.stat().st_mode & 0o077 == 0
+deadline = time.monotonic() + 5
+while True:
+    with sqlite3.connect(CATALOG / "catalog.db") as db:
+        checkpoint = db.execute(
+            "SELECT sequence,result FROM attempts WHERE name=?", (resume_name,)
+        ).fetchone()
+    if checkpoint and checkpoint[0] > 0:
+        break
+    assert time.monotonic() < deadline, checkpoint
+    time.sleep(0.02)
+
+expected_bytes = resumable.read_bytes()
+resumable.unlink()
+lost = interrupt_transfer(CLIENT, resumable_args, PORT, "get", PUT_RESULT, None)
+assert b"PUT outcome unknown" in lost, lost
+committed = resolve(resume_name)
+result = run(*resumable_args)
+assert committed[1].encode() in result.stdout
+assert resolve(resume_name) == committed
+run("get", resume_name, output)
+assert output.read_bytes() == expected_bytes
+run("get", name, output)
+assert output.read_bytes() == first.read_bytes()
+
+# The client keeps only verified ciphertext in its local GET journal. A
+# subsequent invocation verifies the prefix and requests the same version tail.
+get_journal = ROOT / "download.checkpoint"
+download_args = ["get-resume", str(get_journal), *committed, str(output)]
+previous = output.read_bytes()
+interrupt_transfer(CLIENT, download_args, PORT, "get", GET_DATA,
+                   signal.SIGTERM, occurrence=5)
+assert output.read_bytes() == previous
+assert get_journal.stat().st_size > 328
+result = run(*download_args)
+assert b"Restored verified download prefix" in result.stdout, result.stdout
+assert output.read_bytes() == expected_bytes
+run(*download_args)  # the entire version is already in the local journal
+assert output.read_bytes() == expected_bytes
 run("get", name, output)
 assert output.read_bytes() == first.read_bytes()
 
