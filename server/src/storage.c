@@ -131,7 +131,8 @@ static int has_private_permissions(int fd) {
 static int is_private_directory(int fd) {
   struct stat st;
   return fstat(fd, &st) == 0 && st.st_uid == geteuid() &&
-         (st.st_mode & (S_IWGRP | S_IWOTH)) == 0 && has_private_permissions(fd);
+         (st.st_mode & (unsigned)(S_IWGRP | S_IWOTH)) == 0 &&
+         has_private_permissions(fd);
 }
 
 static int open_service_directory(int root) {
@@ -408,10 +409,11 @@ static int replace_upload(int root, int service, const char* temp_name,
 }
 
 static int open_publication_lock(int root) {
-  int flags = O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
+  const unsigned flags = O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
   int fd = openat(root, publication_lock, flags);
   if (fd >= 0 || errno != ENOENT) return fd;
-  fd = openat(root, publication_lock, flags | O_CREAT | O_EXCL, 0600);
+  fd = openat(root, publication_lock, flags | (unsigned)(O_CREAT | O_EXCL),
+              0600);
   if (fd < 0 && errno == EEXIST) fd = openat(root, publication_lock, flags);
   return fd;
 }

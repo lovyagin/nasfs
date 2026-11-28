@@ -3,6 +3,8 @@ bin_PROGRAMS = nasfs_server
 noinst_HEADERS = \
     include/config/config.h \
     include/logging/log.h \
+    include/file_service.h \
+    include/network/session_internal.h \
     include/network/session.h \
     include/storage.h \
     include/utils/daemon.h \
@@ -14,6 +16,7 @@ nasfs_server_SOURCES = \
     src/config/config.c \
     src/logging/log.c \
     src/network/session.c \
+    src/file_service.c \
     src/storage.c \
     src/utils/daemon.c \
     src/utils/pid_file.c \

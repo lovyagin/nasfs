@@ -20,9 +20,9 @@
 #include <uv.h>
 
 #include "crypto_engine.h"
+#include "file_service.h"
 #include "pake.h"
 #include "protocol.h"
-#include "storage.h"
 
 /**
  * @enum session_state_t
@@ -42,29 +42,19 @@ typedef enum {
  * @struct client_session_t
  * @brief Context and state for an active client connection.
  */
-typedef struct {
+struct client_session {
   uv_tcp_t handle;        /**< libuv TCP handle for the connection. */
   uint64_t last_activity; /**< libuv monotonic clock in milliseconds. */
   session_state_t state;  /**< Current state of the session. */
-  const nasfs_storage_t* storage;
 
   /* Receive Buffer */
   uint8_t* recv_buffer; /**< Buffer for accumulating incomplete TCP frames. */
   size_t recv_length;   /**< Current number of bytes in the receive buffer. */
   size_t recv_capacity; /**< Total allocated capacity of the receive buffer. */
 
-  /* File Transfer State */
-  uv_file active_fd; /**< File descriptor for active transfers (PUT/GET). */
-  int has_record_lengths; /**< Container carries ciphertext record lengths. */
-  uint64_t file_offset;   /**< Current offset in the active file. */
-
   /* Crypto State */
   uint8_t handshake_transcript[32];
   uint8_t auth_context[32];
-  crypto_generichash_state manifest;
-  uint8_t upload_manifest[32 + crypto_sign_BYTES];
-  int has_manifest;
-  uint8_t owner_slot[NASFS_OWNER_SLOT_V1_SIZE];
   OQS_KEM* kem;            /**< OQS Key Encapsulation Mechanism instance. */
   uint8_t* kem_secret_key; /**< The server's secret key for this session. */
   uint8_t*
@@ -79,34 +69,7 @@ typedef struct {
   crypto_secretstream_xchacha20poly1305_state
       recv_crypto_state; /**< Client->server control channel state. */
 
-  /* Block Integrity Verification / Encryption info */
-  int file_encryption_enabled; /**< Flag indicating if the current file transfer
-                                  has encryption/integrity enabled. */
-  int has_pending_block_meta; /**< Flag indicating if we received block metadata
-                                 but not yet the data. */
-  uint64_t
-      expected_block_seq; /**< Expected sequence number of the next block. */
-  uint32_t
-      expected_block_size; /**< Expected size of the next block's ciphertext. */
-  uint8_t expected_block_hash[32]; /**< Expected hash of the next block's
-                                      ciphertext. */
-  uint64_t
-      server_block_seq; /**< Current block sequence counter on the server. */
-  uint8_t file_salt[crypto_pwhash_SALTBYTES]; /**< Per-file random salt used for
-                                                 key derivation. */
-  uint64_t expected_plaintext_size; /**< Plaintext file size announced by the
-                                       client on PUT; returned on GET so the
-                                       client can verify no truncation. */
-  int upload_exclusive;     /**< Publish only if the name does not exist. */
-  uint8_t file_cipher_algo; /**< nasfs_cipher_algo_t for this file's blocks. */
-  uint8_t file_hash_algo;   /**< nasfs_hash_algo_t for block integrity. */
-
-  size_t
-      pending_fs; /**< File requests whose callbacks still own the session. */
-  char upload_name[NASFS_STORAGE_NAME_MAX + 1];
-  char upload_temp_name[NASFS_UPLOAD_TEMP_SIZE];
-  uint64_t upload_plaintext_bytes;
-  int put_draining;  /**< PUT_DONE received while writes are outstanding. */
+  nasfs_file_service_t files;
   int read_paused;   /**< Receive stopped at the pending filesystem limit. */
   int handle_closed; /**< TCP close callback has run. */
 
@@ -115,8 +78,7 @@ typedef struct {
   uint8_t pake_X[32]; /**< Client share X received in CMD_PAKE_HELLO. */
   uint8_t pake_w[32]; /**< Password scalar w derived from server password. */
   int pake_hello_received; /**< Set when CMD_PAKE_HELLO has been processed. */
-
-} client_session_t;
+};
 
 /**
  * @brief Callback for accepting new incoming client connections.

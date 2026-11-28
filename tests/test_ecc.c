@@ -17,7 +17,8 @@ int main(void) {
   size_t num_blocks = 4;      // Let's have 4 blocks of data
 
   // Allocate memory for blocks
-  uint8_t** original_blocks = calloc(num_blocks, sizeof(*original_blocks));
+  uint8_t** original_blocks =
+      (uint8_t**)calloc(num_blocks, sizeof(*original_blocks));
   uint8_t** healthy_blocks =
       (uint8_t**)malloc((num_blocks - 1) * sizeof(uint8_t*));
   uint8_t* parity_block = malloc(block_size);
@@ -39,7 +40,7 @@ int main(void) {
       goto cleanup;
     }
     for (size_t i = 0; i < block_size; i++) {
-      original_blocks[b][i] = (uint8_t)((b * 17 + i * 3) & 0xFF);
+      original_blocks[b][i] = (uint8_t)((b * 17 + i * 3) & 0xFFu);
     }
   }
 
@@ -52,7 +53,7 @@ int main(void) {
   memcpy(corrupted_block_backup, original_blocks[corrupted_index], block_size);
 
   // Introduce silent data corruption (bit rot) by flipping a bit in block 1
-  original_blocks[corrupted_index][1024] ^= 0x40;  // Flip 6th bit
+  original_blocks[corrupted_index][1024] ^= 0x40u;  // Flip 6th bit
 
   // Check if it is different
   if (memcmp(original_blocks[corrupted_index], corrupted_block_backup,
@@ -97,8 +98,8 @@ cleanup:
   if (original_blocks) {
     for (size_t b = 0; b < num_blocks; b++) free(original_blocks[b]);
   }
-  free(original_blocks);
-  free(healthy_blocks);
+  free((void*)original_blocks);
+  free((void*)healthy_blocks);
   free(parity_block);
   free(reconstructed_block);
   return result;

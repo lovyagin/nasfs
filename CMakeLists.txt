@@ -87,6 +87,7 @@ add_executable(nasfs_server
   server/src/logging/log.c
   server/src/network/session.c
   server/src/storage.c
+  server/src/file_service.c
   server/src/utils/daemon.c
   server/src/utils/pid_file.c
   server/src/utils/signal_handler.c
@@ -101,18 +102,14 @@ target_link_directories(nasfs_server PRIVATE
 )
 target_link_libraries(nasfs_server PRIVATE nasfs_common ${OPENSSL_LIBRARIES})
 
-add_executable(nasfs_client
-  client/src/main.c
-)
-target_include_directories(nasfs_client PRIVATE client/include common/include)
+add_library(nasfs_client_api STATIC client/src/client.c)
+target_include_directories(nasfs_client_api PUBLIC client/include)
+target_compile_options(nasfs_client_api PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(nasfs_client_api PUBLIC nasfs_common)
+
+add_executable(nasfs_client client/src/main.c)
 target_compile_options(nasfs_client PRIVATE -Wall -Wextra -Wpedantic)
-target_link_directories(nasfs_client PRIVATE
-  ${UV_LIBRARY_DIRS}
-  ${OQS_LIBRARY_DIRS}
-  ${SODIUM_LIBRARY_DIRS}
-  ${OPENSSL_LIBRARY_DIRS}
-)
-target_link_libraries(nasfs_client PRIVATE nasfs_common ${OPENSSL_LIBRARIES})
+target_link_libraries(nasfs_client PRIVATE nasfs_client_api)
 
 enable_testing()
 
